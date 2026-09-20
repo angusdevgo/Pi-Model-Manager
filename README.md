@@ -1,4 +1,4 @@
-#       ⚡ Pi Model Manager
+#       <h1 align="center">⚡ Pi Model Manager</h1>
 
 <p align="center">
   <a href="#-中文说明">中文说明</a> | <a href="#-english">English</a>
