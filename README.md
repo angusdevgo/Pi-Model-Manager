@@ -1,4 +1,4 @@
-# ⚡ Pi Model Manager (Pi 模型与服务商配置管理器)
+# ⚡ Pi Model Manager
 
 <p align="center">
   <a href="#-中文说明">中文说明</a> | <a href="#-english">English</a>
