@@ -210,6 +210,6 @@ pi-model-manager/
 
 ---
 
-## 🤝 Community & Support / 社区与支持
+## 🤝 Community & Support 
 
-- **LINUX DO 社区**: [https://linux.do](https://linux.do/) - 欢迎在此讨论和反馈使用体验与改进建议。
+- **LINUX DO 社区**: https://linux.do
