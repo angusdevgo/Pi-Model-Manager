@@ -9,3 +9,7 @@ venv/
 .vscode/
 *.lnk
 *.log
+*.bak
+
+# 用户配置备份
+backup/

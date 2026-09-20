@@ -1,5 +1,16 @@
+import sys
+import os
+
+# 保护 pythonw.exe 免受 print() 导致的 NoneType 崩溃
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, 'w')
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, 'w')
+
+import fnmatch
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -12,6 +23,19 @@ from pathlib import Path
 DEFAULT_AGENT_DIR = Path(os.environ.get("PI_CODING_AGENT_DIR", Path.home() / ".pi" / "agent"))
 DEFAULT_MODELS_PATH = DEFAULT_AGENT_DIR / "models.json"
 CURRENT_CONFIG_PATH = DEFAULT_MODELS_PATH
+PI_SETTINGS_PATH = DEFAULT_AGENT_DIR / "settings.json"
+
+# 始终在侧栏中展示的内置厂商（其余内置厂商仅在检测到凭据时展示）
+CORE_BUILTIN_PROVIDERS = ["deepseek", "xiaomi", "openai", "anthropic", "google"]
+
+# 内置厂商的兜底元信息（当无法读取 pi-ai 目录时使用）
+BUILTIN_PROVIDERS_META = {
+    "deepseek": {"name": "DeepSeek (Built-in)", "api": "openai-completions", "baseUrl": "https://api.deepseek.com", "env_key": "DEEPSEEK_API_KEY"},
+    "xiaomi": {"name": "Xiaomi (Built-in)", "api": "openai-completions", "baseUrl": "https://api.xiaomimimo.com/v1", "env_key": "XIAOMI_API_KEY"},
+    "openai": {"name": "OpenAI (Built-in)", "api": "openai-responses", "baseUrl": "https://api.openai.com/v1", "env_key": "OPENAI_API_KEY"},
+    "anthropic": {"name": "Anthropic (Built-in)", "api": "anthropic-messages", "baseUrl": "https://api.anthropic.com", "env_key": "ANTHROPIC_API_KEY"},
+    "google": {"name": "Google Gemini (Built-in)", "api": "google-generative-ai", "baseUrl": "https://generativelanguage.googleapis.com/v1beta", "env_key": "GEMINI_API_KEY"},
+}
 
 def strip_json_comments(text: str) -> str:
     result = []
@@ -56,8 +80,6 @@ def normalize_config_path(path_value=None):
     return Path(str(path_value)).expanduser()
 
 def detect_config_schema(path, data):
-    if not isinstance(data, dict):
-        return "pi-providers"
     return "pi-providers"
 
 def read_config_file(path):
@@ -67,154 +89,359 @@ def read_config_file(path):
         return {"providers": {}}
     return json.loads(clean)
 
-def normalize_config_for_ui(path, data, schema):
-    if isinstance(data, dict) and isinstance(data.get("providers"), dict):
-        normalized = dict(data)
-        normalized["providers"] = data.get("providers", {})
-        return normalized
-    return {"providers": {}}
-
-def is_editable_schema(schema):
-    return True
-
-def load_config(path_value=None):
-    path = normalize_config_path(path_value)
-    if not path.exists():
-        return {"providers": {}}
+def load_pi_settings():
+    if not PI_SETTINGS_PATH.exists():
+        return {}
     try:
-        data = read_config_file(path)
-        schema = detect_config_schema(path, data)
-        return normalize_config_for_ui(path, data, schema)
+        raw = PI_SETTINGS_PATH.read_text(encoding="utf-8-sig")
+        clean = strip_json_comments(raw).strip()
+        return json.loads(clean) if clean else {}
     except Exception:
-        return {"providers": {}}
+        return {}
 
-def sanitize_filename(name: str) -> str:
-    text = str(name or "").strip()
-    if not text:
-        return "export"
-    safe = []
-    for ch in text:
-        if ch.isalnum() or ch in ("-", "_", "."):
-            safe.append(ch)
-        else:
-            safe.append("_")
-    result = "".join(safe).strip("._")
-    return result or "export"
+def save_pi_settings(settings_dict):
+    try:
+        PI_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PI_SETTINGS_PATH.write_text(json.dumps(settings_dict, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        return True
+    except Exception:
+        return False
 
 
-def get_desktop_dir():
-    desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
-    return Path(desktop) if os.path.isdir(desktop) else Path.home()
+def model_reference(pid, model_id):
+    return f"{pid}/{model_id}"
 
 
-def build_provider_export_text(provider_id, provider, source_path):
-    provider = provider if isinstance(provider, dict) else {}
-    display_name = provider.get("name") or provider_id
-    base_url = provider.get("baseUrl") or ""
-    api_key = provider.get("apiKey") or ""
-    api_type = provider.get("api") or "openai-completions"
-    models = provider.get("models") or []
-    model_lines = []
-    for model in models:
-        if not isinstance(model, dict):
-            continue
-        model_id = str(model.get("id") or "").strip()
-        if not model_id:
-            continue
-        model_name = str(model.get("name") or "").strip()
-        if model_name and model_name != model_id:
-            model_lines.append(f"- {model_id} ({model_name})")
-        else:
-            model_lines.append(f"- {model_id}")
-    model_block = "\n".join(model_lines) if model_lines else "- (无模型)"
-    key_text = api_key if api_key else "（空）"
-    source_text = str(source_path) if source_path else ""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return (
-        "Pi Model Manager 导出\n"
-        f"导出时间: {timestamp}\n"
-        f"配置文件: {source_text}\n"
-        "\n"
-        "服务商信息\n"
-        f"显示名称: {display_name}\n"
-        f"服务商 ID: {provider_id}\n"
-        f"URL: {base_url}\n"
-        f"Key: {key_text}\n"
-        f"API类型: {api_type}\n"
-        f"模型数量: {len(models)}\n"
-        "\n"
-        "模型列表\n"
-        f"{model_block}\n"
-    )
+THINKING_LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 
 
-def build_all_providers_export_text(config, source_path):
-    providers = config.get("providers") if isinstance(config, dict) else {}
-    providers = providers if isinstance(providers, dict) else {}
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    source_text = str(source_path) if source_path else ""
-    parts = [
-        "Pi Model Manager 导出",
-        f"导出时间: {timestamp}",
-        f"配置文件: {source_text}",
-        f"服务商数量: {len(providers)}",
-        "",
-    ]
-    for idx, (provider_id, provider) in enumerate(providers.items(), start=1):
+def pattern_matches_model(pattern, pid, model_id):
+    """Pi 的 enabledModels 使用 glob 模式匹配 provider/model 或单独的 modelId。"""
+    pat = str(pattern or "").strip()
+    if not pat:
+        return False
+    # 允许 "provider/model:high" 这类带思考等级后缀的写法
+    base_pat = pat
+    last_colon = pat.rfind(":")
+    if last_colon != -1:
+        suffix = pat[last_colon + 1:].lower()
+        if suffix in THINKING_LEVELS:
+            base_pat = pat[:last_colon]
+    for candidate in (base_pat, pat):
+        ref = model_reference(pid, model_id)
+        if candidate.lower() == ref.lower() or candidate.lower() == str(model_id).lower():
+            return True
+        if any(ch in candidate for ch in "*?["):
+            try:
+                if fnmatch.fnmatch(ref.lower(), candidate.lower()) or fnmatch.fnmatch(str(model_id).lower(), candidate.lower()):
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def apply_enabled_state_to_config(cfg):
+    """兼容占位（保留函数名，避免旧调用点报错）。
+
+    模型“禁用”不再依赖 settings.json 的 enabledModels 白名单：
+      · 内置模型 —— 目录由 Pi 原生提供，不可删除也不可隐藏；
+      · 自定义模型 —— models.json 为唯一真相，禁用 = 不写入。
+    因此本函数无事可做，原样返回。
+    """
+    return cfg
+
+
+def clear_enabled_models_whitelist():
+    """清除 settings.json 里由工具写入的 enabledModels 白名单。
+
+    白名单是作用域过滤器：一旦存在，Pi 只显示匹配的模型，未列出的厂商会整体消失。
+    禁用已改由 models.json 内容决定，白名单不再需要且有害。
+    仅当现有白名单符合“工具生成”特征（全为 provider/* 形式的通配）时才清除，
+    避免误删主人手工编写的精细白名单。
+    """
+    try:
+        settings = load_pi_settings()
+        current = settings.get("enabledModels")
+        if not isinstance(current, list) or not current:
+            return False
+        looks_generated = all(
+            isinstance(p, str) and p.endswith("/*") and p.count("/") == 1
+            for p in current
+        )
+        if not looks_generated:
+            return False
+        settings.pop("enabledModels", None)
+        return save_pi_settings(settings)
+    except Exception:
+        return False
+
+
+def apply_model_overrides_to_config(cfg):
+    """把 models.json 的 modelOverrides 应用到模型对象上（与 Pi 运行时行为一致）。"""
+    for pid, provider in (cfg.get("providers") or {}).items():
         if not isinstance(provider, dict):
             continue
-        parts.append(f"[{idx}] {provider.get('name') or provider_id}")
-        parts.append(f"服务商 ID: {provider_id}")
-        parts.append(f"URL: {provider.get('baseUrl') or ''}")
-        parts.append(f"Key: {provider.get('apiKey') or '（空）'}")
-        parts.append(f"API类型: {provider.get('api') or 'openai-completions'}")
-        models = provider.get('models') or []
-        parts.append(f"模型数量: {len(models)}")
-        if models:
-            parts.append("模型列表:")
-            for model in models:
-                if not isinstance(model, dict):
+        overrides = provider.get("modelOverrides")
+        if not isinstance(overrides, dict):
+            continue
+        for model in provider.get("models") or []:
+            if not isinstance(model, dict) or not model.get("id"):
+                continue
+            ov = overrides.get(model["id"])
+            if not isinstance(ov, dict):
+                continue
+            ov_headers = ov.get("headers")
+            if isinstance(ov_headers, dict):
+                merged_headers = dict(model.get("headers") or {})
+                for hk, hv in ov_headers.items():
+                    if hv is not None:
+                        merged_headers[str(hk)] = hv
+                if merged_headers:
+                    model["headers"] = merged_headers
+            if ov.get("name"):
+                model["name"] = ov["name"]
+    return cfg
+
+
+def sync_pi_enabled_models(cfg):
+    """已废弃，保留仅为兼容旧调用点。
+
+    旧实现会把厂商写入 settings.json 的 enabledModels 白名单。白名单是**作用域过滤器**：
+    一旦存在，Pi 只显示匹配的模型，未列出的厂商会整体消失，且顺序仍不可控。
+    现在禁用语义已改为“不写入 models.json = Pi 侧不存在”，因此不再写白名单。
+
+    这里只做一件事：清除工具历史上写下的白名单，让 Pi 回到“全部可用”状态。
+    """
+    return clear_enabled_models_whitelist()
+
+def get_pi_ai_dist_dir():
+    candidates = [
+        Path(os.environ.get("APPDATA", "")) / "npm" / "node_modules" / "@earendil-works" / "pi-coding-agent" / "node_modules" / "@earendil-works" / "pi-ai" / "dist",
+        Path.home() / "AppData" / "Roaming" / "npm" / "node_modules" / "@earendil-works" / "pi-coding-agent" / "node_modules" / "@earendil-works" / "pi-ai" / "dist",
+    ]
+    for c in candidates:
+        if c.is_dir():
+            return c
+    return None
+
+
+def get_pi_ai_catalog_dir():
+    dist = get_pi_ai_dist_dir()
+    if dist is None:
+        return None
+    data_dir = dist / "providers" / "data"
+    return data_dir if data_dir.is_dir() else None
+
+
+_BUILTIN_CATALOG_CACHE = None
+
+
+def load_builtin_catalog(force=False):
+    """读取 pi-ai 内置模型目录。
+
+    pi-ai 的 data/*.json 结构为 { "<api>": { "<modelId>": {完整模型定义} } }。
+    返回 { providerId: { name, apis, baseUrl, env_keys, models: [完整模型定义] } }
+    """
+    global _BUILTIN_CATALOG_CACHE
+    if _BUILTIN_CATALOG_CACHE is not None and not force:
+        return _BUILTIN_CATALOG_CACHE
+
+    catalog = {}
+    data_dir = get_pi_ai_catalog_dir()
+    if data_dir is not None:
+        for f in sorted(data_dir.glob("*.json")):
+            if f.name.startswith("."):
+                continue
+            try:
+                raw = json.loads(f.read_text(encoding="utf-8-sig"))
+            except Exception:
+                continue
+            if not isinstance(raw, dict):
+                continue
+            for api_name, models in raw.items():
+                if not isinstance(models, dict):
                     continue
-                mid = str(model.get('id') or '').strip()
-                if not mid:
+                for mid, mdef in models.items():
+                    if not isinstance(mdef, dict):
+                        continue
+                    pid = str(mdef.get("provider") or "").strip()
+                    if not pid:
+                        continue
+                    entry = catalog.setdefault(pid, {"models": [], "apis": [], "baseUrl": "", "env_keys": []})
+                    entry["models"].append(mdef)
+                    if api_name and api_name not in entry["apis"]:
+                        entry["apis"].append(api_name)
+                    if not entry["baseUrl"] and mdef.get("baseUrl"):
+                        entry["baseUrl"] = mdef["baseUrl"]
+
+    # 从厂商实现文件中解析显示名与环境变量名
+    dist = get_pi_ai_dist_dir()
+    if dist is not None:
+        prov_dir = dist / "providers"
+        if prov_dir.is_dir():
+            for f in sorted(prov_dir.glob("*.js")):
+                if f.name.endswith(".models.js") or f.name == "all.js":
                     continue
-                mname = str(model.get('name') or '').strip()
-                parts.append(f"- {mid}" + (f" ({mname})" if mname and mname != mid else ""))
-        else:
-            parts.append("模型列表: - (无模型)")
-        parts.append("")
-    return "\n".join(parts).rstrip() + "\n"
+                try:
+                    text = f.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                pid = None
+                id_pos = -1
+                for m in re.finditer(r'\bid:\s*"([^"]+)"', text):
+                    if m.group(1) in catalog:
+                        pid = m.group(1)
+                        id_pos = m.end()
+                        break
+                if pid is None:
+                    continue
+                entry = catalog[pid]
+                nm = re.search(r'\bname:\s*"([^"]+)"', text[id_pos:])
+                if nm:
+                    entry["name"] = nm.group(1)
+                envs = []
+                for em in re.finditer(r'envApiKeyAuth\(\s*"[^"]*"\s*,\s*\[([^\]]*)\]', text):
+                    for s in re.findall(r'"([^"]+)"', em.group(1)):
+                        if s not in envs:
+                            envs.append(s)
+                entry["env_keys"] = envs
+
+    for pid, meta in BUILTIN_PROVIDERS_META.items():
+        entry = catalog.setdefault(pid, {"models": [], "apis": [], "baseUrl": "", "env_keys": []})
+        entry.setdefault("name", meta.get("name"))
+        if not entry.get("baseUrl"):
+            entry["baseUrl"] = meta.get("baseUrl", "")
+        if not entry.get("apis") and meta.get("api"):
+            entry["apis"] = [meta["api"]]
+        if not entry.get("env_keys") and meta.get("env_key"):
+            entry["env_keys"] = [meta["env_key"]]
+
+    _BUILTIN_CATALOG_CACHE = catalog
+    return catalog
 
 
-def export_provider_txt(config, config_path, provider_id):
-    if isinstance(config, str):
-        config = json.loads(config)
-    if not isinstance(config, dict):
-        raise ValueError("配置数据无效")
-    providers = config.get("providers") or {}
-    provider = providers.get(provider_id)
-    if not isinstance(provider, dict):
-        raise ValueError("未找到当前服务商")
-    text = build_provider_export_text(provider_id, provider, config_path)
-    base_dir = get_desktop_dir()
-    filename = sanitize_filename(provider.get("name") or provider_id) + "-export.txt"
-    out_path = base_dir / filename
-    out_path.write_text(text, encoding="utf-8")
-    return out_path, text
+def read_credential_sources():
+    """读取 Pi 的 auth.json / models-store.json / 环境变量中的凭据信息。"""
+    auth_data = {}
+    auth_file = DEFAULT_AGENT_DIR / "auth.json"
+    if auth_file.exists():
+        try:
+            loaded = json.loads(strip_json_comments(auth_file.read_text(encoding="utf-8-sig")))
+            if isinstance(loaded, dict):
+                auth_data = loaded
+        except Exception:
+            pass
+
+    store_data = {}
+    store_file = DEFAULT_AGENT_DIR / "models-store.json"
+    if store_file.exists():
+        try:
+            loaded = json.loads(strip_json_comments(store_file.read_text(encoding="utf-8-sig")))
+            if isinstance(loaded, dict):
+                store_data = loaded
+        except Exception:
+            pass
+    return auth_data, store_data
 
 
-def export_all_providers_txt(config, config_path):
-    if isinstance(config, str):
-        config = json.loads(config)
-    if not isinstance(config, dict):
-        raise ValueError("配置数据无效")
-    text = build_all_providers_export_text(config, config_path)
-    base_dir = get_desktop_dir()
-    filename = sanitize_filename(Path(config_path).stem if config_path else "providers") + "-all-export.txt"
-    out_path = base_dir / filename
-    out_path.write_text(text, encoding="utf-8")
-    return out_path, text
+def resolve_provider_credential(pid, auth_data, catalog_entry):
+    """返回 (api_key, auth_type)。优先 auth.json，其次环境变量。"""
+    api_key = ""
+    auth_type = None
+    entry = auth_data.get(pid) if isinstance(auth_data, dict) else None
+    if isinstance(entry, dict):
+        api_key = entry.get("key") or entry.get("apiKey") or entry.get("access") or entry.get("token") or ""
+        auth_type = entry.get("type", "api_key")
+    elif isinstance(entry, str):
+        api_key = entry
+        auth_type = "api_key"
+    if not api_key:
+        for env_name in (catalog_entry or {}).get("env_keys", []) or []:
+            val = os.environ.get(env_name, "")
+            if val:
+                api_key = val
+                auth_type = "env"
+                break
+    return api_key, auth_type
 
+
+def provider_is_authenticated(pid, auth_data, store_data, catalog_entry):
+    """判断 Pi 侧该内置厂商是否具备可用凭据（无凭据的厂商在 Pi 中本就不出现）。
+
+    凭据来源：
+    1. auth.json 中存在非空条目 (api_key 或 oauth token)
+    2. 环境变量 (如 DEEPSEEK_API_KEY)
+
+    注意：models-store.json 仅为模型目录快照缓存，不代表已认证。
+    """
+    api_key, auth_type = resolve_provider_credential(pid, auth_data, catalog_entry)
+    return bool(api_key or auth_type)
+
+
+def scan_builtin_providers(existing_providers=None):
+    """扫描 Pi 内置厂商及其完整模型目录。"""
+    catalog = load_builtin_catalog()
+    auth_data, store_data = read_credential_sources()
+    existing_providers = existing_providers or {}
+
+    builtins = {}
+    for pid, entry in catalog.items():
+        auth_entry = auth_data.get(pid) if isinstance(auth_data, dict) else None
+        api_key, auth_type = resolve_provider_credential(pid, auth_data, entry)
+        has_store = isinstance(store_data.get(pid), dict)
+        is_core = pid in CORE_BUILTIN_PROVIDERS
+        has_existing = pid in existing_providers
+        authenticated = provider_is_authenticated(pid, auth_data, store_data, entry)
+
+        # 仅扫描满足以下条件的内置厂商：
+        # 1. 在 auth.json / models-store.json / 环境变量中有可用凭据 (authenticated)
+        # 2. 或已经在用户的 models.json 中明确配置过 (has_existing)
+        # 没有凭据且用户从未配置过的内置厂商不自动注入，避免界面充斥未配置项。
+        if not (authenticated or has_existing):
+            continue
+
+        models = []
+        seen_model_ids = {}
+        for mdef in entry.get("models", []):
+            if not isinstance(mdef, dict) or not mdef.get("id"):
+                continue
+            copy = json.loads(json.dumps(mdef))
+            seen_model_ids[copy["id"]] = len(models)
+            models.append(copy)
+
+        # models-store.json 是 Pi 动态刷新后的真实厂商目录，优先级高于内置快照
+        s_entry = store_data.get(pid)
+        if isinstance(s_entry, dict):
+            for sm in s_entry.get("models") or []:
+                if not isinstance(sm, dict) or not sm.get("id"):
+                    continue
+                copy = json.loads(json.dumps(sm))
+                copy.setdefault("provider", pid)
+                idx = seen_model_ids.get(copy["id"])
+                if idx is None:
+                    seen_model_ids[copy["id"]] = len(models)
+                    models.append(copy)
+                else:
+                    merged = json.loads(json.dumps(models[idx]))
+                    merged.update(copy)
+                    models[idx] = merged
+
+        apis = entry.get("apis") or []
+        display_name = entry.get("name") or pid
+        if is_core and not display_name.endswith("(Built-in)"):
+            display_name = f"{display_name} (Built-in)"
+
+        builtins[pid] = {
+            "name": display_name,
+            "api": apis[0] if apis else (BUILTIN_PROVIDERS_META.get(pid, {}).get("api") or "openai-completions"),
+            "baseUrl": entry.get("baseUrl") or BUILTIN_PROVIDERS_META.get(pid, {}).get("baseUrl", ""),
+            "apiKey": api_key,
+            "models": models,
+            "_isBuiltin": True,
+            "_authType": auth_type or "builtin",
+            "_apiKeyScanned": bool(api_key),
+        }
+    return builtins
 
 def clean_pi_config(cfg):
     if not isinstance(cfg, dict):
@@ -223,12 +450,45 @@ def clean_pi_config(cfg):
     if not isinstance(providers, dict):
         cfg["providers"] = {}
         return cfg
-    for provider in providers.values():
+    for pid, provider in list(providers.items()):
         if not isinstance(provider, dict):
             continue
+        provider.pop("_builtinOnly", None)
+        # 废弃的历史字段：不再写盘
+        provider.pop("_removed", None)
+        provider.pop("_modelOrder", None)
         for key in ("name", "baseUrl", "apiKey", "api", "authHeader"):
             if provider.get(key) == "":
                 provider.pop(key, None)
+
+        # 清理与规范化 API Key 池 (apiKeys)
+        api_keys_pool = provider.get("apiKeys")
+        if isinstance(api_keys_pool, list):
+            cleaned_pool = []
+            seen_pool_ids = set()
+            for kitem in api_keys_pool:
+                if not isinstance(kitem, dict):
+                    continue
+                kid = str(kitem.get("id") or "").strip()
+                ksecret = str(kitem.get("key") or "").strip()
+                if not kid or not ksecret or kid in seen_pool_ids:
+                    continue
+                seen_pool_ids.add(kid)
+                kname = str(kitem.get("name") or "").strip()
+                cleaned_item = {"id": kid, "key": ksecret}
+                if kname:
+                    cleaned_item["name"] = kname
+                cleaned_pool.append(cleaned_item)
+            if cleaned_pool:
+                provider["apiKeys"] = cleaned_pool
+            else:
+                provider.pop("apiKeys", None)
+        else:
+            provider.pop("apiKeys", None)
+
+        # 构建可供快速查验的 pool 映射
+        active_pool_map = {item["id"]: item["key"] for item in provider.get("apiKeys", [])}
+
         models = provider.get("models")
         if isinstance(models, list):
             cleaned = []
@@ -248,6 +508,32 @@ def clean_pi_config(cfg):
                     model["disabled"] = True
                 else:
                     model.pop("disabled", None)
+
+                # 处理模型级 Key / headers
+                key_ref = str(model.get("apiKeyRef") or "").strip()
+                headers = model.get("headers")
+                if not isinstance(headers, dict):
+                    headers = {}
+                else:
+                    headers = dict(headers)
+
+                # 如果绑定了有效的池中 Key，同步更新 headers["Authorization"]
+                if key_ref and key_ref in active_pool_map:
+                    model["apiKeyRef"] = key_ref
+                    headers["Authorization"] = f"Bearer {active_pool_map[key_ref]}"
+                else:
+                    model.pop("apiKeyRef", None)
+
+                # 清理空 headers
+                clean_headers = {}
+                for hk, hv in headers.items():
+                    if hk and hv:
+                        clean_headers[str(hk)] = str(hv)
+                if clean_headers:
+                    model["headers"] = clean_headers
+                else:
+                    model.pop("headers", None)
+
                 model.pop("_failStreak", None)
                 model.pop("_lastError", None)
                 cleaned.append(model)
@@ -255,67 +541,419 @@ def clean_pi_config(cfg):
     return cfg
 
 
-def merge_model_lists(old_models, new_models):
-    old_by_id = {}
-    if isinstance(old_models, list):
-        for model in old_models:
-            if isinstance(model, dict) and model.get("id"):
-                old_by_id[str(model["id"])] = dict(model)
-    merged = []
-    seen = set()
-    if isinstance(new_models, list):
-        for model in new_models:
+def build_pi_disk_config(cfg):
+    """生成真正写入 models.json 的内容。
+
+    核心语义（重要）：
+    - 内置厂商：模型目录由 Pi 原生提供，**既不删除也不隐藏**。写盘时补全完整目录
+      元数据，保证 Pi 侧不会回落到 128K 上下文等默认值。
+    - 自定义厂商：models.json 是唯一真相。被禁用的自定义模型**不写入**，
+      即 Pi 侧不存在 —— 禁用 = 物理移除。
+    - 写入的模型必须补全完整目录元数据（cost / contextWindow / maxTokens /
+      reasoning / input / compat），否则 Pi 侧会回落到 128K 上下文等默认值。
+
+    注意：Pi 的 ModelDefinitionSchema 没有 disabled 字段，因此内置模型的 disabled
+    标记对 Pi 完全无效，工具侧也不提供该操作。
+    """
+    normalized = clean_pi_config(json.loads(json.dumps(cfg)))
+    catalog = load_builtin_catalog()
+    auth_data, _ = read_credential_sources()
+    out_providers = {}
+
+    for pid, provider in (normalized.get("providers") or {}).items():
+        if not isinstance(provider, dict):
+            continue
+        entry = catalog.get(pid) or {}
+        is_builtin = bool(provider.get("_isBuiltin")) or pid in catalog
+        catalog_models = {}
+        for mdef in entry.get("models") or []:
+            if isinstance(mdef, dict) and mdef.get("id"):
+                catalog_models[mdef["id"]] = mdef
+        catalog_apis = entry.get("apis") or []
+        provider_api = provider.get("api") or (catalog_apis[0] if catalog_apis else "")
+        provider_base = provider.get("baseUrl") or entry.get("baseUrl") or ""
+
+        out = {}
+
+        # 显示名：内置厂商保留 Pi 原生名称，除非用户确实改过
+        name = provider.get("name")
+        if name:
+            scanned_name = entry.get("name") or ""
+            if not (is_builtin and name in (scanned_name, f"{scanned_name} (Built-in)")):
+                out["name"] = name
+
+        # Base URL / 协议：与内置目录一致时不重复写盘
+        if provider.get("baseUrl"):
+            if not (is_builtin and provider["baseUrl"] == entry.get("baseUrl")):
+                out["baseUrl"] = provider["baseUrl"]
+        if provider.get("api"):
+            if not (is_builtin and provider["api"] in catalog_apis):
+                out["api"] = provider["api"]
+
+        # API Key：内置厂商如果与 auth.json / 环境变量一致则不写盘，避免密钥陈旧覆盖
+        if provider.get("apiKey"):
+            if is_builtin:
+                scanned_key, _ = resolve_provider_credential(pid, auth_data, entry)
+                if provider["apiKey"] != scanned_key:
+                    out["apiKey"] = provider["apiKey"]
+            else:
+                out["apiKey"] = provider["apiKey"]
+
+        for key in ("compat", "authHeader"):
+            if provider.get(key) not in (None, "", {}):
+                out[key] = provider[key]
+
+        if provider.get("apiKeys"):
+            out["apiKeys"] = provider["apiKeys"]
+
+        out_models = []
+        overrides = {}
+        # 按用户在工具中的排列顺序输出模型（数组顺序 = Pi 侧显示顺序）
+        for model in provider.get("models") or []:
             if not isinstance(model, dict):
                 continue
-            model_id = str(model.get("id", "")).strip()
-            if not model_id or model_id in seen:
+            mid = model.get("id")
+            if not mid:
                 continue
-            seen.add(model_id)
-            item = dict(old_by_id.get(model_id, {}))
-            item.update(model)
-            merged.append(item)
-    return merged
+            headers = model.get("headers") if isinstance(model.get("headers"), dict) else {}
+            headers = {str(k): str(v) for k, v in headers.items() if k and v}
+            is_builtin_model = bool(model.get("_isBuiltinModel")) or mid in catalog_models
 
-def merge_pi_config(existing, incoming):
-    existing = existing if isinstance(existing, dict) else {}
-    incoming = incoming if isinstance(incoming, dict) else {"providers": {}}
-    existing_providers = existing.get("providers") if isinstance(existing.get("providers"), dict) else {}
-    incoming_providers = incoming.get("providers") if isinstance(incoming.get("providers"), dict) else {}
-    merged = dict(existing)
-    merged["providers"] = {}
-    for pid, provider in incoming_providers.items():
-        old = existing_providers.get(pid) if isinstance(existing_providers.get(pid), dict) else {}
-        new_provider = dict(old)
-        if isinstance(provider, dict):
-            new_provider.update(provider)
-            if "models" in provider:
-                new_provider["models"] = merge_model_lists(old.get("models"), provider.get("models"))
-        merged["providers"][pid] = new_provider
-    return clean_pi_config(merged)
+            # 禁用 = 不写入 → Pi 侧彻底不存在。
+            # 仅对“自定义模型”成立；内置模型由 Pi 原生目录提供，必须完整保留
+            # （既不删除也不隐藏），否则工具与 Pi 的模型集合会不一致。
+            if model.get("disabled") is True and not is_builtin_model:
+                continue
+
+            if not is_builtin_model:
+                # 用户自建模型：完整写出，必要时补全 api / baseUrl
+                entry_out = {k: v for k, v in model.items()
+                             if k not in ("_isBuiltinModel", "_builtinOrig", "apiKeyRef")
+                             and k != "disabled"}
+                if not entry_out.get("api") and provider_api and "api" not in out:
+                    entry_out["api"] = provider_api
+                if not entry_out.get("baseUrl") and provider_base and "baseUrl" not in out:
+                    entry_out["baseUrl"] = provider_base
+                out_models.append(entry_out)
+                continue
+
+            # 内置模型：以完整目录定义为基底，叠加用户改动
+            base = json.loads(json.dumps(model.get("_builtinOrig") or catalog_models.get(mid) or {"id": mid}))
+            base.pop("provider", None)
+            base.pop("disabled", None)
+            if model.get("name"):
+                base["name"] = model["name"]
+            for key in ("api", "baseUrl", "reasoning", "contextWindow", "maxTokens", "input", "cost", "compat", "thinkingLevelMap", "samplingParams"):
+                if key in model and model.get(key) is not None:
+                    base[key] = model[key]
+            out_models.append(base)
+
+            original_headers = catalog_models.get(mid, {}).get("headers") or {}
+            extra_headers = {k: v for k, v in headers.items() if original_headers.get(k) != v}
+            if extra_headers:
+                overrides[mid] = {**overrides.get(mid, {}), "headers": extra_headers}
+
+        # 保留用户在 models.json 中已有的 modelOverrides
+        managed_ids = {m.get("id") for m in (provider.get("models") or []) if isinstance(m, dict)}
+        existing_overrides = provider.get("modelOverrides")
+        if isinstance(existing_overrides, dict):
+            for oid, oval in existing_overrides.items():
+                if not isinstance(oval, dict):
+                    continue
+                oval = json.loads(json.dumps(oval))
+                if oid in managed_ids:
+                    # 该模型的 headers 已由界面接管（load_config 已合并进 model.headers），此处重新计算
+                    oval.pop("headers", None)
+                merged = {**oval, **overrides.get(oid, {})}
+                if merged:
+                    overrides[oid] = merged
+
+        if out_models:
+            out["models"] = out_models
+        if overrides:
+            out["modelOverrides"] = overrides
+
+        # 顺序：数组顺序即 Pi 侧顺序；不再输出 _modelOrder。
+
+        # 平安性检查：Pi 要求厂商条目至少包含一个“有效字段”，否则会在启动时报 composition error。
+        # 参考 provider-composer.js: baseUrl / headers / compat / modelOverrides / models / apiKey / authHeader
+        trigger_keys = ("baseUrl", "headers", "compat", "modelOverrides", "models", "apiKey", "authHeader", "oauth")
+        if not any(k in out for k in trigger_keys):
+            if out and provider_base:
+                # 仅有 name 等修饰性字段：补上 baseUrl 以满足 Pi 的校验
+                out["baseUrl"] = provider_base
+            else:
+                # 没有任何需要写盘的内容，完全跳过该厂商（避免无意义地钉住内置默认值）
+                continue
+
+        out_providers[pid] = out
+
+    return {"providers": out_providers}
+
+
+def load_config(path_value=None, merge_builtins=True):
+    """读取工具内存配置。
+
+    两种厂商语义：
+    - 自定义厂商：models.json 是唯一真相。文件里没有的模型就不存在，不做目录回填；
+      模型顺序 = models.json 数组顺序（与 Pi 侧一致）。
+    - 内置厂商：合并 Pi 原生目录用于展示，顺序 = Pi 原生目录顺序；模型既不删除也不隐藏。
+      未添加 Key / 未 OAuth 登录的内置厂商不进入列表。
+    """
+    path = normalize_config_path(path_value)
+    cfg = {"providers": {}}
+    if path.exists():
+        try:
+            data = read_config_file(path)
+            if isinstance(data, dict) and isinstance(data.get("providers"), dict):
+                cfg = dict(data)
+        except Exception:
+            pass
+
+    # 历史遗留：旧版本用 _removed 标记“整厂隐藏”。该机制已废弃，此处一次性消化：
+    # 直接从内存配置中剔除这些条目，避免它们被当作“已配置”而重新注入内置目录。
+    for _pid in [k for k, v in (cfg.get("providers") or {}).items()
+                 if isinstance(v, dict) and v.get("_removed")]:
+        cfg["providers"].pop(_pid, None)
+
+    if merge_builtins:
+        try:
+            builtins = scan_builtin_providers(cfg.get("providers") or {})
+            for b_pid, b_prov in builtins.items():
+                if b_pid not in cfg["providers"]:
+                    cfg["providers"][b_pid] = b_prov
+                else:
+                    p = cfg["providers"][b_pid]
+                    p["_isBuiltin"] = True
+                    if not p.get("apiKey") and b_prov.get("apiKey"):
+                        p["apiKey"] = b_prov["apiKey"]
+                        p["_apiKeyScanned"] = True
+                    if not p.get("baseUrl") and b_prov.get("baseUrl"):
+                        p["baseUrl"] = b_prov["baseUrl"]
+                    user_models = p.get("models", [])
+                    user_model_ids = {m["id"]: m for m in user_models if isinstance(m, dict) and m.get("id")}
+                    merged_models = []
+                    # 先放内置模型（用户覆盖项合并进来），并保留完整目录定义供写盘比对
+                    for bm in b_prov.get("models", []):
+                        merged = json.loads(json.dumps(bm))
+                        merged["_builtinOrig"] = json.loads(json.dumps(bm))
+                        if bm["id"] in user_model_ids:
+                            merged.update(user_model_ids[bm["id"]])
+                            merged["_builtinOrig"] = json.loads(json.dumps(bm))
+                        merged["_isBuiltinModel"] = True
+                        merged_models.append(merged)
+                    # 再放用户自建（非内置）模型
+                    builtin_ids = {bm["id"] for bm in b_prov.get("models", [])}
+                    for um in user_models:
+                        if isinstance(um, dict) and um.get("id") not in builtin_ids:
+                            merged_models.append(um)
+
+                    # 顺序：内置模型的显示顺序**必须**等于 Pi 的原生目录顺序。
+                    # Pi 的 applyModelsJson 对内置厂商只做“原地 upsert”，
+                    # models.json 的数组顺序对内置模型无效 —— 这里也不能套用自定义
+                    # 排序，否则工具与 Pi 的顺序会出现偏差。
+                    p["models"] = merged_models
+        except Exception:
+            pass
+
+    try:
+        apply_enabled_state_to_config(cfg)
+    except Exception:
+        pass
+
+    # 将 models.json 的 modelOverrides 投影到模型上（与 Pi 运行时一致），
+    # 这样模型级独立 Key / 名称覆盖在界面上可见且可被取消。
+    try:
+        apply_model_overrides_to_config(cfg)
+    except Exception:
+        pass
+
+    return cfg
+
 
 def save_config(cfg, path_value=None):
     path = normalize_config_path(path_value)
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing = {}
-    if path.exists():
-        try:
-            existing = read_config_file(path)
-        except Exception:
-            existing = {}
-    cfg = merge_pi_config(existing, cfg)
-    path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    disk_cfg = build_pi_disk_config(cfg)
+    path.write_text(json.dumps(disk_cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return disk_cfg
 
-def discover_config_targets():
-    path = DEFAULT_MODELS_PATH.resolve()
-    config = load_config(path)
-    return [{
-        "label": "Pi",
-        "path": str(path),
-        "providerCount": len(config.get("providers", {})),
-        "exists": path.exists(),
-        "schema": "pi-providers",
-        "editable": True,
-    }]
+def sanitize_filename(name: str) -> str:
+    text = str(name or "").strip()
+    if not text:
+        return "export"
+    safe = []
+    for ch in text:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    result = "".join(safe).strip("._")
+    return result or "export"
+
+def get_desktop_dir():
+    desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
+    return Path(desktop) if os.path.isdir(desktop) else Path.home()
+
+def build_provider_export_text(provider_id, provider, source_path):
+    provider = provider if isinstance(provider, dict) else {}
+    display_name = provider.get("name") or provider_id
+    base_url = provider.get("baseUrl") or ""
+    api_key = provider.get("apiKey") or ""
+    api_keys_pool = provider.get("apiKeys") or []
+    api_type = provider.get("api") or "openai-completions"
+    models = provider.get("models") or []
+    
+    pool_map = {k.get("id"): k for k in api_keys_pool if isinstance(k, dict) and k.get("id")}
+    pool_lines = []
+    for k in api_keys_pool:
+        if not isinstance(k, dict):
+            continue
+        kid = k.get("id") or ""
+        kname = k.get("name") or ""
+        kkey = k.get("key") or ""
+        kmasked = (kkey[:4] + "••••" + kkey[-3:]) if len(kkey) > 8 else "••••••••"
+        desc = f" ({kname})" if kname else ""
+        pool_lines.append(f"- [{kid}]{desc}: {kmasked}")
+    pool_block = "\n".join(pool_lines) if pool_lines else "- (无密钥池，仅使用默认 Key)"
+
+    model_lines = []
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        model_id = str(model.get("id") or "").strip()
+        if not model_id:
+            continue
+        model_name = str(model.get("name") or "").strip()
+        name_part = f" ({model_name})" if model_name and model_name != model_id else ""
+        
+        key_ref = model.get("apiKeyRef")
+        headers = model.get("headers") or {}
+        has_auth_header = bool(headers.get("Authorization") or headers.get("x-api-key"))
+        
+        auth_note = ""
+        if key_ref and key_ref in pool_map:
+            pool_item = pool_map[key_ref]
+            ref_name = pool_item.get("name") or key_ref
+            auth_note = f" [Key池: {ref_name}]"
+        elif has_auth_header:
+            auth_note = " [独立专属Key]"
+        else:
+            auth_note = " [继承默认Key]"
+
+        if model.get("disabled") is True:
+            auth_note += " [已禁用]"
+
+        model_lines.append(f"- {model_id}{name_part}{auth_note}")
+    model_block = "\n".join(model_lines) if model_lines else "- (无模型)"
+    key_text = api_key if api_key else "（空）"
+    source_text = str(source_path) if source_path else ""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return (
+        "Pi Model Manager 导出\n"
+        f"导出时间: {timestamp}\n"
+        f"配置文件: {source_text}\n"
+        "\n"
+        "服务商信息\n"
+        f"显示名称: {display_name}\n"
+        f"服务商 ID: {provider_id}\n"
+        f"URL: {base_url}\n"
+        f"默认 Key: {key_text}\n"
+        f"API类型: {api_type}\n"
+        f"模型数量: {len(models)}\n"
+        "\n"
+        "密钥池 (Key Pool)\n"
+        f"{pool_block}\n"
+        "\n"
+        "模型列表\n"
+        f"{model_block}\n"
+    )
+
+def build_all_providers_export_text(config, source_path):
+    providers = config.get("providers") if isinstance(config, dict) else {}
+    providers = providers if isinstance(providers, dict) else {}
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    source_text = str(source_path) if source_path else ""
+    parts = [
+        "Pi Model Manager 导出",
+        f"导出时间: {timestamp}",
+        f"配置文件: {source_text}",
+        f"服务商数量: {len(providers)}",
+        "",
+    ]
+    for idx, (provider_id, provider) in enumerate(providers.items(), start=1):
+        if not isinstance(provider, dict):
+            continue
+        parts.append(f"[{idx}] {provider.get('name') or provider_id}")
+        parts.append(f"服务商 ID: {provider_id}")
+        parts.append(f"URL: {provider.get('baseUrl') or ''}")
+        parts.append(f"默认 Key: {provider.get('apiKey') or '（空）'}")
+        parts.append(f"API类型: {provider.get('api') or 'openai-completions'}")
+        
+        api_keys_pool = provider.get("apiKeys") or []
+        pool_map = {k.get("id"): k for k in api_keys_pool if isinstance(k, dict) and k.get("id")}
+        if api_keys_pool:
+            parts.append(f"密钥池: {len(api_keys_pool)} 组")
+            for k in api_keys_pool:
+                if isinstance(k, dict):
+                    parts.append(f"  * [{k.get('id')}] {k.get('name') or ''}")
+                    
+        models = provider.get('models') or []
+        parts.append(f"模型数量: {len(models)}")
+        if models:
+            parts.append("模型列表:")
+            for model in models:
+                if not isinstance(model, dict):
+                    continue
+                mid = str(model.get('id') or '').strip()
+                if not mid:
+                    continue
+                mname = str(model.get('name') or '').strip()
+                name_part = f" ({mname})" if mname and mname != mid else ""
+                key_ref = model.get("apiKeyRef")
+                headers = model.get("headers") or {}
+                if key_ref and key_ref in pool_map:
+                    k_item = pool_map[key_ref]
+                    auth_note = f" [Key池: {k_item.get('name') or key_ref}]"
+                elif bool(headers.get("Authorization") or headers.get("x-api-key")):
+                    auth_note = " [独立专属Key]"
+                else:
+                    auth_note = ""
+                parts.append(f"- {mid}{name_part}{auth_note}")
+        else:
+            parts.append("模型列表: - (无模型)")
+        parts.append("")
+    return "\n".join(parts).rstrip() + "\n"
+
+def export_provider_txt(config, config_path, provider_id):
+    if isinstance(config, str):
+        config = json.loads(config)
+    if not isinstance(config, dict):
+        raise ValueError("配置数据无效")
+    providers = config.get("providers") or {}
+    provider = providers.get(provider_id)
+    if not isinstance(provider, dict):
+        raise ValueError("未找到当前服务商")
+    text = build_provider_export_text(provider_id, provider, config_path)
+    base_dir = get_desktop_dir()
+    filename = sanitize_filename(provider.get("name") or provider_id) + "-export.txt"
+    out_path = base_dir / filename
+    out_path.write_text(text, encoding="utf-8")
+    return out_path, text
+
+def export_all_providers_txt(config, config_path):
+    if isinstance(config, str):
+        config = json.loads(config)
+    if not isinstance(config, dict):
+        raise ValueError("配置数据无效")
+    text = build_all_providers_export_text(config, config_path)
+    base_dir = get_desktop_dir()
+    filename = sanitize_filename(Path(config_path).stem if config_path else "providers") + "-all-export.txt"
+    out_path = base_dir / filename
+    out_path.write_text(text, encoding="utf-8")
+    return out_path, text
+
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 
 def fetch_models(base_url, api_key):
     url = base_url.rstrip("/")
@@ -326,9 +964,14 @@ def fetch_models(base_url, api_key):
     else:
         endpoint = f"{url}/v1/models"
     
-    headers = {"Accept": "application/json"}
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": DEFAULT_USER_AGENT,
+    }
     if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+        api_key_clean = str(api_key).strip()
+        if api_key_clean:
+            headers["Authorization"] = api_key_clean if api_key_clean.lower().startswith("bearer ") else f"Bearer {api_key_clean}"
     
     req = urllib.request.Request(endpoint, headers=headers)
     with urllib.request.urlopen(req, timeout=15) as resp:
@@ -350,42 +993,56 @@ def fetch_models(base_url, api_key):
             models.append({"id": str(mid), "name": str(name)})
     return sorted(models, key=lambda x: x["id"])
 
-
-def test_model(base_url, api_key, api_type, model_id):
-    """对单个模型发送最小化真实请求，验证 API 是否真正接通。
-    返回: {success, latency_ms, error?}
-    """
+def test_model(base_url, api_key, api_type, model_id, custom_headers=None):
     base = (base_url or "").rstrip("/")
     if not base:
         return {"success": False, "error": "Base URL 为空"}
     start = time.time()
     try:
+        custom_headers = custom_headers if isinstance(custom_headers, dict) else {}
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": DEFAULT_USER_AGENT,
+        }
+        api_key_clean = str(api_key).strip() if api_key else ""
+        auth_bearer = (api_key_clean if api_key_clean.lower().startswith("bearer ") else f"Bearer {api_key_clean}") if api_key_clean else ""
+
         if api_type == "anthropic-messages":
             endpoint = base + "/messages" if base.endswith("/v1") else base + "/v1/messages"
-            headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
-            if api_key:
-                headers["x-api-key"] = api_key
+            headers["anthropic-version"] = "2023-06-01"
+            if api_key_clean:
+                headers["x-api-key"] = api_key_clean
+            for k, v in custom_headers.items():
+                if k and v:
+                    headers[str(k)] = str(v)
             body = {"model": model_id, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
         elif api_type == "google-generative-ai":
             gbase = base
             if not gbase.endswith("/v1beta") and not gbase.endswith("/v1"):
                 gbase = gbase + "/v1beta"
             endpoint = f"{gbase}/models/{model_id}:generateContent"
-            headers = {"Content-Type": "application/json"}
-            if api_key:
-                headers["x-goog-api-key"] = api_key
+            if api_key_clean:
+                headers["x-goog-api-key"] = api_key_clean
+            for k, v in custom_headers.items():
+                if k and v:
+                    headers[str(k)] = str(v)
             body = {"contents": [{"parts": [{"text": "hi"}]}]}
         elif api_type == "openai-responses":
             endpoint = base + "/responses" if base.endswith("/v1") else base + "/v1/responses"
-            headers = {"Content-Type": "application/json", "Accept": "application/json"}
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
+            if auth_bearer:
+                headers["Authorization"] = auth_bearer
+            for k, v in custom_headers.items():
+                if k and v:
+                    headers[str(k)] = str(v)
             body = {"model": model_id, "input": "hi", "max_output_tokens": 1}
-        else:  # openai-completions (默认)
+        else:
             endpoint = base + "/chat/completions" if base.endswith("/v1") else base + "/v1/chat/completions"
-            headers = {"Content-Type": "application/json", "Accept": "application/json"}
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
+            if auth_bearer:
+                headers["Authorization"] = auth_bearer
+            for k, v in custom_headers.items():
+                if k and v:
+                    headers[str(k)] = str(v)
             body = {"model": model_id, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}
 
         data = json.dumps(body).encode("utf-8")
@@ -414,40 +1071,52 @@ def test_model(base_url, api_key, api_type, model_id):
 class ApiBridge:
     def __init__(self):
         self._window = None
+        self._last_selected_provider = None
 
     def set_window(self, win):
         self._window = win
 
     def discover_configs(self):
-        return {"targets": discover_config_targets(), "defaultPath": str(DEFAULT_MODELS_PATH)}
+        path = DEFAULT_MODELS_PATH.resolve()
+        config = load_config(path)
+        return {
+            "targets": [{
+                "label": "Pi",
+                "path": str(path),
+                "providerCount": len(config.get("providers", {})),
+                "exists": path.exists(),
+                "schema": "pi-providers",
+                "editable": True,
+            }],
+            "defaultPath": str(DEFAULT_MODELS_PATH)
+        }
 
     def get_config(self, path=None):
         config_path = normalize_config_path(path)
-        schema = "pi-providers"
-        editable = True
-        if config_path.exists():
-            try:
-                raw_data = read_config_file(config_path)
-                schema = detect_config_schema(config_path, raw_data) or "unknown"
-                editable = is_editable_schema(schema)
-            except Exception:
-                schema = "unknown"
-                editable = False
-        return {"config": load_config(config_path), "path": str(config_path), "schema": schema, "editable": editable, "selectedProviderId": getattr(self, '_last_selected_provider', None)}
+        cfg = load_config(config_path, merge_builtins=True)
+        return {
+            "config": cfg,
+            "path": str(config_path),
+            "schema": "pi-providers",
+            "editable": True,
+            "selectedProviderId": self._last_selected_provider
+        }
 
     def save_config(self, config_json_str, path=None):
         try:
             config_path = normalize_config_path(path)
-            if config_path.exists():
-                raw_data = read_config_file(config_path)
-                schema = detect_config_schema(config_path, raw_data)
-                if not is_editable_schema(schema):
-                    return {"success": False, "error": "当前配置格式为只读预览，不能直接写回。"}
             data = json.loads(config_json_str) if isinstance(config_json_str, str) else config_json_str
+            disabled_count = 0
+            for p in (data.get("providers") or {}).values():
+                if not isinstance(p, dict):
+                    continue
+                for m in p.get("models") or []:
+                    if isinstance(m, dict) and m.get("disabled") is True:
+                        disabled_count += 1
             save_config(data, config_path)
-            saved = load_config(config_path)
-            model_count = sum(len(provider.get("models", [])) for provider in saved.get("providers", {}).values() if isinstance(provider, dict))
-            return {"success": True, "providerCount": len(saved.get("providers", {})), "modelCount": model_count}
+            saved = load_config(config_path, merge_builtins=False)
+            model_count = sum(len(p.get("models", [])) for p in saved.get("providers", {}).values() if isinstance(p, dict))
+            return {"success": True, "providerCount": len(saved.get("providers", {})), "modelCount": model_count, "disabledCount": disabled_count}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -458,11 +1127,46 @@ class ApiBridge:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def test_model(self, base_url, api_key, api_type, model_id):
+    def test_model(self, base_url, api_key, api_type, model_id, custom_headers=None):
         try:
-            return test_model(base_url, api_key, api_type, model_id)
+            return test_model(base_url, api_key, api_type, model_id, custom_headers)
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    def get_default_model(self):
+        try:
+            s = load_pi_settings()
+            return {
+                "success": True,
+                "defaultProvider": s.get("defaultProvider") or "",
+                "defaultModel": s.get("defaultModel") or ""
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def set_default_model(self, provider_id, model_id):
+        try:
+            s = load_pi_settings()
+            s["defaultProvider"] = str(provider_id or "").strip()
+            s["defaultModel"] = str(model_id or "").strip()
+            if not s["defaultProvider"]:
+                s.pop("defaultProvider", None)
+            if not s["defaultModel"]:
+                s.pop("defaultModel", None)
+            ok = save_pi_settings(s)
+            if ok:
+                return {"success": True, "defaultProvider": s.get("defaultProvider", ""), "defaultModel": s.get("defaultModel", "")}
+            return {"success": False, "error": "写入 settings.json 失败"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def rescan_builtins(self):
+        try:
+            builtins = scan_builtin_providers()
+            return {"success": True, "builtins": builtins}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
 
     def export_provider_txt(self, config_json_str, path, provider_id):
         try:
@@ -486,7 +1190,7 @@ class ApiBridge:
         try:
             config_path = normalize_config_path(None)
             data = load_config(config_path)
-            provider_id = getattr(self, '_last_selected_provider', None)
+            provider_id = self._last_selected_provider
             if not provider_id:
                 return {"success": False, "error": "请先选择一个服务商"}
             out_path, text = export_provider_txt(data, config_path, provider_id)
@@ -511,10 +1215,6 @@ class ApiBridge:
 
     def maximize_window(self):
         if self._window:
-            if hasattr(self._window, 'toggle_fullscreen'):
-                # Check maximized state or toggle
-                pass
-            # pywebview maximize / restore
             try:
                 self._window.restore() if getattr(self, '_maximized', False) else self._window.maximize()
                 self._maximized = not getattr(self, '_maximized', False)
@@ -524,6 +1224,7 @@ class ApiBridge:
     def close_window(self):
         if self._window:
             self._window.destroy()
+
 
 HTML_CONTENT = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -549,954 +1250,919 @@ HTML_CONTENT = """<!DOCTYPE html>
     --b-blue: #3B82F6;
     --b-green: #10B981;
     --b-amber: #F59E0B;
-    --s-gold: #C8962C;
-    --b-serif: "Noto Serif SC", "Songti SC", serif;
-    --b-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
-    --b-mono: "JetBrains Mono", "Cascadia Code", "Consolas", "SF Mono", monospace;
-
-    /* 兼容旧变量名并映射到屎山黑橙美学 */
-    --card-bg: #161B23;
-    --card-hover: #1D232D;
-    --glass-border: #262C36;
-    --glass-border-focus: #E64A2E;
-    --input-bg: #11151C;
-    --primary: #E64A2E;
-    --primary-hover: #FF7A5C;
-    --primary-glow: rgba(230, 74, 46, 0.25);
-    --emerald: #10B981;
-    --emerald-hover: #059669;
-    --emerald-glow: rgba(16, 185, 129, 0.25);
-    --rose: #E64A2E;
-    --rose-hover: #DC2626;
-    --amber: #F59E0B;
-    --indigo: #6366F1;
-    --text-main: #F5F5F4;
-    --text-muted: #B8BCC4;
-    --text-dim: #6B7280;
+    --b-purple: #A855F7;
+    --b-sans: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --b-mono: "JetBrains Mono", "Cascadia Code", "Fira Code", Consolas, monospace;
   }
-  * { box-sizing: border-box; margin: 0; padding: 0; font-family: var(--b-sans); user-select: none; }
-  body { font-size: 13.5px; line-height: 1.45; }
-  
-  ::-webkit-scrollbar { width: 5px; height: 5px; }
-  ::-webkit-scrollbar-track { background: var(--b-bg); }
-  ::-webkit-scrollbar-thumb { background: var(--b-line-2); border-radius: 2px; }
-  ::-webkit-scrollbar-thumb:hover { background: var(--b-text-3); }
-
+  * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
   body {
     background-color: var(--b-bg);
-    background-image: radial-gradient(circle at 20% 0%, rgba(230, 74, 46, 0.05), transparent 50%), linear-gradient(180deg, var(--b-bg) 0%, var(--b-bg-2) 100%);
     color: var(--b-text);
+    font-family: var(--b-sans);
+    font-size: 13px;
     height: 100vh;
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    border: 1px solid var(--b-line);
-    border-radius: 4px;
   }
-  
-  /* 顶部现代化标题栏 (屎山 topbar 风格) */
+  input, select, textarea, button { font-family: inherit; font-size: inherit; }
+
   header {
-    background: rgba(11, 14, 19, 0.92);
-    backdrop-filter: blur(20px);
+    height: 44px;
+    background: var(--b-bg-2);
     border-bottom: 1px solid var(--b-line);
-    padding: 0 20px;
-    height: 56px;
     display: flex;
+    align-items: center;
     justify-content: space-between;
-    align-items: center;
+    padding: 0 12px;
     flex-shrink: 0;
   }
-  .pywebview-drag-region { -webkit-app-region: drag; }
-  .pywebview-no-drag-region { -webkit-app-region: no-drag; }
-
-  .header-left {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    min-width: 0;
-    flex: 1;
-  }
-  .header-right { display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
-
+  .header-left, .header-right { display: flex; align-items: center; gap: 10px; }
   .logo-title {
-    font-family: var(--b-serif);
-    font-weight: 700;
-    font-size: 16px;
-    letter-spacing: 1.5px;
-    color: var(--b-text);
     display: flex;
     align-items: center;
-    gap: 10px;
-    white-space: nowrap;
-    flex-shrink: 0;
-  }
-  .logo-title .brand-mark {
-    width: 28px;
-    height: 28px;
-    background: var(--b-accent);
-    display: grid;
-    place-items: center;
-    font-family: var(--b-serif);
-    font-size: 14px;
-    color: #fff;
-    font-weight: 900;
-    border-radius: 2px;
-    box-shadow: 0 0 10px rgba(230, 74, 46, 0.35);
-  }
-  .logo-title .sub-en {
-    font-family: var(--b-mono);
-    font-size: 9px;
-    font-weight: 500;
-    letter-spacing: 0.16em;
-    color: var(--b-text-3);
-    text-transform: uppercase;
-  }
-  
-  /* 顶部一体化分段标签栏 (Segmented Tabs) */
-  .target-tabs {
-    display: flex;
-    align-items: center;
-    background: var(--b-surface);
-    border: 1px solid var(--b-line);
-    border-radius: 4px;
-    padding: 2px;
-    gap: 2px;
-    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.3);
-  }
-  .target-tab-item {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 12px;
-    border-radius: 3px;
-    cursor: pointer;
-    font-family: var(--b-mono);
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--b-text-3);
-    transition: all 0.15s ease;
-    user-select: none;
-    border: 1px solid transparent;
-  }
-  .target-tab-item:hover {
-    color: var(--b-text);
-    background: var(--b-surface-2);
-  }
-  .target-tab-item.active {
-    background: var(--b-surface-2);
-    color: #FFFFFF;
-    font-weight: 700;
-    border-color: var(--b-line-2);
-    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
-    position: relative;
-  }
-  .target-tab-item.active::before {
-    content: '';
-    position: absolute;
-    bottom: -2px;
-    left: 20%;
-    right: 20%;
-    height: 2px;
-    background: var(--b-accent);
-    border-radius: 1px;
-    box-shadow: 0 0 6px var(--b-accent);
-  }
-  .target-tab-item .tab-icon {
-    font-size: 12px;
-    opacity: 0.8;
-  }
-  .target-tab-item.active .tab-icon {
-    opacity: 1;
-  }
-
-  .header-right {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    flex-shrink: 0;
-  }
-
-  .header-actions {
-    display: flex;
     gap: 8px;
-    flex-shrink: 0;
-    flex-wrap: wrap;
-    justify-content: flex-end;
+    font-weight: 600;
+    font-size: 13.5px;
+    letter-spacing: 0.5px;
   }
-
-  /* 窗口控制三键 */
-  .window-controls {
-    display: flex;
-    align-items: center;
-    margin-left: 6px;
-    border-left: 1px solid var(--b-line);
-    padding-left: 8px;
-    gap: 2px;
-  }
-  .win-btn {
-    width: 28px;
-    height: 28px;
+  .brand-mark {
+    width: 22px;
+    height: 22px;
     border-radius: 2px;
+    background: var(--b-accent);
+    color: #FFF;
     display: flex;
     align-items: center;
     justify-content: center;
-    cursor: pointer;
-    color: var(--b-text-3);
     font-size: 12px;
-    transition: all 0.15s ease;
+    font-weight: 700;
   }
-  .win-btn:hover {
-    background: var(--b-surface-2);
-    color: var(--b-text);
-  }
-  .win-btn.close:hover {
-    background: var(--b-accent);
-    color: white;
-  }
+  .sub-en { font-size: 9.5px; color: var(--b-text-3); font-family: var(--b-mono); letter-spacing: 0.8px; }
 
   .btn {
-    font-family: var(--b-sans);
-    border: 1px solid var(--b-line-2);
-    border-radius: 2px;
-    padding: 6px 14px;
-    font-size: 12.5px;
-    font-weight: 500;
-    cursor: pointer;
     display: inline-flex;
     align-items: center;
-    justify-content: center;
-    gap: 6px;
-    white-space: nowrap;
-    transition: all 0.12s ease;
-    background: var(--b-surface);
-    color: var(--b-text);
-  }
-  .btn:hover {
-    border-color: var(--b-accent);
-    color: var(--b-accent);
-    background: var(--b-surface-2);
-  }
-  .btn .shortcut-badge {
-    font-family: var(--b-mono);
-    font-size: 9.5px;
-    letter-spacing: 0.05em;
-    opacity: 0.85;
-    background: rgba(0, 0, 0, 0.35);
-    padding: 1px 5px;
+    gap: 5px;
+    padding: 4px 10px;
     border-radius: 2px;
-    color: var(--b-text-2);
-    border: 1px solid var(--b-line);
-  }
-  .btn-primary {
-    background: var(--b-accent);
-    border-color: var(--b-accent);
-    color: #FFF !important;
-  }
-  .btn-primary:hover {
-    background: var(--b-accent-2);
-    border-color: var(--b-accent-2);
-    color: #FFF !important;
-    box-shadow: 0 0 12px rgba(230, 74, 46, 0.4);
-  }
-  .btn-emerald {
-    background: var(--b-surface-2);
-    border-color: rgba(16, 185, 129, 0.4);
-    color: #6EE7B7;
-  }
-  .btn-emerald:hover {
-    border-color: var(--b-green);
-    background: rgba(16, 185, 129, 0.14);
-    color: #A7F3D0;
-  }
-  .btn-indigo {
-    background: var(--b-surface-2);
-    border-color: rgba(99, 102, 241, 0.4);
-    color: #A5B4FC;
-  }
-  .btn-indigo:hover {
-    border-color: #818CF8;
-    background: rgba(99, 102, 241, 0.14);
-    color: #C7D2FE;
-  }
-  .btn-rose {
-    background: var(--b-surface-2);
-    border-color: rgba(230, 74, 46, 0.35);
-    color: #FFA39E;
-  }
-  .btn-rose:hover {
-    border-color: var(--b-accent);
-    background: var(--b-accent-soft);
-    color: #FFCCC7;
-  }
-  .btn-secondary {
-    background: var(--b-surface);
-    color: var(--b-text);
-    border: 1px solid var(--b-line-2);
-  }
-  .btn-secondary:hover {
-    background: var(--b-surface-2);
-    border-color: var(--b-text-3);
-  }
-  .btn-ghost {
-    background: transparent;
     border: 1px solid transparent;
-    color: var(--b-text-3);
-    padding: 4px 8px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 500;
+    line-height: 1.4;
+    transition: all 0.12s ease;
+    white-space: nowrap;
   }
-  .btn-ghost:hover {
-    background: var(--b-accent-soft);
-    color: var(--b-accent);
-    border-color: transparent;
+  .btn-primary { background: var(--b-accent); color: #FFF; border-color: var(--b-accent); }
+  .btn-primary:hover { background: var(--b-accent-2); border-color: var(--b-accent-2); }
+  .btn-secondary { background: var(--b-surface-2); color: var(--b-text); border-color: var(--b-line-2); }
+  .btn-secondary:hover { background: var(--b-line); border-color: var(--b-text-4); }
+  .btn-ghost { background: transparent; color: var(--b-text-2); border-color: var(--b-line); }
+  .btn-ghost:hover { background: var(--b-surface); color: var(--b-text); border-color: var(--b-line-2); }
+  .btn-emerald { background: rgba(16, 185, 129, 0.14); color: #6EE7B7; border-color: rgba(16, 185, 129, 0.4); }
+  .btn-emerald:hover { background: rgba(16, 185, 129, 0.24); border-color: #6EE7B7; }
+  .btn-indigo { background: rgba(59, 130, 246, 0.14); color: #93C5FD; border-color: rgba(59, 130, 246, 0.4); }
+  .btn-indigo:hover { background: rgba(59, 130, 246, 0.24); border-color: #93C5FD; }
+  .btn-rose { background: rgba(230, 74, 46, 0.14); color: #FFA39E; border-color: rgba(230, 74, 46, 0.4); }
+  .btn-rose:hover { background: rgba(230, 74, 46, 0.24); border-color: #FFA39E; }
+  .btn-purple { background: rgba(168, 85, 247, 0.14); color: #D8B4FE; border-color: rgba(168, 85, 247, 0.4); }
+  .btn-purple:hover { background: rgba(168, 85, 247, 0.24); border-color: #D8B4FE; }
+  .btn-amber { background: rgba(245, 158, 11, 0.14); color: #FCD34D; border-color: rgba(245, 158, 11, 0.4); }
+  .btn-amber:hover { background: rgba(245, 158, 11, 0.24); border-color: #FCD34D; }
+
+  .window-controls { display: flex; align-items: center; margin-left: 6px; }
+  .win-btn {
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    color: var(--b-text-3);
+    font-size: 13px;
+    transition: all 0.1s ease;
+  }
+  .win-btn:hover { background: var(--b-surface-2); color: var(--b-text); }
+  .win-btn.close:hover { background: var(--b-accent); color: #FFF; }
+
+  /* 2-Column Main Layout */
+  .layout {
+    flex: 1;
+    display: flex;
+    overflow: hidden;
+    position: relative;
   }
 
-  /* 三栏工作台平铺布局 */
-  .layout {
-    display: flex;
-    flex: 1;
-    overflow: hidden;
-    background: var(--b-bg);
-  }
-  
-  /* 栏目1: 左侧服务商列表 (固定宽度 240px) */
   .sidebar {
-    width: 240px;
+    width: 260px;
     min-width: 220px;
-    background: var(--b-surface);
+    max-width: 380px;
+    background: var(--b-bg-2);
     border-right: 1px solid var(--b-line);
     display: flex;
     flex-direction: column;
     flex-shrink: 0;
   }
   .sidebar-header {
-    padding: 10px 14px;
-    border-bottom: 1px solid var(--b-line);
+    height: 40px;
+    padding: 0 12px;
     display: flex;
-    justify-content: space-between;
     align-items: center;
-    font-family: var(--b-serif);
-    font-size: 13px;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--b-line);
+    font-size: 12px;
     font-weight: 600;
-    letter-spacing: 0.5px;
-    color: var(--b-text);
+    color: var(--b-text-2);
+    background: var(--b-bg-2);
+    flex-shrink: 0;
+  }
+  .sidebar-header .count-chip {
+    font-size: 10.5px;
+    font-family: var(--b-mono);
+    padding: 1px 5px;
+    border-radius: 2px;
+    background: var(--b-surface);
+    color: var(--b-text-3);
+    border: 1px solid var(--b-line);
   }
   .sidebar-search {
-    padding: 8px 10px;
+    padding: 8px 12px;
     border-bottom: 1px solid var(--b-line);
-    background: var(--b-bg);
+    background: var(--b-bg-2);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
   }
   .search-input {
     width: 100%;
     background: var(--b-surface);
     border: 1px solid var(--b-line);
     border-radius: 2px;
-    padding: 5px 8px;
+    padding: 4px 7px;
     color: var(--b-text);
     font-family: var(--b-sans);
     font-size: 12px;
     outline: none;
     transition: border-color 0.15s;
   }
-  .search-input:focus {
-    border-color: var(--b-accent);
-  }
+  .search-input:focus { border-color: var(--b-accent); }
   .search-input::placeholder { color: var(--b-text-4); }
 
   .provider-list {
     flex: 1;
     overflow-y: auto;
-    padding: 6px;
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-    background: var(--b-bg);
-  }
-  
-  .p-card {
-    background: var(--b-surface);
-    border: 1px solid var(--b-line);
-    border-radius: 2px;
-    padding: 8px 10px;
-    cursor: pointer;
-    transition: all 0.12s ease;
-    position: relative;
-  }
-  .p-card:hover {
-    border-color: var(--b-line-2);
-    background: var(--b-surface-2);
-  }
-  .p-card.active {
-    border-color: var(--b-line-2);
-    border-left: 3px solid var(--b-accent);
-    background: var(--b-surface-2);
-  }
-  .p-card-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px; }
-  .p-name { font-weight: 600; font-size: 12.5px; color: var(--b-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 130px; }
-  .p-id { font-size: 11px; color: var(--b-text-3); font-family: var(--b-mono); }
-  .p-badges { display: flex; align-items: center; gap: 4px; }
-  .p-count { font-family: var(--b-mono); font-size: 10px; background: var(--b-bg); padding: 1px 5px; border-radius: 2px; color: var(--b-text-2); border: 1px solid var(--b-line); }
-  .p-proto { font-family: var(--b-mono); font-size: 9px; padding: 1px 4px; border-radius: 2px; background: rgba(230, 74, 46, 0.12); color: var(--b-accent-2); border: 1px solid rgba(230, 74, 46, 0.25); text-transform: uppercase; }
-
-  /* 栏目2: 中间服务商连接配置 (固定 310px) */
-  .column-provider {
-    width: 310px;
-    min-width: 290px;
-    background: var(--b-surface);
-    border-right: 1px solid var(--b-line);
-    display: flex;
-    flex-direction: column;
-    overflow-y: auto;
-    padding: 16px 16px;
-    flex-shrink: 0;
-    gap: 12px;
-  }
-
-  /* 栏目3: 右侧模型管理与测活 (自适应填满) */
-  .column-models {
-    flex: 1;
-    min-width: 380px;
-    background: var(--b-bg-2);
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-    padding: 16px 20px;
-    gap: 12px;
-  }
-
-  .card {
-    background: var(--b-surface);
-    border: 1px solid var(--b-line);
-    border-radius: 2px;
-    padding: 14px 16px;
-    position: relative;
-  }
-  .card-title {
-    font-family: var(--b-serif);
-    font-size: 13.5px;
-    font-weight: 600;
-    letter-spacing: 0.5px;
-    margin-bottom: 12px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    color: var(--b-text);
-    border-bottom: 1px solid var(--b-line);
-    padding-bottom: 8px;
-  }
-  .card-title .title-left {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .card-title .count-badge {
-    font-family: var(--b-mono);
-    font-size: 10px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    padding: 2px 6px;
-    border-radius: 2px;
-    background: var(--b-bg);
-    color: var(--b-text-3);
-    border: 1px solid var(--b-line);
-  }
-
-  /* 表单查看模式 (View Mode) 工业数据条 */
-  .view-panel {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }
-  .view-field {
+    padding: 6px 8px;
     display: flex;
     flex-direction: column;
     gap: 2px;
-    border-bottom: 1px dashed var(--b-line);
-    padding-bottom: 6px;
-  }
-  .view-field:last-child { border-bottom: none; padding-bottom: 0; }
-  .view-label {
-    font-family: var(--b-mono);
-    font-size: 9.5px;
-    letter-spacing: 0.08em;
-    color: var(--b-text-4);
-    text-transform: uppercase;
-  }
-  .view-value {
-    font-family: var(--b-mono);
-    font-size: 12px;
-    color: var(--b-text);
-    word-break: break-all;
-    user-select: text;
-    line-height: 1.4;
-  }
-  .view-value.empty {
-    color: var(--b-text-4);
-    font-style: italic;
   }
 
-  /* 表单编辑模式 (Edit Mode) */
+  /* Single-line Provider Row (.p-row) */
+  .p-row {
+    height: 36px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 8px;
+    border-radius: 2px;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: background 0.1s, border-color 0.1s;
+    position: relative;
+    user-select: none;
+  }
+  .p-row:hover {
+    background: var(--b-surface);
+    border-color: var(--b-line);
+  }
+  .p-row.active {
+    background: var(--b-surface-2);
+    border-color: var(--b-line-2);
+    border-left: 3px solid var(--b-accent);
+  }
+  .p-row.dragging { opacity: 0.35; }
+  .p-row.drag-over { border-top: 2px solid var(--b-accent); }
+
+  .p-row-handle {
+    font-size: 11px;
+    color: var(--b-text-4);
+    cursor: grab;
+    flex-shrink: 0;
+    line-height: 1;
+  }
+  .p-row:hover .p-row-handle { color: var(--b-text-3); }
+
+  .p-row-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: var(--b-text-4);
+  }
+  .p-row-dot.proto-openai-dot { background: var(--b-blue); }
+  .p-row-dot.proto-claude-dot { background: #D946EF; }
+  .p-row-dot.proto-gemini-dot { background: var(--b-green); }
+  .p-row-dot.proto-resp-dot { background: #6366F1; }
+
+  .p-row-name {
+    font-size: 12px;
+    color: var(--b-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+  }
+  .p-row.active .p-row-name { font-weight: 600; color: #FFF; }
+
+  .p-row-badges {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+  .p-proto {
+    font-size: 9.5px;
+    font-family: var(--b-mono);
+    padding: 1px 4px;
+    border-radius: 2px;
+    background: rgba(59, 130, 246, 0.15);
+    color: #93C5FD;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+    line-height: 1.2;
+  }
+  .p-proto.proto-builtin {
+    background: rgba(168, 85, 247, 0.18);
+    color: #D8B4FE;
+    border-color: rgba(168, 85, 247, 0.35);
+  }
+  .p-count {
+    font-size: 10px;
+    font-family: var(--b-mono);
+    color: var(--b-text-3);
+    padding: 0 3px;
+  }
+
+  .p-row-actions {
+    display: none;
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
+  }
+  .p-row:hover .p-row-actions { display: inline-flex; }
+  .p-row.active .p-row-actions { display: inline-flex; }
+  .p-row-btn {
+    width: 20px;
+    height: 20px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    background: transparent;
+    color: var(--b-text-3);
+    border-radius: 2px;
+    cursor: pointer;
+    font-size: 11px;
+    padding: 0;
+  }
+  .p-row-btn:hover { background: var(--b-surface-2); color: var(--b-text); }
+  .p-row-btn.del:hover { background: var(--b-accent); color: #FFF; }
+
+  /* Column Resizer */
+  .col-resizer {
+    width: 4px;
+    background: transparent;
+    cursor: col-resize;
+    flex-shrink: 0;
+    transition: background 0.15s;
+    z-index: 10;
+  }
+  .col-resizer:hover, .col-resizer.resizing { background: var(--b-accent); }
+
+  /* Full-width Models Column */
+  .column-models {
+    flex: 1;
+    min-width: 0;
+    background: var(--b-bg);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .model-work-tabs {
+    height: 40px;
+    padding: 0 12px;
+    background: var(--b-bg-2);
+    border-bottom: 1px solid var(--b-line);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-shrink: 0;
+  }
+  .model-tab-buttons { display: flex; align-items: center; gap: 4px; }
+  .model-tab-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 10px;
+    border-radius: 2px;
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--b-text-3);
+    border: 1px solid transparent;
+    transition: all 0.1s;
+  }
+  .model-tab-btn:hover { color: var(--b-text); background: var(--b-surface); }
+  .model-tab-btn.active {
+    color: var(--b-text);
+    background: var(--b-surface-2);
+    border-color: var(--b-line-2);
+    font-weight: 600;
+  }
+  .model-tab-badge {
+    font-size: 10px;
+    font-family: var(--b-mono);
+    padding: 1px 4px;
+    border-radius: 2px;
+    background: var(--b-surface);
+    color: var(--b-text-3);
+    border: 1px solid var(--b-line);
+  }
+  .model-tab-btn.active .model-tab-badge { background: var(--b-accent); color: #FFF; border-color: var(--b-accent); }
+
+  .model-view-pane {
+    flex: 1;
+    display: none;
+    flex-direction: column;
+    overflow: hidden;
+    padding: 10px 12px;
+  }
+  .model-view-pane.active { display: flex; }
+
+  .model-add-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 8px;
+    flex-shrink: 0;
+  }
+  .input {
+    background: var(--b-surface);
+    border: 1px solid var(--b-line);
+    border-radius: 2px;
+    padding: 4px 8px;
+    color: var(--b-text);
+    font-size: 12px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .input:focus { border-color: var(--b-accent); }
+  .input::placeholder { color: var(--b-text-4); }
+
+  /* Scrollbars */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--b-line-2); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--b-text-4); }
+
+  /* Model Table Header (Non-scrolling) */
+  .model-table-header {
+    height: 28px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 10px;
+    background: var(--b-bg-2);
+    border: 1px solid var(--b-line);
+    border-bottom: none;
+    border-radius: 2px 2px 0 0;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--b-text-3);
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    flex-shrink: 0;
+    box-sizing: border-box;
+  }
+  .model-table-header .th-handle { width: 20px; flex-shrink: 0; text-align: center; }
+  .model-table-header .th-alias  { width: 200px; flex-shrink: 0; padding-left: 6px; box-sizing: border-box; }
+  .model-table-header .th-id     { flex: 1; min-width: 140px; padding-left: 6px; box-sizing: border-box; }
+  .model-table-header .th-status { width: 70px; flex-shrink: 0; text-align: center; }
+  .model-table-header .th-actions{ width: 290px; flex-shrink: 0; text-align: right; }
+
+  /* Model Rows Container (Scrolling) */
+  .models-container {
+    flex: 1;
+    overflow-y: auto;
+    border: 1px solid var(--b-line);
+    border-radius: 0 0 2px 2px;
+    background: var(--b-surface);
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* Single-line Model Row (.model-row) */
+  .model-row {
+    height: 36px;
+    min-height: 36px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 10px;
+    border-bottom: 1px solid var(--b-line);
+    transition: background 0.1s;
+    user-select: none;
+    position: relative;
+    box-sizing: border-box;
+  }
+  .model-row:last-child { border-bottom: none; }
+  .model-row:hover { background: var(--b-surface-2); }
+  .model-row.disabled { opacity: 0.5; background: var(--b-bg); }
+  .model-row.dragging { opacity: 0.3; }
+  .model-row.drag-over { border-top: 2px solid var(--b-accent); }
+
+  .model-row-handle {
+    width: 20px;
+    font-size: 12px;
+    color: var(--b-text-4);
+    cursor: grab;
+    flex-shrink: 0;
+    line-height: 1;
+    text-align: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .model-row:hover .model-row-handle { color: var(--b-text-3); }
+
+  .model-row-alias {
+    width: 200px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+  }
+  .alias-input {
+    width: 100%;
+    box-sizing: border-box;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 2px;
+    padding: 3px 6px;
+    color: var(--b-text);
+    font-size: 12px;
+    font-weight: 500;
+    font-family: inherit;
+    outline: none;
+    transition: all 0.12s;
+  }
+  .alias-input:hover { background: var(--b-surface); border-color: var(--b-line-2); }
+  .alias-input:focus { background: var(--b-bg); border-color: var(--b-accent); }
+
+  .model-row-id {
+    flex: 1;
+    min-width: 140px;
+    box-sizing: border-box;
+    font-family: var(--b-mono);
+    font-size: 11.5px;
+    color: var(--b-text-3);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 2px 6px;
+    background: var(--b-bg);
+    border-radius: 2px;
+    border: 1px solid var(--b-line);
+    line-height: 1.4;
+  }
+
+  .model-row-status {
+    width: 70px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .disabled-badge {
+    font-size: 10px;
+    font-family: var(--b-mono);
+    padding: 1px 5px;
+    border-radius: 2px;
+    background: rgba(230, 74, 46, 0.15);
+    color: #FFA39E;
+    border: 1px solid rgba(230, 74, 46, 0.3);
+    white-space: nowrap;
+  }
+  .fail-streak {
+    font-size: 10px;
+    font-family: var(--b-mono);
+    padding: 1px 4px;
+    border-radius: 2px;
+    background: rgba(245, 158, 11, 0.15);
+    color: #FCD34D;
+    border: 1px solid rgba(245, 158, 11, 0.3);
+    white-space: nowrap;
+  }
+
+  .model-row-actions {
+    width: 290px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 3px;
+  }
+  .model-row-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2px 6px;
+    border-radius: 2px;
+    border: 1px solid var(--b-line);
+    background: transparent;
+    color: var(--b-text-2);
+    font-size: 11px;
+    cursor: pointer;
+    line-height: 1.3;
+    white-space: nowrap;
+    transition: all 0.1s;
+  }
+  .model-row-btn:hover { background: var(--b-surface-2); border-color: var(--b-line-2); color: var(--b-text); }
+  .model-row-btn.test-btn {
+    color: #93C5FD;
+    border-color: rgba(59, 130, 246, 0.3);
+    background: rgba(59, 130, 246, 0.08);
+  }
+  .model-row-btn.test-btn:hover {
+    background: rgba(59, 130, 246, 0.2);
+    border-color: #93C5FD;
+  }
+  .model-row-btn.test-btn.testing { opacity: 0.5; cursor: wait; }
+  .model-row-btn.test-btn.ok {
+    color: #6EE7B7;
+    background: rgba(16, 185, 129, 0.15);
+    border-color: rgba(16, 185, 129, 0.4);
+  }
+  .model-row-btn.test-btn.fail {
+    color: #FFA39E;
+    background: rgba(230, 74, 46, 0.15);
+    border-color: rgba(230, 74, 46, 0.4);
+  }
+  .model-row-btn.default-btn {
+    color: var(--b-amber);
+    border-color: rgba(245, 158, 11, 0.3);
+  }
+  .model-row-btn.default-btn.is-default {
+    background: rgba(245, 158, 11, 0.18);
+    border-color: var(--b-amber);
+    color: #FCD34D;
+    font-weight: 600;
+  }
+  .model-row-btn.del-btn:hover {
+    background: var(--b-accent);
+    color: #FFF;
+    border-color: var(--b-accent);
+  }
+
+  /* Slide-in Provider Drawer */
+  .provider-drawer {
+    position: fixed;
+    top: 44px;
+    right: 0;
+    bottom: 26px;
+    width: 370px;
+    max-width: calc(100vw - 260px);
+    z-index: 50;
+    pointer-events: none;
+    visibility: hidden;
+    transition: visibility 0s 0.22s;
+  }
+  .provider-drawer.open {
+    pointer-events: auto;
+    visibility: visible;
+    transition: visibility 0s 0s;
+  }
+  .drawer-backdrop {
+    position: fixed;
+    top: 44px;
+    left: 0;
+    right: 0;
+    bottom: 26px;
+    background: rgba(0, 0, 0, 0.45);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.22s ease;
+  }
+  .provider-drawer.open .drawer-backdrop {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .drawer-panel {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    background: var(--b-bg-2);
+    border-left: 1px solid var(--b-line-2);
+    display: flex;
+    flex-direction: column;
+    box-shadow: -6px 0 24px rgba(0, 0, 0, 0.5);
+    transform: translateX(100%);
+    transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .provider-drawer.open .drawer-panel {
+    transform: translateX(0);
+  }
+  .drawer-header {
+    height: 42px;
+    padding: 0 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--b-line);
+    font-size: 13px;
+    font-weight: 600;
+    flex-shrink: 0;
+    background: var(--b-surface);
+  }
+  .drawer-close {
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    background: transparent;
+    color: var(--b-text-3);
+    border-radius: 2px;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  .drawer-close:hover { background: var(--b-surface-2); color: var(--b-text); }
+  .drawer-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .view-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: var(--b-surface);
+    border: 1px solid var(--b-line);
+    border-radius: 2px;
+    padding: 12px;
+  }
+  .view-field { display: flex; flex-direction: column; gap: 2px; }
+  .view-label { font-size: 10.5px; color: var(--b-text-3); text-transform: uppercase; letter-spacing: 0.5px; }
+  .view-value { font-size: 12px; color: var(--b-text); font-family: var(--b-mono); word-break: break-all; }
+  .view-value.empty { color: var(--b-text-4); font-style: italic; }
+
   .edit-panel {
     display: none;
     flex-direction: column;
     gap: 10px;
+    background: var(--b-surface);
+    border: 1px solid var(--b-line);
+    border-radius: 2px;
+    padding: 12px;
   }
-  
-  .form-group { display: flex; flex-direction: column; gap: 4px; position: relative; }
-  .form-group label { font-family: var(--b-mono); font-size: 10px; letter-spacing: 0.06em; font-weight: 500; color: var(--b-text-3); display: flex; align-items: center; gap: 4px; text-transform: uppercase; }
+  .form-group { display: flex; flex-direction: column; gap: 4px; }
+  .form-group label { font-size: 11px; font-weight: 600; color: var(--b-text-2); }
   .input-wrapper { position: relative; display: flex; align-items: center; }
-  .input-wrapper .input { width: 100%; }
-  .input-wrapper .toggle-pwd {
+  .input-wrapper .input { width: 100%; padding-right: 28px; box-sizing: border-box; }
+  .toggle-pwd {
     position: absolute;
     right: 6px;
     cursor: pointer;
+    font-size: 12px;
     color: var(--b-text-3);
-    font-size: 12px;
-    padding: 2px;
-    border-radius: 2px;
-    transition: color 0.15s;
-  }
-  .input-wrapper .toggle-pwd:hover { color: var(--b-text); background: var(--b-surface-2); }
-
-  .input {
-    background: var(--b-bg);
-    border: 1px solid var(--b-line);
-    border-radius: 2px;
-    padding: 6px 9px;
-    color: var(--b-text);
-    font-family: var(--b-mono);
-    font-size: 12px;
-    outline: none;
-    user-select: text;
-    transition: border-color 0.15s;
-  }
-  .input:focus {
-    border-color: var(--b-accent);
-  }
-  select.input {
-    cursor: pointer;
-    font-family: var(--b-sans);
-  }
-  select.input option {
-    background-color: #161B23 !important;
-    color: #F5F5F4 !important;
-    padding: 6px 10px;
-  }
-
-  /* 模型工作区顶部分段导航 (Models Tab / Fetch Tab) */
-  .model-work-tabs {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    margin-bottom: 8px;
-    flex-shrink: 0;
-    flex-wrap: wrap;
-  }
-  .model-tab-buttons {
-    display: inline-flex;
-    background: var(--b-surface);
-    border: 1px solid var(--b-line);
-    border-radius: 4px;
-    padding: 2px;
-    gap: 2px;
-  }
-  .model-tab-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 12px;
-    border-radius: 3px;
-    cursor: pointer;
-    font-family: var(--b-mono);
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--b-text-3);
-    border: 1px solid transparent;
-    transition: all 0.15s ease;
     user-select: none;
   }
-  .model-tab-btn:hover {
-    color: var(--b-text);
-    background: var(--b-surface-2);
-  }
-  .model-tab-btn.active {
-    background: var(--b-surface-2);
-    color: #FFFFFF;
-    font-weight: 700;
-    border-color: var(--b-line-2);
-    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
-    position: relative;
-  }
-  .model-tab-btn.active::before {
-    content: '';
-    position: absolute;
-    bottom: -2px;
-    left: 20%;
-    right: 20%;
-    height: 2px;
-    background: var(--b-accent);
-    border-radius: 1px;
-  }
-  .model-tab-badge {
-    font-size: 10px;
-    padding: 1px 5px;
-    border-radius: 10px;
-    background: var(--b-line);
-    color: var(--b-text-2);
-  }
-  .model-tab-btn.active .model-tab-badge {
-    background: var(--b-accent-soft);
-    color: var(--b-accent-2);
-  }
+  .toggle-pwd:hover { color: var(--b-text); }
 
-  /* 模型视图容器 */
-  .model-view-pane {
-    display: none;
-    flex-direction: column;
-    flex: 1;
-    overflow: hidden;
-    min-height: 0;
-  }
-  .model-view-pane.active {
-    display: flex;
-  }
-
-  /* 模型列表容器 - 弹性撑满并支持滚动 */
-  .model-card-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-    flex-shrink: 0;
-  }
-  .model-add-bar {
-    display: flex;
-    gap: 6px;
-    background: var(--b-surface);
-    padding: 6px;
-    border-radius: 2px;
-    border: 1px solid var(--b-line);
-    flex-shrink: 0;
-    align-items: center;
-  }
-  .model-add-bar .input {
-    min-width: 0;
-  }
-  .model-add-bar .btn {
-    flex-shrink: 0;
-    white-space: nowrap;
-    padding: 6px 12px;
-  }
-  .models-tag-container {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    flex: 1;
-    overflow-y: auto;
-    overflow-x: hidden;
-    padding: 6px;
-    background: var(--b-surface);
-    border-radius: 2px;
-    border: 1px solid var(--b-line);
-    min-height: 0;
-  }
-
-  /* 定时测活下拉与健康状态 */
-  .schedule-wrap { position: relative; }
-  .schedule-dropdown {
-    position: absolute;
-    top: calc(100% + 6px);
-    right: 0;
-    min-width: 180px;
-    padding: 10px;
-    background: var(--b-surface);
-    border: 1px solid var(--b-line-2);
-    border-radius: 2px;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.6);
-    z-index: 999;
-  }
-  .schedule-dropdown-title { font-family: var(--b-mono); font-size: 10px; color: var(--b-text-4); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.1em; }
-  .schedule-option { display: flex; align-items: center; gap: 8px; padding: 5px 6px; border-radius: 2px; cursor: pointer; font-size: 12px; color: var(--b-text); transition: background 0.12s; }
-  .schedule-option:hover { background: var(--b-surface-2); }
-  .schedule-option input[type="radio"] { accent-color: var(--b-accent); cursor: pointer; }
-  .schedule-status { margin-top: 6px; padding: 6px 8px; font-family: var(--b-mono); font-size: 11px; color: var(--b-text-3); background: var(--b-bg); border-radius: 2px; border: 1px solid var(--b-line); line-height: 1.4; }
-  .schedule-status.active { color: var(--b-accent-2); border-color: rgba(230, 74, 46, 0.4); background: var(--b-accent-soft); }
-  .schedule-divider { height: 1px; background: var(--b-line); margin: 8px 0; }
-
-  #scheduleBtn.active { color: var(--b-accent-2); border-color: var(--b-accent); background: var(--b-accent-soft); }
-  #scheduleBtn.active::before { content: '●'; color: var(--b-accent); margin-right: 4px; animation: pulse 1.6s ease-in-out infinite; }
-
-  .health-summary { display: inline-flex; align-items: center; gap: 5px; margin-left: 4px; }
-  .health-pill {
-    display: inline-flex; align-items: center; gap: 3px;
-    font-family: var(--b-mono);
-    font-size: 10.5px; font-weight: 600;
-    padding: 1px 6px;
-    border-radius: 2px;
-    border: 1px solid transparent;
-  }
-  .health-pill.ok { background: rgba(16, 185, 129, 0.14); color: #6EE7B7; border-color: rgba(16, 185, 129, 0.35); }
-  .health-pill.fail { background: rgba(230, 74, 46, 0.14); color: #FFA39E; border-color: rgba(230, 74, 46, 0.35); }
-  .health-meta { font-family: var(--b-mono); font-size: 10px; color: var(--b-text-4); margin-left: 4px; }
-  .health-meta.testing { color: var(--b-amber); }
-
-  .model-tag.testing-all {
-    border-color: var(--b-accent);
-    background: var(--b-accent-soft);
-  }
-  .model-tag {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    background: var(--b-surface);
-    border: 1px solid var(--b-line);
-    border-radius: 2px;
-    padding: 5px 8px;
-    font-size: 12px;
-    transition: all 0.12s ease;
-    min-width: 0;
-  }
-  .model-tag:hover {
-    border-color: var(--b-line-2);
-    background: var(--b-surface-2);
-  }
-  .model-tag .alias-icon { font-size: 11px; flex-shrink: 0; opacity: 0.6; color: var(--b-text-3); }
-  .model-tag .alias-input {
-    background: transparent;
-    border: 1px dashed transparent;
-    border-radius: 2px;
-    color: var(--b-text);
-    font-size: 12px;
-    font-weight: 500;
-    flex: 1;
-    min-width: 70px;
-    max-width: 160px;
-    padding: 2px 4px;
-    outline: none;
-    font-family: inherit;
-    transition: all 0.12s;
-  }
-  .model-tag .alias-input:hover { border-color: var(--b-line-2); background: var(--b-bg); }
-  .model-tag .alias-input:focus { border-color: var(--b-accent); background: var(--b-bg); }
-  .model-tag .alias-id {
-    font-family: var(--b-mono);
-    font-size: 11px;
-    color: var(--b-text-3);
-    flex: 1.2;
-    min-width: 60px;
-    background: var(--b-bg);
-    padding: 2px 6px;
-    border-radius: 2px;
-    border: 1px solid var(--b-line);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .model-tag .del-btn {
-    cursor: pointer;
-    color: var(--b-text-4);
-    font-size: 12px;
-    padding: 1px 4px;
-    border-radius: 2px;
-    flex-shrink: 0;
-    transition: all 0.12s;
-  }
-  .model-tag .del-btn:hover { color: #FFF; background: var(--b-accent); }
-  .model-tag .test-btn, .fetch-row .test-btn {
-    cursor: pointer;
-    font-size: 11px;
-    flex-shrink: 0;
-    padding: 2px 5px;
-    border-radius: 2px;
-    border: 1px solid var(--b-line);
-    background: var(--b-bg);
-    color: var(--b-text-3);
-    transition: all 0.12s;
-    user-select: none;
-    white-space: nowrap;
-  }
-  .model-tag .test-btn:hover, .fetch-row .test-btn:hover {
-    border-color: var(--b-accent);
-    color: var(--b-accent);
-    background: var(--b-accent-soft);
-  }
-  .model-tag .test-btn.testing, .fetch-row .test-btn.testing { opacity: 0.6; }
-  .model-tag .test-btn.ok, .fetch-row .test-btn.ok { color: #6EE7B7; background: rgba(16, 185, 129, 0.14); border-color: rgba(16, 185, 129, 0.4); }
-  .model-tag .test-btn.fail, .fetch-row .test-btn.fail { color: #FFA39E; background: rgba(230, 74, 46, 0.14); border-color: rgba(230, 74, 46, 0.4); }
-
-  /* 模型禁用状态 */
-  .model-tag.disabled { opacity: 0.45; background: var(--b-bg); border-style: dashed; }
-  .model-tag.disabled .alias-input { color: var(--b-text-4); text-decoration: line-through; }
-  .model-tag.disabled .alias-id { color: var(--b-text-4); }
-  .disabled-badge {
-    font-family: var(--b-mono); font-size: 9.5px; font-weight: 600; padding: 1px 5px; border-radius: 2px;
-    background: rgba(230, 74, 46, 0.15); color: #FFA39E; border: 1px solid rgba(230, 74, 46, 0.35);
-    flex-shrink: 0; text-transform: uppercase;
-  }
-  .fail-streak {
-    font-family: var(--b-mono); font-size: 9.5px; font-weight: 600; padding: 1px 5px; border-radius: 2px;
-    background: rgba(245, 158, 11, 0.15); color: #FCD34D; border: 1px solid rgba(245, 158, 11, 0.35);
-    flex-shrink: 0;
-  }
-  .model-tag .toggle-btn {
-    cursor: pointer; font-size: 11px; padding: 1px 5px; border-radius: 2px;
-    border: 1px solid var(--b-line); background: var(--b-bg); transition: all 0.12s; flex-shrink: 0;
-  }
-  .model-tag .toggle-btn.off { opacity: 0.6; color: var(--b-text-3); }
-  .model-tag .toggle-btn.off:hover { opacity: 1; border-color: var(--b-amber); color: var(--b-amber); }
-  .model-tag .toggle-btn.on { color: #FFA39E; border-color: rgba(230, 74, 46, 0.4); background: var(--b-accent-soft); }
-  .model-tag .toggle-btn.on:hover { color: #6EE7B7; border-color: rgba(16, 185, 129, 0.4); background: rgba(16, 185, 129, 0.14); }
-
-  /* 拉取预览容器 (全幅视图) */
+  /* Fetch Preview Container */
   .fetch-preview-container {
+    height: 100%;
     display: flex;
     flex-direction: column;
-    flex: 1;
-    background: var(--b-surface);
-    border-radius: 2px;
-    border: 1px solid var(--b-line);
-    padding: 10px;
     overflow: hidden;
-    min-height: 0;
   }
   .fetch-preview-header {
     display: flex;
-    justify-content: space-between;
     align-items: center;
+    justify-content: space-between;
     margin-bottom: 8px;
-    gap: 8px;
-    flex-wrap: wrap;
     flex-shrink: 0;
-    padding-bottom: 8px;
-    border-bottom: 1px solid var(--b-line);
   }
-  .fetch-preview-header .title {
-    font-family: var(--b-sans);
-    color: var(--b-text);
-    font-size: 13px;
-    font-weight: 700;
+
+  /* Footer */
+  footer {
+    height: 26px;
+    background: var(--b-bg-2);
+    border-top: 1px solid var(--b-line);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 12px;
+    font-size: 11px;
+    color: var(--b-text-3);
+    flex-shrink: 0;
   }
-  .fetch-preview-header .actions { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
-  .fetch-preview-header .actions .btn { padding: 4px 9px; font-size: 11px; border-radius: 2px; white-space: nowrap; flex-shrink: 0; }
-  .fetch-preview-list {
+  .footer-left, .footer-right { display: flex; align-items: center; gap: 12px; }
+  kbd {
+    font-family: var(--b-mono);
+    font-size: 10px;
+    padding: 1px 4px;
+    border-radius: 2px;
+    background: var(--b-surface);
+    border: 1px solid var(--b-line);
+    color: var(--b-text-2);
+  }
+
+  /* Modal Dialog for Model Key Configuration */
+  .modal-backdrop {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.75);
+    z-index: 200;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .modal-backdrop.open {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .modal-box {
+    background: var(--b-bg-2);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    box-shadow: 0 20px 48px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(255, 255, 255, 0.05);
+    border-radius: 8px;
+    width: 450px;
+    max-width: 92vw;
     display: flex;
     flex-direction: column;
-    gap: 4px;
-    flex: 1;
-    overflow-y: auto;
-    overflow-x: hidden;
-    padding-right: 2px;
-    min-height: 0;
+    overflow: hidden;
+    transform: scale(0.94) translateY(8px);
+    transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.22s ease;
   }
-  .fetch-row {
+  .modal-backdrop.open .modal-box {
+    transform: scale(1) translateY(0);
+  }
+  .modal-header {
+    height: 42px;
+    padding: 0 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: rgba(255, 255, 255, 0.03);
+    border-bottom: 1px solid var(--b-line);
+    font-size: 13px;
+    font-weight: 600;
+    font-family: var(--b-mono);
+    color: var(--b-text);
+    flex-shrink: 0;
+  }
+  .modal-header .drawer-close {
+    width: 26px;
+    height: 26px;
+    border-radius: 4px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: none;
+    color: var(--b-text-3);
+    font-size: 14px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .modal-header .drawer-close:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--b-text);
+  }
+  .modal-body {
+    padding: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    font-size: 12px;
+    color: var(--b-text-2);
+    line-height: 1.55;
+  }
+  .modal-footer {
+    padding: 12px 18px 14px 18px;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 10px;
+    background: var(--b-bg-2);
+    border-top: 1px solid var(--b-line);
+  }
+
+  /* 二级弹窗卡片式单选框选项 */
+  .modal-option-card {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 10px 12px;
+    background: var(--b-surface);
+    border: 1px solid var(--b-line);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .modal-option-card:hover {
+    border-color: var(--b-line-2);
+    background: rgba(255, 255, 255, 0.04);
+  }
+  .modal-option-card.selected {
+    border-color: var(--b-accent);
+    background: rgba(16, 185, 129, 0.06);
+  }
+
+  /* Model row Key badge button */
+  .model-row-btn.key-btn {
+    font-family: inherit;
+    color: var(--b-text-3);
+    border-color: var(--b-line);
+  }
+  .model-row-btn.key-btn:hover {
+    color: var(--b-text);
+    border-color: var(--b-line-2);
+  }
+  .model-row-btn.key-btn.is-custom {
+    color: #FCD34D;
+    background: rgba(245, 158, 11, 0.15);
+    border-color: rgba(245, 158, 11, 0.35);
+  }
+  .model-row-btn.key-btn.is-pool {
+    color: #93C5FD;
+    background: rgba(59, 130, 246, 0.15);
+    border-color: rgba(59, 130, 246, 0.35);
+  }
+
+  /* Key Pool List styling */
+  .key-pool-item {
     display: flex;
     align-items: center;
     gap: 6px;
-    padding: 4px 8px;
     background: var(--b-surface);
     border: 1px solid var(--b-line);
+    padding: 6px 8px;
     border-radius: 2px;
-    transition: all 0.12s;
-    min-width: 0;
   }
-  .fetch-row:hover { background: var(--b-bg); border-color: var(--b-line-2); }
-  .fetch-row.added { opacity: 0.45; background: var(--b-bg); border-style: dashed; }
-  .fetch-row .checkbox { width: 13px; height: 13px; cursor: pointer; flex-shrink: 0; accent-color: var(--b-accent); margin: 0; }
-  .fetch-row .model-id {
-    font-family: var(--b-mono);
-    font-size: 11px;
-    color: var(--b-text-2);
-    flex: 1.1;
-    min-width: 80px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    background: var(--b-bg);
-    padding: 2px 5px;
-    border-radius: 2px;
-    border: 1px solid var(--b-line);
-  }
-  .fetch-row .alias-input {
-    flex: 1;
-    min-width: 60px;
-    max-width: 140px;
-    background: var(--b-bg);
-    border: 1px solid var(--b-line);
-    border-radius: 2px;
-    color: var(--b-text);
-    font-size: 11.5px;
-    padding: 2px 6px;
-    outline: none;
-    font-family: inherit;
-    transition: border-color 0.12s;
-  }
-  .fetch-row .alias-input:focus { border-color: var(--b-accent); }
-  .fetch-row .alias-input::placeholder { color: var(--b-text-4); font-size: 11px; }
-  .fetch-row .status-badge {
-    font-family: var(--b-mono);
-    font-size: 9.5px;
-    padding: 1px 5px;
-    border-radius: 2px;
-    background: rgba(16, 185, 129, 0.12);
-    color: #6EE7B7;
-    flex-shrink: 0;
-    border: 1px solid rgba(16, 185, 129, 0.3);
-    white-space: nowrap;
-  }
-  .fetch-summary {
-    font-family: var(--b-mono);
-    font-size: 11px;
-    color: var(--b-text-3);
-    padding: 3px 6px;
-    background: var(--b-bg);
-    border-radius: 2px;
-    border: 1px solid var(--b-line);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+  .key-pool-item:hover {
+    border-color: var(--b-line-2);
   }
 
-  /* 底部状态栏 */
-  footer {
-    background: var(--b-surface);
-    border-top: 1px solid var(--b-line);
-    padding: 6px 18px;
-    font-size: 11.5px;
-    color: var(--b-text-3);
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-shrink: 0;
-  }
-  footer .footer-left { display: flex; align-items: center; gap: 8px; font-family: var(--b-mono); }
-  footer .footer-right { display: flex; align-items: center; gap: 14px; font-family: var(--b-mono); font-size: 10.5px; color: var(--b-text-4); }
-  footer .footer-right kbd { background: var(--b-bg); color: var(--b-text-2); padding: 1px 5px; border-radius: 2px; border: 1px solid var(--b-line); font-family: var(--b-mono); }
-
+  /* Keepcompat stubs */
+  .model-tag { display: none; }
+  .column-provider { display: none; }
 </style>
 </head>
 <body>
 
 <header class="pywebview-drag-region">
   <div class="header-left pywebview-no-drag-region">
-    <div class="logo-title pywebview-drag-region" title="按住这里拖动窗口">
+    <div class="logo-title pywebview-drag-region" title="按住拖动窗口">
       <div class="brand-mark">配</div>
       <div style="display: flex; flex-direction: column; line-height: 1.1;">
         <span>模型配置</span>
         <span class="sub-en">MODEL CONFIG MANAGER</span>
       </div>
     </div>
-    <div class="target-tabs pywebview-no-drag-region" id="targetTabs" title="切换 Agent 配置文件"></div>
+    <div class="target-tabs pywebview-no-drag-region" id="targetTabs" style="display:none;"></div>
   </div>
 
   <div class="header-right pywebview-no-drag-region">
-    <div class="header-actions pywebview-no-drag-region">
-      <button class="btn btn-primary" id="saveBtn" onclick="saveAll()" title="保存全局配置到文件 (快捷键: Ctrl+S)">
+    <div class="header-actions pywebview-no-drag-region" style="display: flex; gap: 6px;">
+      <button class="btn btn-purple" onclick="rescanBuiltins()" title="重新扫描 auth.json / models-store.json / 环境变量中的内置服务商">
+        <span>🔄 扫描内置</span>
+      </button>
+      <button class="btn btn-primary" id="saveBtn" onclick="saveAll()" title="保存配置 (Ctrl+S)">
         <span>💾 保存</span>
       </button>
-      <button class="btn btn-secondary" onclick="exportAllProviders()" title="导出全部服务商为 TXT，包含显示名称、URL 和 Key">
+      <button class="btn btn-secondary" onclick="exportAllProviders()" title="导出全部服务商为 TXT">
         <span>📦 导出全部</span>
       </button>
-      <button class="btn btn-emerald" onclick="restartPi()" title="保存配置并在新终端中启动 Pi 会话">
+      <button class="btn btn-emerald" onclick="restartPi()" title="重启 Pi 交互终端">
         <span>🔄 重启</span>
       </button>
     </div>
@@ -1510,184 +2176,302 @@ HTML_CONTENT = """<!DOCTYPE html>
 </header>
 
 <div class="layout">
-  <!-- 栏目1: 服务商导航栏 -->
-  <div class="sidebar">
+  <!-- 栏目1: 紧凑服务商侧栏 (260px) -->
+  <aside class="sidebar" id="sidebar">
     <div class="sidebar-header">
-      <span>已配置服务商</span>
-      <button class="btn btn-secondary edit-action" style="padding: 2px 7px; font-size: 11px;" onclick="newProvider()">➕ 新建</button>
+      <div style="display: flex; align-items: center; gap: 6px;">
+        <span>服务商</span>
+        <span class="count-chip" id="sidebarCount">0</span>
+      </div>
+      <button class="btn btn-secondary" style="padding: 2px 7px; font-size: 11px;" onclick="newProvider()">➕ 新建</button>
     </div>
     <div class="sidebar-search">
       <input class="search-input" id="providerSearch" placeholder="🔍 搜索服务商..." oninput="renderSidebar()">
     </div>
     <div class="provider-list" id="providerList"></div>
-  </div>
+  </aside>
 
-  <!-- 栏目2: 服务商连接与认证面板 (支持查看/锁定与编辑模式) -->
-  <div class="column-provider">
-    <div class="card" style="display: flex; flex-direction: column; gap: 12px; height: 100%;">
-      <div class="card-title">
-        <div class="title-left">
-          <span>🛠️ 服务商连接 (Provider)</span>
+  <!-- 侧栏拖拽调宽 -->
+  <div class="col-resizer" id="resizerSidebar"></div>
+
+  <!-- 栏目2: 全宽模型管理工作区 -->
+  <section class="column-models">
+    <div class="model-work-tabs">
+      <div class="model-tab-buttons">
+        <div class="model-tab-btn active" id="tabBtnModels" onclick="switchModelWorkTab('models')">
+          <span>📋 已配置模型</span>
+          <span class="model-tab-badge" id="modelsTabBadge">0</span>
         </div>
-        <div id="providerModeActions" style="display: flex; gap: 6px;">
-          <button class="btn btn-secondary edit-action" id="editProviderBtn" onclick="toggleProviderEditMode(true)" title="解锁并编辑服务商连接参数">✏️ 编辑</button>
-          <button class="btn btn-primary edit-action" id="saveProviderBtn" style="display: none;" onclick="saveProviderEdit()" title="保存修改并锁定">✓ 完成</button>
-          <button class="btn btn-ghost edit-action" id="cancelProviderBtn" style="display: none;" onclick="cancelProviderEdit()" title="取消修改">✕ 取消</button>
+        <div class="model-tab-btn" id="tabBtnFetch" onclick="switchModelWorkTab('fetch')">
+          <span>📥 拉取预览</span>
+          <span class="model-tab-badge" id="fetchTabBadge" style="display: none;">0</span>
         </div>
       </div>
 
-      <!-- 查看模式: 紧凑工业数据面板 -->
-      <div class="view-panel" id="providerViewPanel">
-        <div class="view-field">
-          <span class="view-label">服务商 ID</span>
-          <span class="view-value" id="vId">-</span>
-        </div>
-        <div class="view-field">
-          <span class="view-label">显示名称</span>
-          <span class="view-value" id="vName">-</span>
-        </div>
-        <div class="view-field">
-          <span class="view-label">Base URL 端点</span>
-          <span class="view-value" id="vBaseUrl">-</span>
-        </div>
-        <div class="view-field">
-          <span class="view-label">API 密钥 (Key)</span>
-          <div style="display: flex; align-items: center; justify-content: space-between;">
-            <span class="view-value" id="vApiKey" style="letter-spacing: 0.05em;">-</span>
-            <button class="btn btn-ghost" style="padding: 1px 4px; font-size: 11px;" onclick="toggleViewKeyMask()" id="viewMaskBtn" title="显隐 API Key">👁️</button>
+      <div style="display: flex; gap: 6px; align-items: center;">
+        <input class="search-input" id="modelSearch" style="width: 140px;" placeholder="🔍 过滤模型/别名..." oninput="renderModels()">
+        <button class="btn btn-indigo" id="testAllBtn" onclick="testAllModels()" title="依次测活当前服务商的所有模型">⚡ 全部测活</button>
+        <button class="btn btn-secondary" id="openDrawerBtn" onclick="openDrawer(selectedPid)" title="查看或编辑服务商连接参数与密钥">⚙️ 厂商设置</button>
+      </div>
+    </div>
+
+    <!-- Tab 1: 已配置模型单行表格 -->
+    <div class="model-view-pane active" id="paneModels">
+      <div class="model-add-bar">
+        <input class="input" id="newModelId" placeholder="模型 ID (例如: deepseek-chat, gpt-4o)" style="flex: 1.2;">
+        <input class="input" id="newModelName" placeholder="显示别名 (可选)" style="flex: 1;">
+        <button class="btn btn-primary" onclick="addModelManual()">➕ 添加模型</button>
+      </div>
+
+      <!-- 不滚动的表头 -->
+      <div class="model-table-header" id="modelTableHeader">
+        <span class="th-handle"></span>
+        <span class="th-alias">别名 (点击编辑)</span>
+        <span class="th-id">模型 ID</span>
+        <span class="th-status">状态</span>
+        <span class="th-actions">操作</span>
+      </div>
+
+      <!-- 滚动的单行表格行容器 -->
+      <div class="models-container" id="modelsContainer">
+        <div style="color: var(--b-text-3); font-size: 12px; padding: 20px; text-align: center;">暂无模型，点击「厂商设置 → 自动拉取」或上方手动添加</div>
+      </div>
+    </div>
+
+    <!-- Tab 2: 远程拉取结果预览 -->
+    <div class="model-view-pane" id="paneFetch">
+      <div class="fetch-preview-container">
+        <div class="fetch-preview-header">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span style="font-size: 12.5px; font-weight: 600;">📥 远程拉取结果</span>
+            <button class="btn btn-emerald" style="padding: 2px 8px; font-size: 11px;" onclick="fetchRemoteModelsFromTab()" title="从当前厂商的 Base URL 获取可用模型列表">🔄 拉取模型</button>
+          </div>
+          <div style="display: flex; gap: 6px;">
+            <button class="btn btn-emerald" onclick="commitFetchedModels()">✅ 添加选中</button>
+            <button class="btn btn-indigo" onclick="testAllFetched()">⚡ 全部测活</button>
+            <button class="btn btn-ghost" onclick="toggleAllFetched(true)">☑ 全选</button>
+            <button class="btn btn-ghost" onclick="toggleAllFetched(false)">☐ 全不选</button>
+            <button class="btn btn-ghost" onclick="switchModelWorkTab('models')">✕ 返回列表</button>
           </div>
         </div>
-        <div class="view-field">
-          <span class="view-label">协议类型</span>
-          <span class="view-value" id="vApi">-</span>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; gap: 6px; flex-shrink: 0;">
+          <div id="fetchSummary" style="font-size: 11.5px; color: var(--b-text-2);"></div>
+          <input class="search-input" id="previewSearch" style="width: 140px; flex-shrink: 0;" placeholder="🔍 过滤拉取模型..." oninput="renderFetchPreview()">
+        </div>
+
+        <!-- 不滚动的拉取表头 -->
+        <div class="model-table-header" id="fetchTableHeader">
+          <span class="th-handle" style="width: 20px; text-align: center;">☑</span>
+          <span class="th-alias" style="width: 200px;">别名 (可直接编辑)</span>
+          <span class="th-id">模型 ID</span>
+          <span class="th-status" style="width: 70px;">状态</span>
+          <span class="th-actions" style="width: 100px;">操作</span>
+        </div>
+
+        <!-- 滚动的单行拉取结果列表 -->
+        <div class="models-container" id="fetchPreviewList"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 右滑厂商抽屉 (#providerDrawer, 370px) -->
+  <div class="provider-drawer" id="providerDrawer">
+    <div class="drawer-backdrop" onclick="closeDrawer()"></div>
+    <div class="drawer-panel">
+      <div class="drawer-header">
+        <span id="drawerTitle">🛠️ 服务商连接</span>
+        <div style="display: flex; align-items: center; gap: 6px;">
+          <div id="providerModeActions" style="display: flex; gap: 6px;">
+            <button class="btn btn-secondary" id="editProviderBtn" onclick="toggleProviderEditMode(true)" title="编辑服务商参数">✏️ 编辑</button>
+            <button class="btn btn-primary" id="saveProviderBtn" style="display: none;" onclick="saveProviderEdit()" title="保存修改">✓ 完成</button>
+            <button class="btn btn-ghost" id="cancelProviderBtn" style="display: none;" onclick="cancelProviderEdit()" title="取消修改">✕ 取消</button>
+          </div>
+          <button class="drawer-close" onclick="closeDrawer()" title="关闭抽屉 (Esc)">✕</button>
         </div>
       </div>
 
-      <!-- 编辑模式: 高对比度暗色输入表单 -->
-      <div class="edit-panel" id="providerEditPanel">
-        <div class="form-group">
-          <label>服务商 ID <span style="color: var(--b-accent);">*</span></label>
-          <input class="input" id="pId" placeholder="例如: deepseek, grok, openrouter">
-        </div>
-        <div class="form-group">
-          <label>显示名称 (可选)</label>
-          <input class="input" id="pName" placeholder="例如: DeepSeek Official">
-        </div>
-        <div class="form-group">
-          <label>Base URL <span style="color: var(--b-accent);">*</span></label>
-          <input class="input" id="pBaseUrl" placeholder="例如: https://api.deepseek.com/v1">
-        </div>
-        <div class="form-group">
-          <label>API Key</label>
-          <div class="input-wrapper">
-            <input class="input" type="password" id="pApiKey" placeholder="sk-...">
-            <span class="toggle-pwd" id="toggleApiKeyBtn" onclick="toggleApiKeyVisibility()" title="显示/隐藏 API Key">👁️</span>
+      <div class="drawer-body">
+        <!-- 查看模式 -->
+        <div class="view-panel" id="providerViewPanel">
+          <div class="view-field">
+            <span class="view-label">服务商 ID</span>
+            <span class="view-value" id="vId">-</span>
+          </div>
+          <div class="view-field">
+            <span class="view-label">显示名称</span>
+            <span class="view-value" id="vName">-</span>
+          </div>
+          <div class="view-field">
+            <span class="view-label">Base URL 端点</span>
+            <span class="view-value" id="vBaseUrl">-</span>
+          </div>
+          <div class="view-field">
+            <span class="view-label">默认 API 密钥 (Key)</span>
+            <div style="display: flex; align-items: center; justify-content: space-between;">
+              <span class="view-value" id="vApiKey" style="letter-spacing: 0.05em;">-</span>
+              <button class="btn btn-ghost" style="padding: 1px 4px; font-size: 11px;" onclick="toggleViewKeyMask()" id="viewMaskBtn" title="显隐 Key">👁️</button>
+            </div>
+          </div>
+          <div class="view-field">
+            <span class="view-label">密钥池 (Key Pool)</span>
+            <div id="vKeyPoolSummary" style="font-size: 11.5px; color: var(--b-text-2); margin-top: 2px;">未配置</div>
+          </div>
+          <div class="view-field">
+            <span class="view-label">协议类型</span>
+            <span class="view-value" id="vApi">-</span>
           </div>
         </div>
-        <div class="form-group">
-          <label>API 协议类型</label>
-          <select class="input" id="pApi" onchange="syncCurrentFormToMemory(); renderSidebar();">
-            <option value="openai-completions">openai-completions (OpenAI 补全)</option>
-            <option value="openai-responses">openai-responses (OpenAI Responses)</option>
-            <option value="anthropic-messages">anthropic-messages (Claude 原生)</option>
-            <option value="google-generative-ai">google-generative-ai (Gemini 原生)</option>
-          </select>
-        </div>
-      </div>
 
-      <div style="margin-top: auto; padding-top: 12px; border-top: 1px solid var(--b-line); display: flex; flex-direction: column; gap: 8px;">
-        <button class="btn btn-emerald edit-action" style="width: 100%;" onclick="fetchRemoteModels()">🔄 自动拉取远程模型</button>
-        <button class="btn btn-secondary edit-action" style="width: 100%;" onclick="exportCurrentProvider()" title="导出当前服务商信息（含名称、URL、Key 与模型）为 TXT 文件">📤 导出当前服务商</button>
-        <button class="btn btn-rose edit-action" style="width: 100%;" onclick="deleteCurrentProvider()" title="删除当前服务商并立即保存">🗑️ 删除服务商</button>
+        <!-- 编辑模式 -->
+        <div class="edit-panel" id="providerEditPanel">
+          <div class="form-group">
+            <label>服务商 ID <span style="color: var(--b-accent);">*</span></label>
+            <input class="input" id="pId" placeholder="例如: deepseek, grok, openrouter">
+          </div>
+          <div class="form-group">
+            <label>显示名称 (可选)</label>
+            <input class="input" id="pName" placeholder="例如: DeepSeek Official">
+          </div>
+          <div class="form-group">
+            <label>Base URL <span style="color: var(--b-accent);">*</span></label>
+            <input class="input" id="pBaseUrl" placeholder="例如: https://api.deepseek.com/v1">
+          </div>
+          <div class="form-group">
+            <label>API 密钥 (API Key)</label>
+            <div class="input-wrapper">
+              <input class="input" id="pApiKey" type="password" placeholder="例如: sk-..." oninput="syncCurrentFormToMemory()">
+              <span class="toggle-pwd" id="toggleEditApiKeyBtn" onclick="toggleEditApiKeyVisibility()" title="显隐 Key">👁️</span>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>API 协议类型</label>
+            <select class="input" id="pApi" onchange="syncCurrentFormToMemory(); renderSidebar();">
+              <option value="openai-completions">openai-completions (OpenAI 补全)</option>
+              <option value="openai-responses">openai-responses (OpenAI Responses)</option>
+              <option value="anthropic-messages">anthropic-messages (Claude 原生)</option>
+              <option value="google-generative-ai">google-generative-ai (Gemini 原生)</option>
+            </select>
+          </div>
+
+          <!-- Key 池管理模块 -->
+          <div class="form-group" style="margin-top: 6px; padding-top: 10px; border-top: 1px dashed var(--b-line);">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px;">
+              <label style="font-size: 11px; font-weight: 600; color: var(--b-text);">🔑 厂商密钥池 (多Key)</label>
+              <button type="button" class="btn btn-secondary" style="padding: 1px 6px; font-size: 11px;" onclick="addKeyPoolItem()">➕ 新增 Key</button>
+            </div>
+            <div style="font-size: 10.5px; color: var(--b-text-3); margin-bottom: 6px;">为不同分组/模型分配不同的 API 密钥，可在模型列表中直接绑定。</div>
+            <div id="keyPoolContainer" style="display: flex; flex-direction: column; gap: 6px; max-height: 180px; overflow-y: auto;">
+              <!-- 动态渲染密钥池条目 -->
+            </div>
+          </div>
+        </div>
+
+        <div style="margin-top: auto; padding-top: 10px; border-top: 1px solid var(--b-line); display: flex; flex-direction: column; gap: 6px;">
+          <button class="btn btn-emerald" style="width: 100%;" onclick="fetchRemoteModels()">🔄 自动拉取远程模型</button>
+          <button class="btn btn-secondary" style="width: 100%;" onclick="exportCurrentProvider()" title="导出当前服务商为 TXT">📤 导出当前服务商</button>
+          <button class="btn btn-rose" id="deleteProviderBtn" style="width: 100%;" onclick="deleteCurrentProvider()" title="删除此服务商">🗑️ 删除服务商</button>
+
+        </div>
       </div>
     </div>
   </div>
+</div>
 
-  <!-- 栏目3: 模型管理与测活工作区 (分段 Tab 视图，彻底消除遮挡) -->
-  <div class="column-models">
-    <div class="card" style="display: flex; flex-direction: column; height: 100%; overflow: hidden; padding: 12px 14px;">
-      
-      <!-- 顶部分段切换导航 -->
-      <div class="model-work-tabs">
-        <div class="model-tab-buttons">
-          <div class="model-tab-btn active" id="tabBtnModels" onclick="switchModelWorkTab('models')">
-            <span>📋 已配置模型</span>
-            <span class="model-tab-badge" id="modelsTabBadge">0</span>
-          </div>
-          <div class="model-tab-btn" id="tabBtnFetch" onclick="switchModelWorkTab('fetch')">
-            <span>📥 拉取预览</span>
-            <span class="model-tab-badge" id="fetchTabBadge" style="display: none;">0</span>
-          </div>
-        </div>
+<!-- 拉取模型时选择密钥弹窗 -->
+<div class="modal-backdrop" id="fetchKeyModal" onclick="handleFetchKeyModalBackdrop(event)">
+  <div class="modal-box" style="width: 380px;">
+    <div class="modal-header">
+      <span>🔄 选择用于拉取的 API 密钥</span>
+      <button class="drawer-close" onclick="closeFetchKeyModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div style="font-size: 11.5px; color: var(--b-text-3); margin-bottom: 4px;">
+        不同密钥可能有不同的可用模型列表。拉取成功后，系统会自动为这些模型绑定您选择的密钥。
+      </div>
+      <div id="fetchKeyModalOptions" style="display: flex; flex-direction: column; gap: 8px;">
+        <!-- 动态填充 -->
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeFetchKeyModal()">取消</button>
+      <button class="btn btn-emerald" onclick="confirmFetchRemoteModels()">✓ 开始拉取</button>
+    </div>
+  </div>
+</div>
 
-        <div style="display: flex; gap: 6px; align-items: center;">
-          <input class="search-input" id="modelSearch" style="width: 130px;" placeholder="🔍 过滤模型/别名..." oninput="renderModels()">
-          <button class="btn btn-indigo edit-action" id="testAllBtn" onclick="testAllModels()" title="依次测活当前服务商的全部模型">⚡ 全部测活</button>
-          <div class="schedule-wrap" title="设置定时自动测活">
-            <button class="btn btn-ghost" id="scheduleBtn" onclick="toggleSchedulePanel()">⏱ <span id="scheduleLabel">定时</span> ▾</button>
-            <div class="schedule-dropdown" id="scheduleDropdown" style="display:none;">
-              <div class="schedule-dropdown-title">定时测活间隔</div>
-              <label class="schedule-option"><input type="radio" name="scheduleInterval" value="0" onchange="setScheduleInterval(0)"> <span>关闭</span></label>
-              <label class="schedule-option"><input type="radio" name="scheduleInterval" value="60" onchange="setScheduleInterval(60)"> <span>1 分钟</span></label>
-              <label class="schedule-option"><input type="radio" name="scheduleInterval" value="300" onchange="setScheduleInterval(300)"> <span>5 分钟</span></label>
-              <label class="schedule-option"><input type="radio" name="scheduleInterval" value="900" onchange="setScheduleInterval(900)"> <span>15 分钟</span></label>
-              <label class="schedule-option"><input type="radio" name="scheduleInterval" value="1800" onchange="setScheduleInterval(1800)"> <span>30 分钟</span></label>
-              <label class="schedule-option"><input type="radio" name="scheduleInterval" value="3600" onchange="setScheduleInterval(3600)"> <span>1 小时</span></label>
-              <div class="schedule-divider"></div>
-              <div class="schedule-row" style="display:flex; align-items:center; gap:6px; padding:4px 6px;">
-                <label style="font-size:11.5px; color:var(--b-text); flex:1;">连续失败自动禁用</label>
-                <input type="checkbox" id="autoDisableChk" checked onchange="setAutoDisable(this.checked)" style="accent-color:var(--b-accent); cursor:pointer;">
-              </div>
-              <div class="schedule-row" style="display:flex; align-items:center; gap:6px; padding:4px 6px;">
-                <label style="font-size:11.5px; color:var(--b-text); flex:1;">失败次数阈值</label>
-                <select id="thresholdSel" onchange="setDisableThreshold(parseInt(this.value,10))" style="background:var(--b-bg); color:var(--b-text); border:1px solid var(--b-line); border-radius:2px; padding:2px 5px; font-size:11px; outline:none; cursor:pointer;">
-                  <option value="1">1 次</option>
-                  <option value="2">2 次</option>
-                  <option value="3" selected>3 次</option>
-                  <option value="5">5 次</option>
-                  <option value="10">10 次</option>
-                </select>
-              </div>
-              <div class="schedule-status" id="scheduleStatus">定时测活已关闭</div>
+<!-- 模型独立 API Key / 密钥池绑定 弹窗配置 -->
+<div class="modal-backdrop" id="modelKeyModal" onclick="handleModelKeyModalBackdrop(event)">
+  <div class="modal-box">
+    <div class="modal-header">
+      <span id="modelKeyModalTitle">🔑 模型密钥配置</span>
+      <button class="drawer-close" onclick="closeModelKeyModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div style="font-size: 11px; color: var(--b-text-3);">
+        目标模型: <b id="modelKeyTargetId" style="color: var(--b-text); font-family: var(--b-mono);"></b>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 4px;">
+        <label class="modal-option-card" id="cardKeyModeDefault">
+          <input type="radio" name="modelKeyMode" value="default" id="keyModeDefault" style="margin-top: 2px;" onchange="updateModelKeyModalUI()">
+          <div style="display: flex; flex-direction: column; gap: 2px;">
+            <span style="font-weight: 500; color: var(--b-text);">继承厂商默认 API Key</span>
+            <span id="modelKeyDefaultPreview" style="color: var(--b-text-3); font-size: 11px;"></span>
+          </div>
+        </label>
+
+        <label class="modal-option-card" id="cardKeyModePool">
+          <input type="radio" name="modelKeyMode" value="pool" id="keyModePool" style="margin-top: 2px;" onchange="updateModelKeyModalUI()">
+          <div style="display: flex; flex-direction: column; gap: 6px; width: 100%;">
+            <span style="font-weight: 500; color: var(--b-text);">绑定厂商密钥池中的 Key</span>
+            <div id="modelKeyPoolWrap" style="display: none;">
+              <select class="input" id="modelKeyPoolSelect" style="width: 100%; font-family: var(--b-mono); font-size: 11.5px;" onchange="updateModelKeyModalUI()">
+                <option value="">(请选择密钥池中的 Key)</option>
+              </select>
             </div>
           </div>
-        </div>
-      </div>
+        </label>
 
-      <!-- 视图 1: 已配置模型列表 -->
-      <div class="model-view-pane active" id="paneModels">
-        <div class="model-add-bar" style="margin-bottom: 8px;">
-          <input class="input" id="newModelId" placeholder="模型 ID (如: gpt-4o, deepseek-chat)" style="flex: 1.2;">
-          <input class="input" id="newModelName" placeholder="显示别名 (可选)" style="flex: 1;">
-          <button class="btn btn-primary edit-action" onclick="addModelManual()">➕ 添加模型</button>
-        </div>
-
-        <div class="models-tag-container" id="modelsContainer">
-          <span style="color: var(--b-text-3); font-size: 12px; padding: 6px;">暂无模型，点击「自动拉取远程模型」或手动添加。别名可直接点击修改</span>
-        </div>
-      </div>
-
-      <!-- 视图 2: 远程拉取结果预览 -->
-      <div class="model-view-pane" id="paneFetch">
-        <div class="fetch-preview-container">
-          <div class="fetch-preview-header">
-            <span class="title">📥 远程拉取结果 (勾选后点「添加选中」写入)</span>
-            <div class="actions">
-              <button class="btn btn-emerald edit-action" onclick="commitFetchedModels()">✅ 添加选中</button>
-              <button class="btn btn-indigo edit-action" onclick="testAllFetched()">⚡ 全部测活</button>
-              <button class="btn btn-ghost edit-action" onclick="toggleAllFetched(true)">☑ 全选</button>
-              <button class="btn btn-ghost edit-action" onclick="toggleAllFetched(false)">☐ 全不选</button>
-              <button class="btn btn-ghost edit-action" onclick="switchModelWorkTab('models')">✕ 返回列表</button>
+        <label class="modal-option-card" id="cardKeyModeCustom">
+          <input type="radio" name="modelKeyMode" value="custom" id="keyModeCustom" style="margin-top: 2px;" onchange="updateModelKeyModalUI()">
+          <div style="display: flex; flex-direction: column; gap: 6px; width: 100%;">
+            <span style="font-weight: 500; color: var(--b-text);">为此模型单独设置自定义 API Key</span>
+            <div id="modelKeyCustomWrap" style="display: none;">
+              <div class="input-wrapper">
+                <input class="input" type="password" id="modelKeyCustomInput" placeholder="输入该模型的专属 API Key (如 sk-...)" style="font-family: var(--b-mono); font-size: 11.5px;">
+                <span class="toggle-pwd" id="toggleModelKeyCustomBtn" onclick="toggleModelKeyCustomVisibility()" title="显隐 Key">👁️</span>
+              </div>
+              <div style="font-size: 10.5px; color: var(--b-text-3); margin-top: 4px;">
+                保存时将以 <code style="color: var(--b-accent);">headers.Authorization = "Bearer ..."</code> 写入模型配置。
+              </div>
             </div>
           </div>
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; gap: 6px; flex-shrink: 0;">
-            <div class="fetch-summary" id="fetchSummary" style="flex: 1;"></div>
-            <input class="search-input" id="previewSearch" style="width: 120px; flex-shrink: 0;" placeholder="🔍 过滤拉取模型..." oninput="renderFetchPreview()">
-          </div>
-          <div class="fetch-preview-list" id="fetchPreviewList"></div>
-        </div>
+        </label>
       </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModelKeyModal()">取消</button>
+      <button class="btn btn-primary" onclick="saveModelKeyModal()">✓ 应用此配置</button>
+    </div>
+  </div>
+</div>
 
+<!-- 全局统一 Confirm / Alert 消息弹窗 -->
+<div class="modal-backdrop" id="globalDialogModal" onclick="handleGlobalDialogBackdrop(event)">
+  <div class="modal-box" id="globalDialogBox" style="width: 440px;">
+    <div class="modal-header">
+      <span id="globalDialogTitle" style="display: flex; align-items: center; gap: 8px;">
+        <span id="globalDialogIcon">⚠️</span>
+        <span id="globalDialogTitleText">提示</span>
+      </span>
+      <button class="drawer-close" onclick="closeGlobalDialog(false)">✕</button>
+    </div>
+    <div class="modal-body" style="padding: 20px 18px;">
+      <div id="globalDialogMessage" style="font-size: 12.5px; line-height: 1.65; color: var(--b-text); white-space: pre-wrap; word-break: break-word;"></div>
+    </div>
+    <div class="modal-footer" id="globalDialogFooter">
+      <button class="btn btn-ghost" id="globalDialogCancelBtn" onclick="closeGlobalDialog(false)">取消</button>
+      <button class="btn btn-emerald" id="globalDialogConfirmBtn" onclick="closeGlobalDialog(true)">确认</button>
     </div>
   </div>
 </div>
@@ -1697,239 +2481,470 @@ HTML_CONTENT = """<!DOCTYPE html>
     <span id="statusMsg">● 就绪</span>
   </div>
   <div class="footer-right">
-    <span id="pathDisplay">📁 正在加载配置文件...</span>
-    <span><kbd>Ctrl+S</kbd> 保存配置</span>
+    <span id="defaultModelStatus" style="color: var(--b-amber);">★ 默认: 正在获取...</span>
+    <span id="pathDisplay">📁 正在加载...</span>
+    <span><kbd>Ctrl+S</kbd> 保存</span>
   </div>
 </footer>
 
 <script>
 let currentConfig = { providers: {} };
 let selectedPid = null;
-let configTargets = [];
 let currentConfigPath = null;
 let currentEditable = true;
-let currentSchema = 'pi-providers';
-let fetchedPreview = []; // Buffer of {id, name, selected, added}
-const configDrafts = {}; // 内存草稿字典: path -> { config, selectedPid, isProviderEditing, editForm }
+let fetchedPreview = [];
+let currentDefaultProvider = '';
+let currentDefaultModel = '';
+let isProviderEditing = false;
+let isViewKeyMasked = true;
+// 密钥池编辑区当前是为哪个服务商渲染的（null = 未渲染/已清空），
+// 用于防止把空/脏数据回写到其他服务商
+let keyPoolRenderedPid = null;
 
-async function refreshTargets(keepPath = true) {
-  setStatus('正在加载 Agent 配置文件...', '#F59E0B');
-  const result = await window.pywebview.api.discover_configs();
-  configTargets = result.targets || [];
-  const previousPath = keepPath ? currentConfigPath : null;
-  if (previousPath && configTargets.some(t => t.path === previousPath)) {
-    currentConfigPath = previousPath;
-  } else if (configTargets.length > 0) {
-    currentConfigPath = configTargets[0].path;
-  } else {
-    currentConfigPath = result.defaultPath;
-  }
-  renderTargetTabs();
-  await loadData(currentConfigPath);
-  setStatus('已就绪', '#10B981');
+// ==========================================
+// 全局统一 Modal 弹窗 Engine (替代原生 alert / confirm)
+// ==========================================
+let globalDialogResolver = null;
+
+function showConfirm(options) {
+  return new Promise((resolve) => {
+    const opts = typeof options === 'string' ? { message: options } : (options || {});
+    globalDialogResolver = resolve;
+
+    const modal = $id('globalDialogModal');
+    const iconEl = $id('globalDialogIcon');
+    const titleEl = $id('globalDialogTitleText');
+    const msgEl = $id('globalDialogMessage');
+    const cancelBtn = $id('globalDialogCancelBtn');
+    const confirmBtn = $id('globalDialogConfirmBtn');
+
+    if (iconEl) iconEl.innerText = opts.icon || (opts.danger ? '🗑️' : '⚠️');
+    if (titleEl) titleEl.innerText = opts.title || '确认提示';
+    if (msgEl) msgEl.innerText = opts.message || opts.text || '';
+
+    if (cancelBtn) {
+      cancelBtn.style.display = 'inline-flex';
+      cancelBtn.innerText = opts.cancelText || '取消';
+    }
+
+    if (confirmBtn) {
+      confirmBtn.innerText = opts.confirmText || '确认';
+      confirmBtn.className = 'btn ' + (opts.confirmClass || (opts.danger ? 'btn-rose' : 'btn-emerald'));
+    }
+
+    if (modal) {
+      modal.classList.add('open');
+      setTimeout(() => confirmBtn && confirmBtn.focus(), 50);
+    }
+  });
 }
 
-function renderTargetTabs() {
-  const container = document.getElementById('targetTabs');
+function showAlert(options) {
+  return new Promise((resolve) => {
+    const opts = typeof options === 'string' ? { message: options } : (options || {});
+    globalDialogResolver = () => resolve();
+
+    const modal = $id('globalDialogModal');
+    const iconEl = $id('globalDialogIcon');
+    const titleEl = $id('globalDialogTitleText');
+    const msgEl = $id('globalDialogMessage');
+    const cancelBtn = $id('globalDialogCancelBtn');
+    const confirmBtn = $id('globalDialogConfirmBtn');
+
+    if (iconEl) iconEl.innerText = opts.icon || (opts.type === 'error' ? '❌' : opts.type === 'success' ? '✅' : 'ℹ️');
+    if (titleEl) titleEl.innerText = opts.title || (opts.type === 'error' ? '错误' : opts.type === 'success' ? '成功' : '提示');
+    if (msgEl) msgEl.innerText = opts.message || opts.text || '';
+
+    if (cancelBtn) cancelBtn.style.display = 'none';
+
+    if (confirmBtn) {
+      confirmBtn.innerText = opts.okText || '确定';
+      confirmBtn.className = 'btn ' + (opts.type === 'error' ? 'btn-rose' : 'btn-primary');
+    }
+
+    if (modal) {
+      modal.classList.add('open');
+      setTimeout(() => confirmBtn && confirmBtn.focus(), 50);
+    }
+  });
+}
+
+function closeGlobalDialog(result) {
+  const modal = $id('globalDialogModal');
+  if (modal) modal.classList.remove('open');
+  if (globalDialogResolver) {
+    const res = globalDialogResolver;
+    globalDialogResolver = null;
+    res(Boolean(result));
+  }
+}
+
+function handleGlobalDialogBackdrop(e) {
+  if (e.target && e.target.id === 'globalDialogModal') {
+    closeGlobalDialog(false);
+  }
+}
+
+// 拦截全局 window.alert
+window.alert = function(msg) {
+  showAlert({ message: String(msg) });
+};
+
+// 快捷键拦截 (Esc 键关闭弹窗/抽屉，Enter 键确认弹窗)
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    const dialogModal = $id('globalDialogModal');
+    if (dialogModal && dialogModal.classList.contains('open')) {
+      closeGlobalDialog(false);
+      return;
+    }
+    const fetchModal = $id('fetchKeyModal');
+    if (fetchModal && fetchModal.classList.contains('open')) {
+      closeFetchKeyModal();
+      return;
+    }
+    const modelModal = $id('modelKeyModal');
+    if (modelModal && modelModal.classList.contains('open')) {
+      closeModelKeyModal();
+      return;
+    }
+    closeDrawer();
+  } else if (e.key === 'Enter') {
+    const dialogModal = $id('globalDialogModal');
+    if (dialogModal && dialogModal.classList.contains('open')) {
+      e.preventDefault();
+      closeGlobalDialog(true);
+      return;
+    }
+  }
+});
+
+function $id(id) { return document.getElementById(id); }
+
+function el(tag, cls, text) {
+  const elem = document.createElement(tag);
+  if (cls) elem.className = cls;
+  if (text !== undefined) elem.innerText = text;
+  return elem;
+}
+
+function emptyState(title, sub) {
+  const wrap = el('div', 'empty-wrap');
+  wrap.style.cssText = 'color:var(--b-text-3); font-size:12px; text-align:center; padding:30px 10px; line-height:1.6;';
+  wrap.appendChild(el('div', '', title));
+  if (sub) {
+    const s = el('div', '', sub);
+    s.style.cssText = 'color:var(--b-text-4); font-size:11px; margin-top:4px;';
+    wrap.appendChild(s);
+  }
+  return wrap;
+}
+
+// Drawer Controls
+function openDrawer(pid) {
+  const drawer = $id('providerDrawer');
+  if (drawer) drawer.classList.add('open');
+  if (pid) {
+    const titleEl = $id('drawerTitle');
+    const p = (currentConfig.providers || {})[pid] || {};
+    if (titleEl) titleEl.textContent = '🛠️ ' + (p.name || pid);
+  }
+}
+
+function closeDrawer() {
+  const drawer = $id('providerDrawer');
+  if (drawer) drawer.classList.remove('open');
+}
+
+// Default Model Sync
+async function refreshDefaultModel() {
+  try {
+    const res = await window.pywebview.api.get_default_model();
+    if (res && res.success) {
+      currentDefaultProvider = res.defaultProvider || '';
+      currentDefaultModel = res.defaultModel || '';
+      const statusEl = $id('defaultModelStatus');
+      if (statusEl) {
+        statusEl.textContent = currentDefaultModel
+          ? `★ 默认: ${currentDefaultProvider}/${currentDefaultModel}`
+          : '☆ 默认: 未设置';
+      }
+    }
+  } catch (e) {}
+}
+
+async function setDefaultModel(providerId, modelId) {
+  try {
+    setStatus(`正在将 [${modelId}] 设为 Pi 默认模型...`, '#F59E0B');
+    const res = await window.pywebview.api.set_default_model(providerId, modelId);
+    if (res && res.success) {
+      currentDefaultProvider = providerId;
+      currentDefaultModel = modelId;
+      const statusEl = $id('defaultModelStatus');
+      if (statusEl) statusEl.textContent = `★ 默认: ${providerId}/${modelId}`;
+      setStatus(`★ 已成功将 [${modelId}] 设为默认模型 (写入 settings.json)`, '#10B981');
+      const p = (currentConfig.providers || {})[providerId];
+      if (p) renderModels(p.models || []);
+    } else {
+      setStatus(`设置默认模型失败: ${res ? res.error : '未知错误'}`, '#EF4444');
+    }
+  } catch (e) {
+    setStatus(`设置默认模型异常: ${e}`, '#EF4444');
+  }
+}
+
+// Rescan Built-ins
+async function rescanBuiltins() {
+  setStatus('正在扫描 Pi 内置服务商与模型目录...', '#F59E0B');
+  try {
+    const res = await window.pywebview.api.rescan_builtins();
+    if (res && res.success && res.builtins) {
+      const bKeys = Object.keys(res.builtins);
+      let addedModels = 0;
+      for (const [bPid, bProv] of Object.entries(res.builtins)) {
+        const existing = currentConfig.providers[bPid];
+        if (!existing) {
+          currentConfig.providers[bPid] = bProv;
+          addedModels += (bProv.models || []).length;
+          continue;
+        }
+        existing._isBuiltin = true;
+        if (!existing.apiKey && bProv.apiKey) existing.apiKey = bProv.apiKey;
+        const byId = {};
+        (existing.models || []).forEach(m => { byId[m.id] = m; });
+        const merged = [];
+        (bProv.models || []).forEach(bm => {
+          if (byId[bm.id]) {
+            const mergedModel = Object.assign({}, bm, byId[bm.id]);
+            mergedModel._isBuiltinModel = true;
+            merged.push(mergedModel);
+            delete byId[bm.id];
+          } else {
+            const copy = Object.assign({}, bm);
+            copy._isBuiltinModel = true;
+            merged.push(copy);
+            addedModels++;
+          }
+        });
+        Object.keys(byId).forEach(mid => merged.push(byId[mid]));
+        existing.models = merged;
+      }
+      renderSidebar();
+      if (selectedPid && currentConfig.providers[selectedPid]) {
+        renderModels(currentConfig.providers[selectedPid].models || []);
+      }
+      setStatus(`✅ 已同步 ${bKeys.length} 个内置服务商，新增 ${addedModels} 个模型 (记得点 💾 保存)`, '#10B981');
+    } else {
+      setStatus('扫描内置服务商未返回数据', '#F59E0B');
+    }
+  } catch (e) {
+    setStatus('扫描内置服务商失败: ' + e, '#EF4444');
+  }
+}
+
+// Render Sidebar (.p-row)
+function renderSidebar() {
+  const container = $id('providerList');
   if (!container) return;
   container.innerHTML = '';
 
-  configTargets.forEach(target => {
-    const item = document.createElement('div');
-    const isActive = target.path === currentConfigPath;
-    item.className = 'target-tab-item' + (isActive ? ' active' : '');
-    item.innerHTML = `
-      <span class="tab-icon">📁</span>
-      <span>${target.label}</span>
-    `;
-    item.onclick = () => switchTarget(target.path);
-    container.appendChild(item);
-  });
-}
+  const activeEntries = Object.entries(currentConfig.providers || {});
 
-function saveCurrentStateToDraft() {
-  if (!currentConfigPath) return;
-  const currentPid = syncCurrentFormToMemory();
-  configDrafts[currentConfigPath] = {
-    config: JSON.parse(JSON.stringify(currentConfig || { providers: {} })),
-    selectedPid: currentPid || selectedPid,
-    isProviderEditing: isProviderEditing,
-    editForm: {
-      pId: document.getElementById('pId') ? document.getElementById('pId').value : '',
-      pName: document.getElementById('pName') ? document.getElementById('pName').value : '',
-      pBaseUrl: document.getElementById('pBaseUrl') ? document.getElementById('pBaseUrl').value : '',
-      pApiKey: document.getElementById('pApiKey') ? document.getElementById('pApiKey').value : '',
-      pApi: document.getElementById('pApi') ? document.getElementById('pApi').value : 'openai-completions',
-    },
-    editable: currentEditable,
-    schema: currentSchema,
-  };
-}
+  const countChip = $id('sidebarCount');
+  if (countChip) countChip.innerText = String(activeEntries.length);
 
-async function switchTarget(path) {
-  if (path === currentConfigPath) return;
-  // 切换前先将当前配置的表单输入与模型改动暂存到内存草稿
-  saveCurrentStateToDraft();
-  
-  currentConfigPath = path;
-  renderTargetTabs();
-  await loadData(currentConfigPath);
-}
-
-async function loadData(path = currentConfigPath) {
-  fetchedPreview = []; // clear buffer when reloading data
-  const fpContainer = document.getElementById('fetchPreviewContainer');
-  if (fpContainer) fpContainer.style.display = 'none';
-
-  // 优先恢复内存中的未保存草稿
-  if (configDrafts[path]) {
-    const draft = configDrafts[path];
-    currentConfig = draft.config;
-    currentConfigPath = path;
-    currentEditable = draft.editable !== false;
-    currentSchema = draft.schema || 'unknown';
-    document.getElementById('pathDisplay').innerText = `📁 当前配置: ${path}`;
-    updateEditState();
-    renderSidebar();
-    
-    if (draft.selectedPid && currentConfig.providers[draft.selectedPid]) {
-      selectProvider(draft.selectedPid);
-    } else {
-      const keys = Object.keys(currentConfig.providers);
-      if (keys.length > 0) selectProvider(keys[0]);
-      else newProvider(true);
-    }
-    
-    // 恢复编辑状态与未暂存的表单内容
-    if (draft.isProviderEditing && draft.editForm) {
-      toggleProviderEditMode(true);
-      if (document.getElementById('pId')) document.getElementById('pId').value = draft.editForm.pId || '';
-      if (document.getElementById('pName')) document.getElementById('pName').value = draft.editForm.pName || '';
-      if (document.getElementById('pBaseUrl')) document.getElementById('pBaseUrl').value = draft.editForm.pBaseUrl || '';
-      if (document.getElementById('pApiKey')) document.getElementById('pApiKey').value = draft.editForm.pApiKey || '';
-      if (document.getElementById('pApi')) document.getElementById('pApi').value = draft.editForm.pApi || 'openai-completions';
-    }
-    return;
-  }
-
-  // 没有草稿时，从后端读取原始配置文件
-  const data = await window.pywebview.api.get_config(path);
-  currentConfig = data.config;
-  currentConfigPath = data.path;
-  currentEditable = data.editable !== false;
-  currentSchema = data.schema || 'unknown';
-  document.getElementById('pathDisplay').innerText = `📁 当前配置: ${data.path}`;
-  updateEditState();
-  renderSidebar();
-  if (selectedPid && currentConfig.providers[selectedPid]) {
-    selectProvider(selectedPid);
-  } else {
-    const keys = Object.keys(currentConfig.providers);
-    if (keys.length > 0) selectProvider(keys[0]);
-    else newProvider(true);
-  }
-}
-
-function updateEditState() {
-  const saveBtn = document.getElementById('saveBtn');
-  if (saveBtn) {
-    saveBtn.disabled = !currentEditable;
-    saveBtn.style.opacity = currentEditable ? '1' : '0.45';
-    saveBtn.style.cursor = currentEditable ? 'pointer' : 'not-allowed';
-  }
-  document.querySelectorAll('.edit-action').forEach(btn => {
-    btn.disabled = !currentEditable;
-    btn.style.opacity = currentEditable ? '1' : '0.45';
-    btn.style.cursor = currentEditable ? 'pointer' : 'not-allowed';
-  });
-}
-
-function assertEditable() {
-  if (currentEditable) return true;
-  alert('当前配置是只读预览格式，暂不直接写回，避免破坏该 Agent 的原配置。');
-  return false;
-}
-
-function toggleApiKeyVisibility() {
-  const input = document.getElementById('pApiKey');
-  const btn = document.getElementById('toggleApiKeyBtn');
-  if (input.type === 'password') {
-    input.type = 'text';
-    btn.textContent = '🙈';
-  } else {
-    input.type = 'password';
-    btn.textContent = '👁️';
-  }
-}
-
-function getProtoBadge(api) {
-  if (api === 'anthropic-messages') return '<span class="p-proto" style="background:rgba(217,70,239,0.18); color:#F0ABFC; border-color:rgba(217,70,239,0.3);">Claude</span>';
-  if (api === 'google-generative-ai') return '<span class="p-proto" style="background:rgba(16,185,129,0.18); color:#6EE7B7; border-color:rgba(16,185,129,0.3);">Gemini</span>';
-  if (api === 'openai-responses') return '<span class="p-proto" style="background:rgba(99,102,241,0.18); color:#A5B4FC; border-color:rgba(99,102,241,0.3);">Resp</span>';
-  return '<span class="p-proto">OpenAI</span>';
-}
-
-function renderSidebar() {
-  const container = document.getElementById('providerList');
-  container.innerHTML = '';
-  const searchInput = document.getElementById('providerSearch');
+  const searchInput = $id('providerSearch');
   const query = searchInput ? searchInput.value.trim().toLowerCase() : '';
-  let pids = Object.keys(currentConfig.providers).sort();
+  
+  let pids = activeEntries.map(([pid]) => pid);
   if (query) {
     pids = pids.filter(pid => {
       const p = currentConfig.providers[pid] || {};
       return pid.toLowerCase().includes(query) || (p.name && p.name.toLowerCase().includes(query));
     });
   }
-  if (pids.length === 0) {
-    container.innerHTML = `<div style="color:var(--text-dim); font-size:12px; text-align:center; padding:18px 0;">${query ? '未找到匹配服务商' : '暂无服务商配置'}</div>`;
+
+  if (pids.length === 0 && activeEntries.length === 0) {
+    container.appendChild(emptyState(query ? '未找到匹配服务商' : '暂无服务商配置', query ? '' : '点击右上角《➕ 新建》添加'));
     return;
   }
-  pids.forEach(pid => {
-    const p = currentConfig.providers[pid];
+
+  pids.forEach((pid) => {
+    const p = currentConfig.providers[pid] || {};
     const count = (p.models || []).length;
-    const card = document.createElement('div');
-    card.className = 'p-card' + (pid === selectedPid ? ' active' : '');
-    card.onclick = () => selectProvider(pid);
-    card.innerHTML = `
-      <div class="p-card-top">
-        <span class="p-name" title="${p.name || pid}">${p.name || pid}</span>
-        <div class="p-badges">
-          ${getProtoBadge(p.api)}
-          <span class="p-count">${count}</span>
-        </div>
-      </div>
-      <div class="p-id">${pid}</div>
-    `;
-    container.appendChild(card);
+    const isActive = pid === selectedPid;
+    const row = el('div', 'p-row' + (isActive ? ' active' : ''));
+    row.dataset.pid = pid;
+
+    row.addEventListener('dragstart', (e) => {
+      if (row.draggable !== true) { e.preventDefault(); return; }
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', pid);
+      row.classList.add('dragging');
+      document.body.classList.add('dragging-cursor');
+    });
+    row.addEventListener('dragend', () => {
+      row.draggable = false;
+      row.classList.remove('dragging');
+      document.body.classList.remove('dragging-cursor');
+      document.querySelectorAll('.p-row').forEach(r => r.classList.remove('drag-over'));
+    });
+    row.addEventListener('dragover', (e) => { e.preventDefault(); row.classList.add('drag-over'); });
+    row.addEventListener('dragleave', () => row.classList.remove('drag-over'));
+    row.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      row.classList.remove('drag-over');
+      const srcPid = e.dataTransfer.getData('text/plain');
+      if (srcPid && srcPid !== pid) await moveProviderToTarget(srcPid, pid);
+    });
+
+    row.onclick = () => selectProvider(pid);
+    row.ondblclick = () => { selectProvider(pid); openDrawer(pid); toggleProviderEditMode(true); };
+
+    const handle = el('span', 'p-row-handle', '≡');
+    handle.title = '按住拖拽调整服务商顺序';
+    handle.addEventListener('pointerdown', () => { row.draggable = true; });
+
+    const dotClass = p.api === 'anthropic-messages' ? 'proto-claude-dot'
+      : p.api === 'google-generative-ai' ? 'proto-gemini-dot'
+      : p.api === 'openai-responses' ? 'proto-resp-dot'
+      : 'proto-openai-dot';
+    const dot = el('span', 'p-row-dot ' + dotClass);
+    dot.title = p.api || 'openai-completions';
+
+    const nameEl = el('span', 'p-row-name', p.name || pid);
+    nameEl.title = (p.name || pid) + (p.name ? ' (' + pid + ')' : '');
+
+    const badges = el('span', 'p-row-badges');
+    if (p._isBuiltin) {
+      const bBadge = el('span', 'p-proto proto-builtin', '内置');
+      bBadge.title = 'Pi 原生内置服务商';
+      badges.appendChild(bBadge);
+    }
+    badges.appendChild(el('span', 'p-count', String(count)));
+
+    const actions = el('span', 'p-row-actions');
+    const editBtn = el('button', 'p-row-btn', '⚙️');
+    editBtn.title = '打开服务商连接抽屉';
+    editBtn.onclick = (e) => { e.stopPropagation(); selectProvider(pid); openDrawer(pid); };
+
+    // 内置厂商由 Pi 原生目录提供，不可删除也不可隐藏 -> 不提供删除按钮
+    if (p._isBuiltin) {
+      actions.append(editBtn);
+    } else {
+      const delBtn = el('button', 'p-row-btn del', '🗑️');
+      delBtn.title = '删除服务商 [' + (p.name || pid) + ']';
+      delBtn.onclick = (e) => { e.stopPropagation(); deleteProvider(pid); };
+      actions.append(editBtn, delBtn);
+    }
+
+    row.append(handle, dot, nameEl, badges, actions);
+    container.appendChild(row);
   });
 }
 
-let isProviderEditing = false;
-let isViewKeyMasked = true;
+async function moveProviderToTarget(srcPid, targetPid) {
+  const providers = currentConfig.providers || {};
+  const keys = Object.keys(providers);
+  const fromIdx = keys.indexOf(srcPid);
+  const toIdx = keys.indexOf(targetPid);
+  if (fromIdx < 0 || toIdx < 0 || fromIdx === toIdx) return;
+  const newKeys = [...keys];
+  const [removed] = newKeys.splice(fromIdx, 1);
+  newKeys.splice(toIdx, 0, removed);
+  const reordered = {};
+  for (const k of newKeys) reordered[k] = providers[k];
+  currentConfig.providers = reordered;
+  renderSidebar();
+  await saveAll();
+}
 
-function toggleViewKeyMask() {
-  isViewKeyMasked = !isViewKeyMasked;
-  const btn = document.getElementById('viewMaskBtn');
-  if (btn) btn.textContent = isViewKeyMasked ? '👁️' : '🙈';
-  if (selectedPid && currentConfig.providers[selectedPid]) {
-    updateProviderViewPanel(selectedPid);
+async function deleteProvider(pid) {
+  const p = currentConfig.providers[pid];
+  if (!p) return;
+
+  if (p._isBuiltin) {
+    // 内置厂商的模型目录由 Pi 自身提供，工具无法删除或隐藏它
+    showAlert('无法删除', `[${pid}] 是 Pi 原生内置服务商，其模型目录由 Pi 自身提供，无法从工具中删除或隐藏。\n\n如需调整连接参数，请在右侧抽屉中编辑。`);
+    return;
+  }
+
+  const ok = await showConfirm({
+    title: '删除服务商',
+    icon: '🗑️',
+    danger: true,
+    message: `确定删除服务商 [${p.name || pid}] 吗？`,
+    confirmText: '确定删除'
+  });
+  if (!ok) return;
+  delete currentConfig.providers[pid];
+  if (selectedPid === pid) {
+    const keys = Object.keys(currentConfig.providers);
+    if (keys.length > 0) selectProvider(keys[0]);
+    else newProvider();
+  }
+  renderSidebar();
+  saveAll();
+  setStatus(`🗑️ 已删除服务商 [${pid}]`, '#EF4444');
+}
+
+
+// Select Provider
+function selectProvider(pid) {
+  selectedPid = pid;
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.set_selected_provider) {
+    window.pywebview.api.set_selected_provider(pid).catch(() => {});
+  }
+  fetchedPreview = [];
+  renderSidebar();
+  const p = (currentConfig.providers || {})[pid] || {};
+  if ($id('pId')) $id('pId').value = pid || '';
+  if ($id('pName')) $id('pName').value = p.name || '';
+  if ($id('pBaseUrl')) $id('pBaseUrl').value = p.baseUrl || '';
+  if ($id('pApiKey')) $id('pApiKey').value = p.apiKey || (p.apiKeys && p.apiKeys[0] ? p.apiKeys[0].key : '') || '';
+  if ($id('pApi')) $id('pApi').value = p.api || 'openai-completions';
+
+  updateProviderViewPanel(pid);
+  toggleProviderEditMode(false);
+  renderModels(p.models || []);
+}
+
+function toggleEditApiKeyVisibility() {
+  const inp = $id('pApiKey');
+  const btn = $id('toggleEditApiKeyBtn');
+  if (!inp) return;
+  if (inp.type === 'password') {
+    inp.type = 'text';
+    if (btn) btn.textContent = '🙈';
+  } else {
+    inp.type = 'password';
+    if (btn) btn.textContent = '👁️';
   }
 }
 
+// Provider View & Edit Panels
+function toggleViewKeyMask() {
+  isViewKeyMasked = !isViewKeyMasked;
+  const btn = $id('viewMaskBtn');
+  if (btn) btn.textContent = isViewKeyMasked ? '👁️' : '🙈';
+  if (selectedPid) updateProviderViewPanel(selectedPid);
+}
+
 function updateProviderViewPanel(pid) {
-  const p = (pid && currentConfig.providers[pid]) ? currentConfig.providers[pid] : null;
-  const vId = document.getElementById('vId');
-  const vName = document.getElementById('vName');
-  const vBaseUrl = document.getElementById('vBaseUrl');
-  const vApiKey = document.getElementById('vApiKey');
-  const vApi = document.getElementById('vApi');
+  const p = (pid && (currentConfig.providers || {})[pid]) ? currentConfig.providers[pid] : null;
+  const vId = $id('vId');
+  const vName = $id('vName');
+  const vBaseUrl = $id('vBaseUrl');
+  const vApiKey = $id('vApiKey');
+  const vKeyPoolSummary = $id('vKeyPoolSummary');
+  const vApi = $id('vApi');
 
   if (!p) {
     if (vId) vId.innerText = '-';
     if (vName) { vName.innerText = '未选择服务商'; vName.className = 'view-value empty'; }
     if (vBaseUrl) { vBaseUrl.innerText = '-'; vBaseUrl.className = 'view-value empty'; }
     if (vApiKey) { vApiKey.innerText = '-'; vApiKey.className = 'view-value empty'; }
+    if (vKeyPoolSummary) vKeyPoolSummary.innerHTML = '未配置';
     if (vApi) { vApi.innerText = '-'; vApi.className = 'view-value empty'; }
     return;
   }
@@ -1956,20 +2971,56 @@ function updateProviderViewPanel(pid) {
       vApiKey.className = 'view-value';
     }
   }
+
+  if (vKeyPoolSummary) {
+    const pool = p.apiKeys || [];
+    if (!pool || pool.length === 0) {
+      vKeyPoolSummary.innerHTML = '<span style="color:var(--b-text-4); font-style:italic;">未配置密钥池</span>';
+    } else {
+      const badges = pool.map(k => {
+        const kname = k.name || k.id;
+        return `<span style="display:inline-block; font-family:var(--b-mono); font-size:10px; padding:1px 5px; margin:2px 3px 2px 0; border-radius:2px; background:rgba(59,130,246,0.15); color:#93C5FD; border:1px solid rgba(59,130,246,0.3);">${escapeHtml(kname)}</span>`;
+      }).join('');
+      vKeyPoolSummary.innerHTML = `已维护 <b>${pool.length}</b> 组密钥:<br>${badges}`;
+    }
+  }
+
   if (vApi) {
     vApi.innerText = p.api || 'openai-completions';
     vApi.className = 'view-value';
   }
+
+  const delBtn = $id('deleteProviderBtn');
+  if (delBtn) {
+    if (p._isBuiltin) {
+      // 内置厂商由 Pi 原生目录提供，不可删除也不可隐藏
+      delBtn.style.display = 'none';
+    } else {
+      delBtn.style.display = 'block';
+      delBtn.innerText = '🗑️ 删除服务商';
+      delBtn.className = 'btn btn-rose';
+      delBtn.title = '删除此服务商';
+    }
+  }
+
+
+}
+
+function escapeHtml(text) {
+  return String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 function toggleProviderEditMode(editing) {
-  if (editing && !assertEditable()) return;
   isProviderEditing = editing;
-  const viewPanel = document.getElementById('providerViewPanel');
-  const editPanel = document.getElementById('providerEditPanel');
-  const editBtn = document.getElementById('editProviderBtn');
-  const saveBtn = document.getElementById('saveProviderBtn');
-  const cancelBtn = document.getElementById('cancelProviderBtn');
+  const viewPanel = $id('providerViewPanel');
+  const editPanel = $id('providerEditPanel');
+  const editBtn = $id('editProviderBtn');
+  const saveBtn = $id('saveProviderBtn');
+  const cancelBtn = $id('cancelProviderBtn');
 
   if (editing) {
     if (viewPanel) viewPanel.style.display = 'none';
@@ -1977,8 +3028,13 @@ function toggleProviderEditMode(editing) {
     if (editBtn) editBtn.style.display = 'none';
     if (saveBtn) saveBtn.style.display = 'inline-flex';
     if (cancelBtn) cancelBtn.style.display = 'inline-flex';
-    document.getElementById('pId').focus();
+    renderKeyPoolEditor(selectedPid);
+    if ($id('pId')) $id('pId').focus();
   } else {
+    // 退出编辑模式后清空密钥池编辑区，避免残留其他厂商的条目被误同步到当前厂商
+    keyPoolRenderedPid = null;
+    const poolContainer = $id('keyPoolContainer');
+    if (poolContainer) poolContainer.innerHTML = '';
     if (viewPanel) viewPanel.style.display = 'flex';
     if (editPanel) editPanel.style.display = 'none';
     if (editBtn) editBtn.style.display = 'inline-flex';
@@ -1989,25 +3045,23 @@ function toggleProviderEditMode(editing) {
 }
 
 async function saveProviderEdit() {
-  if (!assertEditable()) return;
-  const pIdInput = document.getElementById('pId');
+  const pIdInput = $id('pId');
   const rawId = pIdInput ? pIdInput.value : '';
   const pid = normalizeProviderId(rawId);
-  if (!pid) return alert('服务商 ID 不能为空');
-  
-  // 如果是新建服务商且 ID 已存在
+  if (!pid) return showAlert({ title: '校验失败', icon: '⚠️', message: '服务商 ID 不能为空', type: 'error' });
+
   if (!selectedPid && currentConfig.providers[pid]) {
-    return alert(`服务商 ID [${pid}] 已存在，请使用其他 ID`);
+    return showAlert({ title: '校验失败', icon: '⚠️', message: `服务商 ID [${pid}] 已存在，请使用其他 ID`, type: 'error' });
   }
 
-  selectedPid = pid;
-  syncCurrentFormToMemory();
+  // 修复问题1：不再提前覆盖 selectedPid，交由 syncCurrentFormToMemory 内部处理重命名逻辑
+  const finalPid = syncCurrentFormToMemory();
   const saved = await saveAll();
   if (!saved) return;
   toggleProviderEditMode(false);
   renderSidebar();
-  updateProviderViewPanel(pid);
-  setStatus(`✅ 已保存服务商 [${pid}]`, '#10B981');
+  updateProviderViewPanel(finalPid);
+  setStatus(`✅ 已保存服务商 [${finalPid}]`, '#10B981');
 }
 
 function cancelProviderEdit() {
@@ -2021,32 +3075,451 @@ function cancelProviderEdit() {
   toggleProviderEditMode(false);
 }
 
-function selectProvider(pid) {
-  selectedPid = pid;
-  if (window.pywebview && window.pywebview.api && window.pywebview.api.set_selected_provider) {
-    window.pywebview.api.set_selected_provider(pid).catch(() => {});
-  }
-  fetchedPreview = []; // clear buffer when switching providers
-  const fpContainer = document.getElementById('fetchPreviewContainer');
-  if (fpContainer) fpContainer.style.display = 'none';
-  renderSidebar();
-  const p = currentConfig.providers[pid] || {};
-  document.getElementById('pId').value = pid;
-  document.getElementById('pName').value = p.name || '';
-  document.getElementById('pBaseUrl').value = p.baseUrl || '';
-  document.getElementById('pApiKey').value = p.apiKey || '';
-  document.getElementById('pApi').value = p.api || 'openai-completions';
-  
-  updateProviderViewPanel(pid);
-  toggleProviderEditMode(false);
-  renderModels(p.models || []);
+function normalizeProviderId(raw) {
+  return String(raw || '').trim().replace(/[^A-Za-z0-9_.-]+/g, '-');
 }
 
+function syncCurrentFormToMemory() {
+  const pIdInput = $id('pId');
+  if (!pIdInput) return selectedPid;
+  const rawId = pIdInput.value;
+  const pid = normalizeProviderId(rawId);
+  if (!pid) return selectedPid || '';
+
+  if (selectedPid && selectedPid !== pid) {
+    if (currentConfig.providers[pid]) {
+      showAlert({ title: '校验失败', icon: '⚠️', message: '该服务商 ID 已存在', type: 'error' });
+      pIdInput.value = selectedPid;
+      return selectedPid;
+    }
+    currentConfig.providers[pid] = currentConfig.providers[selectedPid] || { models: [] };
+    delete currentConfig.providers[selectedPid];
+    selectedPid = pid;
+  } else if (!selectedPid) {
+    selectedPid = pid;
+  }
+
+  if (!currentConfig.providers[pid]) {
+    currentConfig.providers[pid] = { models: [] };
+  }
+  const p = currentConfig.providers[pid];
+  const nameInput = $id('pName');
+  const baseInput = $id('pBaseUrl');
+  const apiInput = $id('pApi');
+  const apiKeyInput = $id('pApiKey');
+  const displayName = nameInput ? nameInput.value.trim() : (p.name || '');
+  const baseUrl = baseInput ? baseInput.value.trim().replace(new RegExp('/+$'), '') : (p.baseUrl || '');
+  const api = apiInput ? apiInput.value : (p.api || '');
+  const directApiKey = apiKeyInput ? apiKeyInput.value.trim() : '';
+
+  if (displayName) p.name = displayName; else delete p.name;
+  if (baseUrl) p.baseUrl = baseUrl; else delete p.baseUrl;
+  if (api) p.api = api; else delete p.api;
+
+  // 同步密钥与密钥池
+  if (isProviderEditing) {
+    const poolItems = document.querySelectorAll('#keyPoolContainer .key-pool-item');
+    const nextPool = [];
+    poolItems.forEach(item => {
+      const kidInput = item.querySelector('.key-id-input');
+      const knameInput = item.querySelector('.key-name-input');
+      const ksecretInput = item.querySelector('.key-secret-input');
+      const kid = kidInput ? kidInput.value.trim() : '';
+      const ksecret = ksecretInput ? ksecretInput.value.trim() : '';
+      const kname = knameInput ? knameInput.value.trim() : '';
+      if (kid && ksecret) {
+        const poolEntry = { id: kid, key: ksecret };
+        if (kname) poolEntry.name = kname;
+        nextPool.push(poolEntry);
+      }
+    });
+    if (nextPool.length > 0) {
+      p.apiKeys = nextPool;
+      if (directApiKey) {
+        p.apiKey = directApiKey;
+      } else {
+        p.apiKey = nextPool[0].key;
+        if (apiKeyInput) apiKeyInput.value = nextPool[0].key;
+      }
+    } else {
+      delete p.apiKeys;
+      if (directApiKey) {
+        p.apiKey = directApiKey;
+      } else {
+        delete p.apiKey;
+      }
+    }
+  } else {
+    if (directApiKey) {
+      p.apiKey = directApiKey;
+    }
+  }
+
+  if (!p.models) p.models = [];
+  return pid;
+}
+
+function renderKeyPoolEditor(pid) {
+  keyPoolRenderedPid = pid || null;
+  const container = $id('keyPoolContainer');
+  if (!container) return;
+  container.innerHTML = '';
+  const p = (pid && (currentConfig.providers || {})[pid]) ? currentConfig.providers[pid] : {};
+  
+  // 如果 p 存在 apiKey 但 apiKeys 为空，则为其初始化一个默认的 apiKeys 池条目
+  let pool = p.apiKeys || [];
+  if (pool.length === 0 && p.apiKey) {
+    pool = [{ id: 'default', name: '主密钥', key: p.apiKey }];
+  }
+
+  if (pool.length === 0) {
+    const tip = el('div', 'empty-pool-tip', '暂未添加密钥，请点击右上方 ➕ 新增 Key');
+    tip.style.cssText = 'color: var(--b-text-4); font-size: 11px; font-style: italic; padding: 4px 0; text-align: center;';
+    container.appendChild(tip);
+    return;
+  }
+  pool.forEach((item, idx) => {
+    container.appendChild(createKeyPoolRowElement(item.id, item.name || '', item.key || '', idx));
+  });
+}
+
+function createKeyPoolRowElement(idVal, nameVal, secretVal, index) {
+  const row = el('div', 'key-pool-item');
+  row.dataset.index = index;
+
+  const colId = el('input', 'input key-id-input');
+  colId.style.cssText = 'width: 80px; font-family: var(--b-mono); font-size: 11px; padding: 2px 4px;';
+  colId.placeholder = '标识 (如 key-1)';
+  colId.value = idVal || '';
+  colId.title = 'Key 的唯一内部 ID 标识';
+
+  const colName = el('input', 'input key-name-input');
+  colName.style.cssText = 'flex: 1; min-width: 60px; font-size: 11px; padding: 2px 4px;';
+  colName.placeholder = '别名 (如 VIP Key)';
+  colName.value = nameVal || '';
+  colName.title = 'Key 的备注说明';
+
+  const secWrap = el('div', 'input-wrapper');
+  secWrap.style.cssText = 'flex: 1.4; min-width: 90px;';
+  const colSec = el('input', 'input key-secret-input');
+  colSec.type = 'password';
+  colSec.style.cssText = 'width: 100%; font-family: var(--b-mono); font-size: 11px; padding: 2px 24px 2px 4px;';
+  colSec.placeholder = 'sk-...';
+  colSec.value = secretVal || '';
+  
+  const eye = el('span', 'toggle-pwd', '👁️');
+  eye.style.fontSize = '10px';
+  eye.style.right = '4px';
+  eye.onclick = () => {
+    if (colSec.type === 'password') {
+      colSec.type = 'text';
+      eye.textContent = '🙈';
+    } else {
+      colSec.type = 'password';
+      eye.textContent = '👁️';
+    }
+  };
+  secWrap.append(colSec, eye);
+
+  const delBtn = el('button', 'btn btn-ghost', '✕');
+  delBtn.type = 'button';
+  delBtn.style.cssText = 'padding: 1px 5px; font-size: 11px; color: var(--b-text-3);';
+  delBtn.title = '移除此 Key';
+  delBtn.onclick = () => {
+    row.remove();
+    syncCurrentFormToMemory();
+    const remain = document.querySelectorAll('#keyPoolContainer .key-pool-item');
+    if (remain.length === 0) {
+      renderKeyPoolEditor(selectedPid);
+    }
+  };
+
+  row.append(colId, colName, secWrap, delBtn);
+  return row;
+}
+
+function addKeyPoolItem() {
+  const container = $id('keyPoolContainer');
+  if (!container) return;
+  // If showing placeholder tip, clear it
+  const tip = container.querySelector('.empty-pool-tip');
+  if (tip) tip.remove();
+
+  const items = container.querySelectorAll('.key-pool-item');
+  const nextIdx = items.length + 1;
+  const newRow = createKeyPoolRowElement(`key-${nextIdx}`, `密钥 ${nextIdx}`, '', items.length);
+  container.appendChild(newRow);
+  const secretInp = newRow.querySelector('.key-secret-input');
+  if (secretInp) secretInp.focus();
+}
+
+// toggleApiKeyVisibility 不再需要了
+function toggleApiKeyVisibility() {}
+
+// Render Single-line Model Rows (.model-row)
+function renderModels(models) {
+  const pid = selectedPid || syncCurrentFormToMemory();
+  const p = (pid && (currentConfig.providers || {})[pid]) ? currentConfig.providers[pid] : {};
+  const actualList = models !== undefined ? models : (p.models || []);
+
+  const tabBadge = $id('modelsTabBadge');
+  if (tabBadge) tabBadge.innerText = String(actualList.length);
+
+  const container = $id('modelsContainer');
+  if (!container) return;
+  container.innerHTML = '';
+
+  if (!actualList || actualList.length === 0) {
+    container.appendChild(emptyState('暂无模型配置', '点击上方《➕ 添加模型》或《⚙️ 厂商设置 → 自动拉取》'));
+    return;
+  }
+
+  const searchInput = $id('modelSearch');
+  const query = searchInput ? searchInput.value.trim().toLowerCase() : '';
+  let displayList = actualList;
+  if (query) {
+    displayList = displayList.filter(m => {
+      const id = String(m.id || '').toLowerCase();
+      const name = String(m.name || '').toLowerCase();
+      return id.includes(query) || name.includes(query);
+    });
+  }
+
+  if (displayList.length === 0) {
+    container.appendChild(emptyState('未搜索到匹配模型', `关键词: "${query}"`));
+    return;
+  }
+
+  displayList.forEach((m) => {
+    const row = el('div', 'model-row' + (m.disabled ? ' disabled' : ''));
+    row.dataset.mid = m.id;
+
+    // Drag-and-drop ordering
+    row.addEventListener('dragstart', (e) => {
+      if (row.draggable !== true) { e.preventDefault(); return; }
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', m.id);
+      row.classList.add('dragging');
+      document.body.classList.add('dragging-cursor');
+    });
+    row.addEventListener('dragend', () => {
+      row.draggable = false;
+      row.classList.remove('dragging');
+      document.body.classList.remove('dragging-cursor');
+      document.querySelectorAll('.model-row').forEach(r => r.classList.remove('drag-over'));
+    });
+    row.addEventListener('dragover', (e) => { e.preventDefault(); row.classList.add('drag-over'); });
+    row.addEventListener('dragleave', () => row.classList.remove('drag-over'));
+    row.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      row.classList.remove('drag-over');
+      const srcMid = e.dataTransfer.getData('text/plain');
+      if (srcMid && srcMid !== m.id) await moveModelToTarget(pid, srcMid, m.id);
+    });
+
+    // Handle：内置模型的顺序由 Pi 原生目录决定，禁止拖拽以保证两边顺序一致
+    const handle = el('span', 'model-row-handle', '≡');
+    if (m._isBuiltinModel) {
+      handle.title = '内置模型顺序由 Pi 原生目录决定，不可调整';
+      handle.style.opacity = '0.3';
+      handle.style.cursor = 'not-allowed';
+    } else {
+      handle.title = '按住拖拽调整模型顺序';
+      handle.addEventListener('pointerdown', () => { row.draggable = true; });
+    }
+
+    // Alias Input
+    const aliasWrap = el('div', 'model-row-alias');
+    const aliasInput = el('input', 'alias-input');
+    aliasInput.type = 'text';
+    aliasInput.value = m.name || m.id;
+    aliasInput.placeholder = m.id;
+    aliasInput.title = '点击直接修改别名，按回车保存';
+    aliasInput.onchange = () => updateModelAlias(m.id, aliasInput.value);
+    aliasWrap.appendChild(aliasInput);
+
+    // Model ID
+    const idEl = el('span', 'model-row-id', m.id);
+    idEl.title = m.id;
+
+    // Status Badge
+    const statusWrap = el('div', 'model-row-status');
+    if (m.disabled) {
+      statusWrap.appendChild(el('span', 'disabled-badge', '已禁用'));
+    } else if (m._failStreak > 0) {
+      statusWrap.appendChild(el('span', 'fail-streak', `⚠ ${m._failStreak}`));
+    }
+
+    // Actions
+    const actions = el('div', 'model-row-actions');
+
+    // Key Configuration Button (🔑)
+    const keyRef = m.apiKeyRef;
+    const headers = m.headers || {};
+    const hasCustomKey = Boolean(headers.Authorization || headers['x-api-key']);
+    let keyBtnClass = 'model-row-btn key-btn';
+    let keyBtnText = '🔑 Key';
+    let keyBtnTitle = '使用厂商默认 API Key (点击切换或单独配置)';
+
+    const poolList = p.apiKeys || [];
+    const poolMap = {};
+    poolList.forEach(k => { poolMap[k.id] = k; });
+
+    if (keyRef && poolMap[keyRef]) {
+      keyBtnClass += ' is-pool';
+      const kInfo = poolMap[keyRef];
+      keyBtnText = `🔑 ${kInfo.name || keyRef}`;
+      keyBtnTitle = `已绑定厂商密钥池: ${kInfo.name || keyRef} (点击修改)`;
+    } else if (hasCustomKey) {
+      keyBtnClass += ' is-custom';
+      keyBtnText = '🔑 独立Key';
+      keyBtnTitle = '已配置当前模型专属独立 API Key (点击修改)';
+    }
+
+    const keyBtn = el('button', keyBtnClass, keyBtnText);
+    keyBtn.title = keyBtnTitle;
+    keyBtn.onclick = () => openModelKeyModal(m.id);
+
+    // Test Button
+    const testBtn = el('button', 'model-row-btn test-btn', '⚡ 测活');
+    testBtn.title = '发送最小请求验证 API 是否可用';
+    testBtn.onclick = () => testModel(testBtn, m.id);
+
+    // Default Button
+    const isDefault = currentDefaultProvider === pid && currentDefaultModel === m.id;
+    const defBtn = el('button', 'model-row-btn default-btn' + (isDefault ? ' is-default' : ''), isDefault ? '★ 默认' : '☆ 设默认');
+    defBtn.title = isDefault ? '当前已是 Pi 默认模型' : `点击将 [${m.id}] 设为 Pi 默认模型`;
+    defBtn.onclick = () => setDefaultModel(pid, m.id);
+
+    // Delete Button
+    const delBtn = el('button', 'model-row-btn del-btn', '✕');
+    if (m._isBuiltinModel) {
+      // 内置模型的目录由 Pi 原生提供：不可删除，也不提供“禁用”
+      // （Pi 的 models.json schema 没有 disabled 字段，设了也不会生效）
+      delBtn.disabled = true;
+      delBtn.title = `[${m.id}] 是 Pi 内置模型，目录由 Pi 原生提供，不可删除或隐藏。`;
+      delBtn.style.opacity = '0.25';
+      delBtn.style.cursor = 'not-allowed';
+      actions.append(keyBtn, testBtn, defBtn, delBtn);
+    } else {
+      const toggleBtn = el('button', 'model-row-btn', m.disabled ? '🔓 启用' : '⏸ 禁用');
+      toggleBtn.title = m.disabled ? '点击重新启用此模型' : '点击禁用此模型（保存后从 Pi 中移除）';
+      toggleBtn.onclick = () => toggleModelEnabled(m.id);
+      delBtn.title = `删除模型 [${m.id}]`;
+      delBtn.onclick = () => removeModel(m.id);
+      actions.append(keyBtn, testBtn, defBtn, toggleBtn, delBtn);
+    }
+
+    row.append(handle, aliasWrap, idEl, statusWrap, actions);
+    container.appendChild(row);
+  });
+}
+
+async function moveModelToTarget(pid, srcMid, targetMid) {
+  const p = (currentConfig.providers || {})[pid];
+  if (!p || !p.models) return;
+  const models = [...p.models];
+  const fromIdx = models.findIndex(m => m.id === srcMid);
+  const toIdx = models.findIndex(m => m.id === targetMid);
+  if (fromIdx < 0 || toIdx < 0 || fromIdx === toIdx) return;
+  const [removed] = models.splice(fromIdx, 1);
+  models.splice(toIdx, 0, removed);
+  p.models = models;
+  renderModels(p.models);
+  await saveAll();
+}
+
+function updateModelAlias(mid, newAlias) {
+  const pid = syncCurrentFormToMemory();
+  if (!pid) return;
+  const p = currentConfig.providers[pid];
+  if (!p || !p.models) return;
+  const trimmed = String(newAlias || '').trim();
+  const m = p.models.find(x => x.id === mid);
+  if (!m) return;
+  if (!trimmed || trimmed === mid) delete m.name;
+  else m.name = trimmed;
+  renderSidebar();
+}
+
+function toggleModelEnabled(mid) {
+  const pid = syncCurrentFormToMemory();
+  if (!pid) return;
+  const p = currentConfig.providers[pid];
+  if (!p || !p.models) return;
+  const m = p.models.find(x => x.id === mid);
+  if (!m) return;
+  if (m.disabled) {
+    delete m.disabled;
+    m._failStreak = 0;
+    m._lastError = null;
+    setStatus(`✅ [${mid}] 已重新启用（点 💾 保存后 Pi 侧恢复显示）`, '#10B981');
+  } else {
+    m.disabled = true;
+    setStatus(`⏸ [${mid}] 已禁用：点 💾 保存后该模型将从 Pi 中移除`, '#F59E0B');
+  }
+  renderModels(p.models);
+}
+
+function addModelManual() {
+  const mid = $id('newModelId').value.trim();
+  const mname = $id('newModelName').value.trim();
+  if (!mid) return showAlert({ title: '校验失败', icon: '⚠️', message: '请输入模型 ID', type: 'error' });
+  const pid = syncCurrentFormToMemory();
+  if (!pid) return showAlert({ title: '校验失败', icon: '⚠️', message: '请先选择或新建服务商', type: 'error' });
+  const p = currentConfig.providers[pid];
+  if (!p.models) p.models = [];
+  const list = p.models.filter(x => x.id !== mid);
+  const nextModel = { id: mid };
+  if (mname) nextModel.name = mname;
+  list.push(nextModel);
+  p.models = list;
+  $id('newModelId').value = '';
+  $id('newModelName').value = '';
+  renderModels(p.models);
+  renderSidebar();
+  $id('newModelId').focus();
+  setStatus(`已添加模型 [${mid}]，点击「💾 保存」持久化`, '#10B981');
+}
+
+function removeModel(mid) {
+  const pid = syncCurrentFormToMemory();
+  if (!pid) return;
+  const p = currentConfig.providers[pid];
+  p.models = (p.models || []).filter(x => x.id !== mid);
+  renderModels(p.models);
+  renderSidebar();
+}
+
+function newProvider() {
+  selectedPid = null;
+  fetchedPreview = [];
+  renderSidebar();
+  if ($id('pId')) $id('pId').value = '';
+  if ($id('pName')) $id('pName').value = '';
+  if ($id('pBaseUrl')) $id('pBaseUrl').value = '';
+  if ($id('pApiKey')) $id('pApiKey').value = '';
+  if ($id('pApi')) $id('pApi').value = 'openai-completions';
+  updateProviderViewPanel(null);
+  openDrawer();
+  toggleProviderEditMode(true);
+  renderModels([]);
+  if ($id('pId')) $id('pId').focus();
+}
+
+function deleteCurrentProvider() {
+  if (!selectedPid) return;
+  deleteProvider(selectedPid);
+  closeDrawer();
+}
+
+
+// Tab Switching
 function switchModelWorkTab(tab) {
-  const btnModels = document.getElementById('tabBtnModels');
-  const btnFetch = document.getElementById('tabBtnFetch');
-  const paneModels = document.getElementById('paneModels');
-  const paneFetch = document.getElementById('paneFetch');
+  const btnModels = $id('tabBtnModels');
+  const btnFetch = $id('tabBtnFetch');
+  const paneModels = $id('paneModels');
+  const paneFetch = $id('paneFetch');
   
   if (tab === 'fetch') {
     if (btnModels) btnModels.classList.remove('active');
@@ -2061,232 +3534,500 @@ function switchModelWorkTab(tab) {
   }
 }
 
-function renderModels(models) {
-  const pid = selectedPid || syncCurrentFormToMemory();
-  const p = (pid && currentConfig.providers[pid]) ? currentConfig.providers[pid] : {};
-  const actualList = models !== undefined ? models : (p.models || []);
-  
-  // 更新模型总数 Badge
-  const badge = document.getElementById('modelsCountBadge');
-  if (badge) badge.innerText = `${actualList.length} models`;
-  const tabBadge = document.getElementById('modelsTabBadge');
-  if (tabBadge) tabBadge.innerText = `${actualList.length}`;
+// Model-specific API Key Modal & Resolution
+let activeModalModelId = null;
 
-  const container = document.getElementById('modelsContainer');
-  container.innerHTML = '';
-  if (!actualList || actualList.length === 0) {
-    container.innerHTML = '<span style="color: var(--text-muted); font-size: 13px;">暂无模型，点击「自动拉取模型」或手动添加。别名可直接点击修改</span>';
-    return;
-  }
+function getEffectiveModelAuth(pid, model) {
+  const p = (pid && (currentConfig.providers || {})[pid]) ? currentConfig.providers[pid] : {};
+  const pool = p.apiKeys || [];
+  const poolMap = {};
+  pool.forEach(k => { poolMap[k.id] = k; });
 
-  const searchInput = document.getElementById('modelSearch');
-  const query = searchInput ? searchInput.value.trim().toLowerCase() : '';
-  let displayList = actualList;
-  if (query) {
-    displayList = displayList.filter(m => {
-      const id = String(m.id || '').toLowerCase();
-      const name = String(m.name || '').toLowerCase();
-      return id.includes(query) || name.includes(query);
-    });
-  }
+  const headers = model.headers ? { ...model.headers } : {};
+  let effectiveKey = (p.apiKey || '').trim();
+  let keySource = 'default';
+  let keySourceName = '厂商默认';
 
-  if (displayList.length === 0) {
-    container.innerHTML = `<span style="color: var(--text-muted); font-size: 12px; padding: 6px 0;">未搜索到包含 "${query}" 的模型</span>`;
-    return;
-  }
-
-  displayList.forEach(m => {
-    const tag = document.createElement('div');
-    const isDisabled = !!m.disabled;
-    const failStreak = m._failStreak || 0;
-    tag.className = 'model-tag' + (isDisabled ? ' disabled' : '');
-    const alias = m.name || m.id;
-    const safeId = String(m.id).replace(/'/g, "\\'").replace(/"/g, '&quot;');
-    const safeAlias = String(alias).replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    const disabledBadge = isDisabled
-      ? `<span class="disabled-badge" title="连续失败 ${failStreak} 次，已自动禁用。点击「启用」可恢复">⛔ 已禁用</span>`
-      : (failStreak > 0 ? `<span class="fail-streak" title="连续失败 ${failStreak} 次 (达 ${disableThreshold} 次会自动禁用)">⚠ ${failStreak}</span>` : '');
-    const toggleTitle = isDisabled ? '点击重新启用此模型' : '点击手动禁用此模型';
-    const toggleIcon = isDisabled ? '🔓' : '🔒';
-    tag.innerHTML = `
-      <span class="alias-icon" title="可直接编辑此别名">✏️</span>
-      <input class="alias-input" type="text" value="${safeAlias}" placeholder="${safeId}"
-             title="点击直接修改别名，回车或失焦自动保存"
-             onchange="updateModelAlias('${safeId}', this.value)">
-      <span class="alias-id" title="${safeId}">${safeId}</span>
-      ${disabledBadge}
-      <span class="test-btn" onclick="testModel(this, '${safeId}')" title="测活：发送最小请求验证该模型 API 是否接通">⚡ 测活</span>
-      <span class="toggle-btn ${isDisabled ? 'on' : 'off'}" onclick="toggleModelEnabled('${safeId}')" title="${toggleTitle}">${toggleIcon}</span>
-      <span class="del-btn" onclick="removeModel('${safeId}')" title="删除该模型">✕</span>
-    `;
-    container.appendChild(tag);
-  });
-}
-
-function updateModelAlias(mid, newAlias) {
-  if (!assertEditable()) return;
-  const pid = syncCurrentFormToMemory();
-  if (!pid) return;
-  const p = currentConfig.providers[pid];
-  if (!p || !p.models) return;
-  const trimmed = String(newAlias || '').trim();
-  const m = p.models.find(x => x.id === mid);
-  if (!m) return;
-  if (!trimmed || trimmed === mid) {
-    delete m.name;
-  } else {
-    m.name = trimmed;
-  }
-  renderSidebar();
-}
-
-function toggleModelEnabled(mid) {
-  if (!assertEditable()) return;
-  const pid = syncCurrentFormToMemory();
-  if (!pid) return;
-  const p = currentConfig.providers[pid];
-  if (!p || !p.models) return;
-  const m = p.models.find(x => x.id === mid);
-  if (!m) return;
-  if (m.disabled) {
-    delete m.disabled;
-    m._failStreak = 0;
-    m._lastError = null;
-    setStatus(`✅ [${mid}] 已重新启用`, '#10B981');
-  } else {
-    m.disabled = true;
-    setStatus(`⏸ [${mid}] 已手动禁用 (点 💾 保存后生效)`, '#F59E0B');
-  }
-  renderModels(p.models);
-}
-
-
-function normalizeProviderId(raw) {
-  return String(raw || '').trim().replace(/[^A-Za-z0-9_.-]+/g, '-');
-}
-
-function syncCurrentFormToMemory() {
-  const pIdInput = document.getElementById('pId');
-  if (!pIdInput) return selectedPid;
-  const rawId = pIdInput.value;
-  const pid = normalizeProviderId(rawId);
-  if (!pid) return selectedPid || '';
-
-  // 如果是在已有服务商上修改了 ID
-  if (selectedPid && selectedPid !== pid) {
-    if (currentConfig.providers[pid]) {
-      alert('该服务商 ID 已存在');
-      pIdInput.value = selectedPid;
-      return selectedPid;
+  if (model.apiKeyRef && poolMap[model.apiKeyRef]) {
+    const item = poolMap[model.apiKeyRef];
+    effectiveKey = (item.key || '').trim();
+    keySource = 'pool';
+    keySourceName = item.name || item.id;
+    if (effectiveKey) {
+      headers['Authorization'] = `Bearer ${effectiveKey}`;
     }
-    currentConfig.providers[pid] = currentConfig.providers[selectedPid] || { models: [] };
-    delete currentConfig.providers[selectedPid];
-    selectedPid = pid;
-  } else if (!selectedPid) {
-    // 新建服务商场景：selectedPid 为 null，将 pid 登记为选中服务商
-    selectedPid = pid;
+  } else if (headers.Authorization) {
+    keySource = 'custom';
+    keySourceName = '独立专属Key';
+    const match = headers.Authorization.match(/^Bearer[ ]+(.+)$/i);
+    if (match) {
+      effectiveKey = match[1].trim();
+    }
+  } else if (headers['x-api-key']) {
+    keySource = 'custom';
+    keySourceName = '独立专属Key';
+    effectiveKey = headers['x-api-key'].trim();
   }
 
-  if (!currentConfig.providers[pid]) {
-    currentConfig.providers[pid] = { models: [] };
-  }
-  const p = currentConfig.providers[pid];
-  const displayName = document.getElementById('pName').value.trim();
-  const baseUrl = document.getElementById('pBaseUrl').value.trim().replace(/\\/+$/, '');
-  const apiKey = document.getElementById('pApiKey').value.trim();
-  const api = document.getElementById('pApi').value;
-
-  if (displayName) p.name = displayName; else delete p.name;
-  if (baseUrl) p.baseUrl = baseUrl; else delete p.baseUrl;
-  if (apiKey) p.apiKey = apiKey; else delete p.apiKey;
-  if (api) p.api = api; else delete p.api;
-  if (!p.models) p.models = [];
-  return pid;
+  return {
+    apiKey: effectiveKey,
+    headers: headers,
+    source: keySource,
+    sourceName: keySourceName
+  };
 }
 
-function newProvider(skipEditableCheck = false) {
-  if (!skipEditableCheck && !assertEditable()) return;
-  selectedPid = null;
-  fetchedPreview = [];
-  const fpContainer = document.getElementById('fetchPreviewContainer');
-  if (fpContainer) fpContainer.style.display = 'none';
-  renderSidebar();
-  document.getElementById('pId').value = '';
-  document.getElementById('pName').value = '';
-  document.getElementById('pBaseUrl').value = '';
-  document.getElementById('pApiKey').value = '';
-  document.getElementById('pApi').value = 'openai-completions';
-  updateProviderViewPanel(null);
-  toggleProviderEditMode(true);
-  renderModels([]);
-  const pIdInput = document.getElementById('pId');
-  if (pIdInput) pIdInput.focus();
-}
-
-function addModelManual() {
-  if (!assertEditable()) return;
-  const mid = document.getElementById('newModelId').value.trim();
-  const mname = document.getElementById('newModelName').value.trim();
-  if (!mid) return alert('请输入模型 ID');
+function openModelKeyModal(mid) {
   const pid = syncCurrentFormToMemory();
-  if (!pid) return alert('请先输入服务商 ID');
-  const p = currentConfig.providers[pid];
-  const list = (p.models || []).filter(x => x.id !== mid);
-  const nextModel = { id: mid };
-  if (mname) nextModel.name = mname;
-  list.push(nextModel);
-  p.models = list.sort((a,b) => a.id.localeCompare(b.id));
-  document.getElementById('newModelId').value = '';
-  document.getElementById('newModelName').value = '';
-  renderModels(p.models);
-  renderSidebar();
-  // 连续添加时自动聚焦到模型 ID 输入框
-  document.getElementById('newModelId').focus();
-  setStatus(`已添加模型 [${mid}]，点击「💾 保存」持久化`, '#10B981');
+  if (!pid) return showAlert({ title: '校验失败', icon: '⚠️', message: '请先选择服务商', type: 'error' });
+  const p = currentConfig.providers[pid] || {};
+  const model = (p.models || []).find(m => m.id === mid);
+  if (!model) return;
+
+  activeModalModelId = mid;
+  const modal = $id('modelKeyModal');
+  const targetIdEl = $id('modelKeyTargetId');
+  const defPreviewEl = $id('modelKeyDefaultPreview');
+  const poolSelect = $id('modelKeyPoolSelect');
+  const customInput = $id('modelKeyCustomInput');
+
+  if (targetIdEl) targetIdEl.textContent = `${mid} (${model.name || mid})`;
+  
+  const defaultKey = (p.apiKey || '').trim();
+  if (defPreviewEl) {
+    if (defaultKey) {
+      const masked = defaultKey.length > 8 ? defaultKey.slice(0, 4) + '••••' + defaultKey.slice(-3) : '••••••••';
+      defPreviewEl.textContent = `[${masked}]`;
+    } else {
+      defPreviewEl.textContent = '(当前未配置默认 Key)';
+    }
+  }
+
+  // Populate Key Pool Select
+  const pool = p.apiKeys || [];
+  if (poolSelect) {
+    poolSelect.innerHTML = '';
+    if (pool.length === 0) {
+      const opt = el('option', '', '(厂商暂未在「厂商设置」中添加密钥池)');
+      opt.value = '';
+      poolSelect.appendChild(opt);
+      poolSelect.disabled = true;
+    } else {
+      poolSelect.disabled = false;
+      const defOpt = el('option', '', '-- 请选择绑定的池密钥 --');
+      defOpt.value = '';
+      poolSelect.appendChild(defOpt);
+      pool.forEach(k => {
+        const masked = k.key && k.key.length > 8 ? k.key.slice(0, 4) + '••••' + k.key.slice(-3) : '••••••••';
+        const opt = el('option', '', `${k.name || k.id} [${k.id}] (${masked})`);
+        opt.value = k.id;
+        poolSelect.appendChild(opt);
+      });
+    }
+  }
+
+  // Determine current mode
+  const headers = model.headers || {};
+  let currentKeyVal = '';
+  if (headers.Authorization) {
+    const match = headers.Authorization.match(/^Bearer[ ]+(.+)$/i);
+    currentKeyVal = match ? match[1] : headers.Authorization;
+  } else if (headers['x-api-key']) {
+    currentKeyVal = headers['x-api-key'];
+  }
+
+  if (model.apiKeyRef) {
+    $id('keyModePool').checked = true;
+    if (poolSelect) poolSelect.value = model.apiKeyRef;
+    if (customInput) customInput.value = '';
+  } else if (currentKeyVal) {
+    $id('keyModeCustom').checked = true;
+    if (customInput) customInput.value = currentKeyVal;
+  } else {
+    $id('keyModeDefault').checked = true;
+    if (customInput) customInput.value = '';
+  }
+
+  updateModelKeyModalUI();
+  if (modal) modal.classList.add('open');
 }
 
-function removeModel(mid) {
-  if (!assertEditable()) return;
+function updateModelKeyModalUI() {
+  const isDefault = $id('keyModeDefault') && $id('keyModeDefault').checked;
+  const isPool = $id('keyModePool') && $id('keyModePool').checked;
+  const isCustom = $id('keyModeCustom') && $id('keyModeCustom').checked;
+
+  const poolWrap = $id('modelKeyPoolWrap');
+  const customWrap = $id('modelKeyCustomWrap');
+
+  if (poolWrap) poolWrap.style.display = isPool ? 'block' : 'none';
+  if (customWrap) customWrap.style.display = isCustom ? 'block' : 'none';
+
+  if (isCustom) {
+    const input = $id('modelKeyCustomInput');
+    if (input) setTimeout(() => input.focus(), 50);
+  }
+}
+
+function toggleModelKeyCustomVisibility() {
+  const input = $id('modelKeyCustomInput');
+  const btn = $id('toggleModelKeyCustomBtn');
+  if (!input) return;
+  if (input.type === 'password') {
+    input.type = 'text';
+    if (btn) btn.textContent = '🙈';
+  } else {
+    input.type = 'password';
+    if (btn) btn.textContent = '👁️';
+  }
+}
+
+function handleModelKeyModalBackdrop(e) {
+  if (e.target && e.target.id === 'modelKeyModal') {
+    closeModelKeyModal();
+  }
+}
+
+function closeModelKeyModal() {
+  const modal = $id('modelKeyModal');
+  if (modal) modal.classList.remove('open');
+  activeModalModelId = null;
+}
+
+async function saveModelKeyModal() {
+  if (!activeModalModelId) return closeModelKeyModal();
   const pid = syncCurrentFormToMemory();
   if (!pid) return;
-  const p = currentConfig.providers[pid];
-  p.models = (p.models || []).filter(x => x.id !== mid);
+  const p = currentConfig.providers[pid] || {};
+  const model = (p.models || []).find(m => m.id === activeModalModelId);
+  if (!model) return closeModelKeyModal();
+
+  const isDefault = $id('keyModeDefault') && $id('keyModeDefault').checked;
+  const isPool = $id('keyModePool') && $id('keyModePool').checked;
+  const isCustom = $id('keyModeCustom') && $id('keyModeCustom').checked;
+
+  if (isDefault) {
+    delete model.apiKeyRef;
+    if (model.headers) {
+      delete model.headers['Authorization'];
+      delete model.headers['x-api-key'];
+      if (Object.keys(model.headers).length === 0) delete model.headers;
+    }
+    setStatus(`[${model.id}] 已重置为继承厂商默认 Key`, '#10B981');
+  } else if (isPool) {
+    const poolSelect = $id('modelKeyPoolSelect');
+    const kid = poolSelect ? poolSelect.value : '';
+    if (!kid) return showAlert({ title: '配置校验', icon: '⚠️', message: '请选择要绑定的密钥池条目' });
+    const poolList = p.apiKeys || [];
+    const poolItem = poolList.find(k => k.id === kid);
+    if (!poolItem) return showAlert({ title: '配置校验', icon: '⚠️', message: '选中的密钥不存在', type: 'error' });
+
+    model.apiKeyRef = kid;
+    if (!model.headers) model.headers = {};
+    model.headers['Authorization'] = `Bearer ${poolItem.key}`;
+    setStatus(`[${model.id}] 已绑定密钥池: ${poolItem.name || kid}`, '#10B981');
+  } else if (isCustom) {
+    const customInput = $id('modelKeyCustomInput');
+    const secret = customInput ? customInput.value.trim() : '';
+    if (!secret) return showAlert({ title: '配置校验', icon: '⚠️', message: '请输入专属自定义 API Key' });
+
+    delete model.apiKeyRef;
+    if (!model.headers) model.headers = {};
+    model.headers['Authorization'] = `Bearer ${secret}`;
+    setStatus(`[${model.id}] 已配置独立专属 API Key`, '#10B981');
+  }
+
+  closeModelKeyModal();
   renderModels(p.models);
-  renderSidebar();
+  await saveAll();
 }
 
-async function fetchRemoteModels() {
-  if (!assertEditable()) return;
-  const baseUrl = document.getElementById('pBaseUrl').value.trim();
-  const apiKey = document.getElementById('pApiKey').value.trim();
-  if (!baseUrl) return alert('请先填写 Base URL');
-  setStatus('正在拉取模型中...', '#F59E0B');
+// Model Testing
+function currentTestContext() {
+  const pid = selectedPid || syncCurrentFormToMemory();
+  const p = (pid && currentConfig.providers && currentConfig.providers[pid]) || {};
+  const formBaseUrl = $id('pBaseUrl') ? $id('pBaseUrl').value.trim() : '';
+  const formApi = $id('pApi') ? $id('pApi').value : '';
+  const formApiKey = $id('pApiKey') ? $id('pApiKey').value.trim() : '';
+  return {
+    baseUrl: formBaseUrl || p.baseUrl || '',
+    apiKey: formApiKey || p.apiKey || (p.apiKeys && p.apiKeys[0] ? p.apiKeys[0].key : '') || '',
+    api: formApi || p.api || 'openai-completions',
+  };
+}
+
+async function testModel(btn, mid) {
+  const ctx = currentTestContext();
+  if (!ctx.baseUrl) return showAlert({ title: '配置校验', icon: '⚠️', message: '请先填写 Base URL 端点' });
+  
+  const pid = selectedPid || syncCurrentFormToMemory();
+  const p = (pid && (currentConfig.providers || {})[pid]) ? currentConfig.providers[pid] : {};
+  const model = (p.models || []).find(m => m.id === mid) || { id: mid };
+  const auth = getEffectiveModelAuth(pid, model);
+
+  btn.classList.add('testing');
+  btn.classList.remove('ok', 'fail');
+  btn.innerHTML = '⏳ 测活中';
+  btn.title = `正在检测 API 连通性 (Key: ${auth.sourceName})...`;
+  try {
+    const res = await window.pywebview.api.test_model(ctx.baseUrl, auth.apiKey, ctx.api, mid, auth.headers);
+    if (res.success) {
+      btn.classList.add('ok');
+      btn.innerHTML = `✓ ${res.latency_ms}ms`;
+      btn.title = `测活成功 · 延迟 ${res.latency_ms}ms [${auth.sourceName}]`;
+      setStatus(`✅ [${mid}] 测活成功 · ${res.latency_ms}ms (${auth.sourceName})`, '#10B981');
+    } else {
+      btn.classList.add('fail');
+      btn.innerHTML = '✗ 失败';
+      btn.title = `失败: ${res.error || '未知错误'} [${auth.sourceName}]`;
+      setStatus(`❌ [${mid}] 测活失败: ${res.error || '未知错误'} (${auth.sourceName})`, '#EF4444');
+    }
+  } catch (e) {
+    btn.classList.add('fail');
+    btn.innerHTML = '✗ 异常';
+    setStatus(`❌ [${mid}] 测活异常`, '#EF4444');
+  }
+  setTimeout(() => btn.classList.remove('testing'), 400);
+}
+
+let testAllInProgress = false;
+
+async function testAllModels() {
+  if (testAllInProgress) return;
+  const pid = syncCurrentFormToMemory();
+  if (!pid) return showAlert({ title: '未选择服务商', icon: '⚠️', message: '请先选择或配置服务商' });
+  const p = currentConfig.providers[pid];
+  const models = (p && p.models) || [];
+  if (models.length === 0) return showAlert({ title: '暂无模型', icon: 'ℹ️', message: '当前服务商暂无模型' });
+  const ctx = currentTestContext();
+  if (!ctx.baseUrl) return showAlert({ title: '配置校验', icon: '⚠️', message: '请先填写 Base URL 端点' });
+
+  testAllInProgress = true;
+  setStatus(`⏳ 正在依次测活 ${models.length} 个模型...`, '#F59E0B');
+
+  const rows = document.querySelectorAll('#modelsContainer .model-row');
+  let okCount = 0, failCount = 0;
+  for (let i = 0; i < models.length; i++) {
+    const m = models[i];
+    const row = rows[i];
+    const btn = row ? row.querySelector('.test-btn') : null;
+    if (btn) {
+      btn.classList.add('testing');
+      btn.classList.remove('ok', 'fail');
+      btn.innerHTML = '⏳ 测活中';
+    }
+    const auth = getEffectiveModelAuth(pid, m);
+    let res;
+    try {
+      res = await window.pywebview.api.test_model(ctx.baseUrl, auth.apiKey, ctx.api, m.id, auth.headers);
+    } catch (e) {
+      res = { success: false, error: String(e) };
+    }
+    if (res.success) {
+      if (btn) { btn.classList.add('ok'); btn.innerHTML = `✓ ${res.latency_ms}ms`; btn.title = `测活成功 · 延迟 ${res.latency_ms}ms [${auth.sourceName}]`; }
+      okCount++;
+      m._failStreak = 0;
+    } else {
+      if (btn) { btn.classList.add('fail'); btn.innerHTML = '✗ 失败'; btn.title = `失败: ${res.error || '未知错误'} [${auth.sourceName}]`; }
+      failCount++;
+      m._failStreak = (m._failStreak || 0) + 1;
+    }
+    if (btn) btn.classList.remove('testing');
+  }
+  testAllInProgress = false;
+  renderModels(p.models);
+  setStatus(`✅ 全部测活完成：${okCount} 可用 / ${failCount} 失败`, failCount > 0 ? '#F59E0B' : '#10B981');
+}
+
+// Remote Fetch
+let currentFetchParams = null;
+
+function fetchRemoteModelsFromTab() {
+  if (!selectedPid) return showAlert({ title: '未选择服务商', icon: '⚠️', message: '请先在左侧选择一个服务商' });
+  const p = currentConfig.providers[selectedPid] || {};
+  const baseUrl = ($id('pBaseUrl') ? $id('pBaseUrl').value.trim() : '') || p.baseUrl || '';
+  if (!baseUrl) {
+    showAlert({ title: '配置校验', icon: '⚠️', message: '该服务商尚未配置 Base URL，请先在「厂商设置」中填写并保存。' });
+    return openDrawer(selectedPid);
+  }
+  
+  const pool = p.apiKeys || [];
+  const formKey = ($id('pApiKey') ? $id('pApiKey').value.trim() : '') || p.apiKey || '';
+
+  if (pool.length <= 1) {
+    // 只有 0 或 1 个 Key，直接拉取
+    const mainKey = formKey || (pool.length === 1 ? pool[0].key : '');
+    const refId = pool.length === 1 ? pool[0].id : 'default';
+    const refName = pool.length === 1 ? (pool[0].name || pool[0].id) : '主 Key';
+    currentFetchParams = { key: mainKey, ref: refId, refName: refName, tempBaseUrl: baseUrl };
+    confirmFetchRemoteModels();
+    return;
+  }
+
+  // 有多 Key，弹出选择框
+  const modal = $id('fetchKeyModal');
+  const optsContainer = $id('fetchKeyModalOptions');
+  optsContainer.innerHTML = '';
+
+  // Pool Keys 选项
+  pool.forEach((k, idx) => {
+    const card = el('label', 'modal-option-card' + (idx === 0 ? ' selected' : ''));
+    const rdo = el('input');
+    rdo.type = 'radio';
+    rdo.name = 'fetchKeyChoice';
+    rdo.value = k.id;
+    rdo.style.cssText = 'margin-top: 2px;';
+    if (idx === 0) rdo.checked = true;
+    rdo.dataset.secret = k.key || '';
+    rdo.dataset.refname = k.name || k.id;
+
+    rdo.onchange = () => {
+      document.querySelectorAll('#fetchKeyModalOptions .modal-option-card').forEach(c => c.classList.remove('selected'));
+      card.classList.add('selected');
+    };
+
+    let ksecret = k.key || '';
+    let preview = ksecret.length > 8 ? ksecret.slice(0,4) + '••••' + ksecret.slice(-3) : '••••';
+    const wrap = el('div');
+    wrap.style.cssText = 'display: flex; flex-direction: column; gap: 2px; font-size: 11.5px;';
+    const title = el('span', '', `🔑 ${k.name || k.id}`);
+    title.style.cssText = 'font-weight: 500; color: var(--b-text);';
+    const sub = el('span', '', `Key: ${preview}`);
+    sub.style.cssText = 'color: var(--b-text-3); font-family: var(--b-mono); font-size: 10.5px;';
+    wrap.append(title, sub);
+    card.append(rdo, wrap);
+    optsContainer.appendChild(card);
+  });
+
+  currentFetchParams = { tempBaseUrl: baseUrl }; // Store baseUrl for the modal to use
+  modal.classList.add('open');
+}
+
+function fetchRemoteModels() {
+  const pid = syncCurrentFormToMemory();
+  const p = (pid && currentConfig.providers && currentConfig.providers[pid]) || {};
+  const baseUrl = ($id('pBaseUrl') ? $id('pBaseUrl').value.trim() : '') || p.baseUrl || '';
+  if (!baseUrl) return showAlert({ title: '配置校验', icon: '⚠️', message: '请先填写 Base URL 端点' });
+  
+  const pool = p.apiKeys || [];
+  const formKey = ($id('pApiKey') ? $id('pApiKey').value.trim() : '') || p.apiKey || '';
+
+  if (pool.length <= 1) {
+    // 只有 0 或 1 个 Key，直接拉取
+    const mainKey = formKey || (pool.length === 1 ? pool[0].key : '');
+    const refId = pool.length === 1 ? pool[0].id : 'default';
+    const refName = pool.length === 1 ? (pool[0].name || pool[0].id) : '主 Key';
+    currentFetchParams = { key: mainKey, ref: refId, refName: refName, tempBaseUrl: baseUrl };
+    confirmFetchRemoteModels();
+    return;
+  }
+
+  // 有多 Key，弹出选择框
+  const modal = $id('fetchKeyModal');
+  const optsContainer = $id('fetchKeyModalOptions');
+  optsContainer.innerHTML = '';
+
+  // Pool Keys 选项 (第一个默认勾选)
+  pool.forEach((k, idx) => {
+    const card = el('label', 'modal-option-card' + (idx === 0 ? ' selected' : ''));
+    const rdo = el('input');
+    rdo.type = 'radio';
+    rdo.name = 'fetchKeyChoice';
+    rdo.value = k.id;
+    rdo.style.cssText = 'margin-top: 2px;';
+    if (idx === 0) rdo.checked = true;
+    rdo.dataset.secret = k.key || '';
+    rdo.dataset.refname = k.name || k.id;
+
+    rdo.onchange = () => {
+      document.querySelectorAll('#fetchKeyModalOptions .modal-option-card').forEach(c => c.classList.remove('selected'));
+      card.classList.add('selected');
+    };
+
+    let ksecret = k.key || '';
+    let preview = ksecret.length > 8 ? ksecret.slice(0,4) + '••••' + ksecret.slice(-3) : '••••';
+    const wrap = el('div');
+    wrap.style.cssText = 'display: flex; flex-direction: column; gap: 2px; font-size: 11.5px;';
+    const title = el('span', '', `🔑 ${k.name || k.id}`);
+    title.style.cssText = 'font-weight: 500; color: var(--b-text);';
+    const sub = el('span', '', `Key: ${preview}`);
+    sub.style.cssText = 'color: var(--b-text-3); font-family: var(--b-mono); font-size: 10.5px;';
+    wrap.append(title, sub);
+    card.append(rdo, wrap);
+    optsContainer.appendChild(card);
+  });
+
+  currentFetchParams = { tempBaseUrl: baseUrl }; // Store baseUrl for the modal to use
+  modal.classList.add('open');
+}
+
+function closeFetchKeyModal() {
+  const modal = $id('fetchKeyModal');
+  if (modal) modal.classList.remove('open');
+}
+
+function handleFetchKeyModalBackdrop(e) {
+  if (e.target && e.target.id === 'fetchKeyModal') closeFetchKeyModal();
+}
+
+async function confirmFetchRemoteModels() {
+  let baseUrl = ($id('pBaseUrl') ? $id('pBaseUrl').value : '').trim();
+  let apiKey = '';
+  let refId = 'default';
+  let refName = '主 Key';
+
+  const modal = $id('fetchKeyModal');
+  if (modal && modal.classList.contains('open')) {
+    const checked = document.querySelector('input[name="fetchKeyChoice"]:checked');
+    if (checked) {
+      apiKey = checked.dataset.secret || '';
+      refId = checked.value;
+      refName = checked.dataset.refname;
+    }
+    closeFetchKeyModal();
+  } else if (currentFetchParams) {
+    apiKey = currentFetchParams.key;
+    refId = currentFetchParams.ref;
+    refName = currentFetchParams.refName;
+  }
+
+  // Use the stored baseUrl if it's not set from the drawer input (e.g., when called from the tab)
+  if (!baseUrl && currentFetchParams && currentFetchParams.tempBaseUrl) {
+    baseUrl = currentFetchParams.tempBaseUrl;
+  }
+
+  setStatus(`正在使用 ${refName} 拉取远程模型列表...`, '#F59E0B');
   try {
     const res = await window.pywebview.api.fetch_models(baseUrl, apiKey);
     if (!res.success) throw new Error(res.error || '拉取失败');
-    const pid = syncCurrentFormToMemory();
-    const existing = currentConfig.providers[pid].models || [];
+    
+    // 如果是通过左侧列表选择（没有打开抽屉），需要获取 selectedPid
+    const pid = syncCurrentFormToMemory() || selectedPid;
+    const existing = (currentConfig.providers[pid] || {}).models || [];
     const existingIds = new Set(existing.map(m => m.id));
-    // Initialize preview buffer; default-select items NOT already in the list
+    
     fetchedPreview = res.models.map(m => ({
       id: m.id,
       name: m.name || m.id,
       selected: !existingIds.has(m.id),
       added: existingIds.has(m.id),
+      sourceRefId: refId,
+      sourceRefName: refName
     }));
     renderFetchPreview();
     switchModelWorkTab('fetch');
-    setStatus(`成功拉取到 ${res.models.length} 个模型，请在预览区勾选后点击「添加选中」`, '#10B981');
+    closeDrawer();
+    setStatus(`成功拉取到 ${res.models.length} 个模型 (${refName})，请勾选后添加`, '#10B981');
   } catch (err) {
-    alert('拉取模型失败: ' + err.message);
+    showAlert({ title: '拉取失败', icon: '❌', message: '拉取模型失败: ' + err.message, type: 'error' });
     setStatus('拉取模型失败: ' + err.message, '#EF4444');
   }
 }
 
 function renderFetchPreview() {
-  const fetchBadge = document.getElementById('fetchTabBadge');
-  const list = document.getElementById('fetchPreviewList');
-  const summary = document.getElementById('fetchSummary');
+  const fetchBadge = $id('fetchTabBadge');
+  const list = $id('fetchPreviewList');
+  const summary = $id('fetchSummary');
   if (!fetchedPreview || fetchedPreview.length === 0) {
     if (fetchBadge) fetchBadge.style.display = 'none';
     if (list) list.innerHTML = '<div style="color:var(--b-text-3); font-size:12px; text-align:center; padding:20px 0;">暂无拉取结果</div>';
@@ -2299,9 +4040,11 @@ function renderFetchPreview() {
   list.innerHTML = '';
   const selectedCount = fetchedPreview.filter(m => m.selected && !m.added).length;
   const addedCount = fetchedPreview.filter(m => m.added).length;
-  summary.innerHTML = `共拉取 <b style="color:#fff;">${fetchedPreview.length}</b> 个 · 已选 <b style="color:var(--primary);">${selectedCount}</b> 个 · 已在列表中 <b style="color:var(--emerald);">${addedCount}</b> 个`;
-  
-  const searchInput = document.getElementById('previewSearch');
+  if (summary) {
+    summary.innerHTML = `共拉取 <b style="color:#fff;">${fetchedPreview.length}</b> 个 · 已选 <b style="color:var(--b-accent);">${selectedCount}</b> 个 · 已在列表中 <b style="color:var(--b-green);">${addedCount}</b> 个`;
+  }
+
+  const searchInput = $id('previewSearch');
   const query = searchInput ? searchInput.value.trim().toLowerCase() : '';
 
   fetchedPreview.forEach((m, idx) => {
@@ -2310,398 +4053,248 @@ function renderFetchPreview() {
       const name = String(m.name || '').toLowerCase();
       if (!id.includes(query) && !name.includes(query)) return;
     }
-    const row = document.createElement('div');
-    row.className = 'fetch-row' + (m.added ? ' added' : '');
-    const safeId = String(m.id).replace(/'/g, "\\'").replace(/"/g, '&quot;');
-    const safeName = String(m.name).replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    row.innerHTML = `
-      <input type="checkbox" class="checkbox" ${m.selected ? 'checked' : ''} ${m.added ? 'disabled' : ''}
-             onchange="fetchedPreview[${idx}].selected = this.checked; updateFetchSummary();">
-      <span class="model-id" title="${safeId}">${safeId}</span>
-      <input type="text" class="alias-input" value="${safeName}" placeholder="为该模型设置别名（可选）"
-             onchange="fetchedPreview[${idx}].name = this.value.trim() || fetchedPreview[${idx}].id">
-      <span class="test-btn" onclick="testModel(this, '${safeId}')" title="测活：验证该模型 API 是否接通">⚡</span>
-      ${m.added ? '<span class="status-badge">已在列表中</span>' : ''}
-    `;
+    const row = el('div', 'model-row fetch-row' + (m.added ? ' added' : ''));
+    row.dataset.mid = m.id;
+
+    // Checkbox column (20px)
+    const chkWrap = el('div', 'model-row-handle');
+    const chk = el('input', 'checkbox');
+    chk.type = 'checkbox';
+    chk.checked = m.selected;
+    chk.disabled = m.added;
+    chk.style.cursor = m.added ? 'not-allowed' : 'pointer';
+    chk.style.accentColor = 'var(--b-accent)';
+    chk.onchange = () => { fetchedPreview[idx].selected = chk.checked; updateFetchSummary(); };
+    chkWrap.appendChild(chk);
+
+    // Alias column (200px)
+    const aliasWrap = el('div', 'model-row-alias');
+    const aliasInp = el('input', 'alias-input');
+    aliasInp.type = 'text';
+    aliasInp.value = m.name || m.id;
+    aliasInp.placeholder = m.id;
+    aliasInp.title = '修改导入后的显示别名';
+    aliasInp.onchange = () => { fetchedPreview[idx].name = aliasInp.value.trim() || fetchedPreview[idx].id; };
+    aliasWrap.appendChild(aliasInp);
+
+    // Model ID column (flex: 1)
+    const idWrap = el('div');
+    idWrap.style.cssText = 'flex: 1; display: flex; align-items: center; gap: 6px; padding-left: 6px; box-sizing: border-box; min-width: 140px; overflow: hidden;';
+    const idSpan = el('span', 'model-row-id', m.id);
+    idSpan.title = m.id;
+    idWrap.appendChild(idSpan);
+
+    if (m.sourceRefId && m.sourceRefId !== 'default') {
+      const keyBadge = el('span', '', `🔑 ${m.sourceRefName}`);
+      keyBadge.style.cssText = 'font-size: 10px; padding: 1px 4px; border-radius: 2px; color: #93C5FD; background: rgba(59,130,246,0.15); border: 1px solid rgba(59,130,246,0.3); white-space: nowrap;';
+      idWrap.appendChild(keyBadge);
+    }
+
+    // Status column (70px)
+    const statusWrap = el('div', 'model-row-status');
+    if (m.added) {
+      statusWrap.appendChild(el('span', 'disabled-badge', '已在列表'));
+    }
+
+    // Actions column (100px)
+    const actions = el('div', 'model-row-actions');
+    actions.style.width = '100px';
+
+    const testBtn = el('button', 'model-row-btn test-btn', '⚡ 测活');
+    testBtn.title = '测活：验证该模型 API 是否连通';
+    testBtn.onclick = (e) => { e.stopPropagation(); testSingleFetched(testBtn, m.id); };
+    actions.appendChild(testBtn);
+
+    row.append(chkWrap, aliasWrap, idWrap, statusWrap, actions);
     list.appendChild(row);
   });
 }
 
-function updateFetchSummary() {
-  const summary = document.getElementById('fetchSummary');
-  if (!summary || fetchedPreview.length === 0) return;
-  const selectedCount = fetchedPreview.filter(m => m.selected && !m.added).length;
-  const addedCount = fetchedPreview.filter(m => m.added).length;
-  summary.innerHTML = `共拉取 <b style="color:#fff;">${fetchedPreview.length}</b> 个模型 · 已选 <b style="color:var(--primary);">${selectedCount}</b> 个 · 已在列表中 <b style="color:var(--emerald);">${addedCount}</b> 个`;
-}
-
-function toggleAllFetched(value) {
-  if (!assertEditable()) return;
-  fetchedPreview.forEach(m => { if (!m.added) m.selected = value; });
-  renderFetchPreview();
-}
-
-function commitFetchedModels() {
-  if (!assertEditable()) return;
-  const pid = syncCurrentFormToMemory();
-  if (!pid) return alert('请先填写服务商 ID');
-  const p = currentConfig.providers[pid];
-  if (!p) return;
-  const list = (p.models || []).slice();
-  let addedCount = 0;
-  fetchedPreview.forEach(m => {
-    if (m.added) return;
-    if (!m.selected) return;
-    if (list.some(x => x.id === m.id)) return;
-    const next = { id: m.id };
-    // Apply alias if it's different from the id
-    const trimmed = String(m.name || '').trim();
-    if (trimmed && trimmed !== m.id) next.name = trimmed;
-    list.push(next);
-    m.added = true;
-    m.selected = false;
-    addedCount++;
-  });
-  p.models = list.sort((a, b) => a.id.localeCompare(b.id));
-  renderModels(p.models);
-  renderSidebar();
-  renderFetchPreview();
-  switchModelWorkTab('models');
-  if (addedCount > 0) {
-    setStatus(`✅ 已将 ${addedCount} 个模型添加到 [${pid}] 列表。点击「💾 保存」即可持久化`, '#10B981');
-  } else {
-    setStatus('没有选中可添加的模型，请先勾选', '#F59E0B');
-  }
-}
-
-function currentTestContext() {
-  return {
-    baseUrl: document.getElementById('pBaseUrl').value.trim(),
-    apiKey: document.getElementById('pApiKey').value.trim(),
-    api: document.getElementById('pApi').value || 'openai-completions',
-  };
-}
-
-async function testModel(btn, mid) {
-  if (!assertEditable()) return;
+async function testSingleFetched(btn, mid) {
   const ctx = currentTestContext();
-  if (!ctx.baseUrl) return alert('请先填写 Base URL');
+  if (!ctx.baseUrl) return showAlert({ title: '配置校验', icon: '⚠️', message: '请先填写 Base URL 端点' });
+  
+  const pid = syncCurrentFormToMemory();
+  const p = currentConfig.providers[pid] || {};
+  const fetchedItem = fetchedPreview.find(m => m.id === mid);
+  
+  let testKey = ctx.apiKey;
+  let customHeaders = null;
+  
+  if (fetchedItem && fetchedItem.sourceRefId && fetchedItem.sourceRefId !== 'default') {
+    const poolItem = (p.apiKeys || []).find(k => k.id === fetchedItem.sourceRefId);
+    if (poolItem && poolItem.key) {
+      testKey = poolItem.key;
+      customHeaders = { Authorization: `Bearer ${poolItem.key}` };
+    }
+  }
+
   btn.classList.add('testing');
   btn.classList.remove('ok', 'fail');
-  btn.innerHTML = '⏳';
-  btn.title = '正在检测...';
+  btn.innerHTML = '⏳ 测活中';
+  btn.title = '正在检测 API 连通性...';
   try {
-    const res = await window.pywebview.api.test_model(ctx.baseUrl, ctx.apiKey, ctx.api, mid);
+    const res = await window.pywebview.api.test_model(ctx.baseUrl, testKey, ctx.api, mid, customHeaders);
     if (res.success) {
       btn.classList.add('ok');
-      btn.innerHTML = '✓';
-      btn.title = `可用 · ${res.latency_ms}ms`;
+      btn.innerHTML = `✓ ${res.latency_ms}ms`;
+      btn.title = `测活成功 · 延迟 ${res.latency_ms}ms`;
       setStatus(`✅ [${mid}] 测活成功 · ${res.latency_ms}ms`, '#10B981');
     } else {
       btn.classList.add('fail');
-      btn.innerHTML = '✗';
+      btn.innerHTML = '✗ 失败';
       btn.title = `失败: ${res.error || '未知错误'}`;
       setStatus(`❌ [${mid}] 测活失败: ${res.error || '未知错误'}`, '#EF4444');
     }
   } catch (e) {
     btn.classList.add('fail');
-    btn.innerHTML = '✗';
-    btn.title = '检测异常';
+    btn.innerHTML = '✗ 异常';
     setStatus(`❌ [${mid}] 测活异常`, '#EF4444');
   }
-  setTimeout(() => btn.classList.remove('testing'), 300);
+  setTimeout(() => btn.classList.remove('testing'), 400);
+}
+
+function updateFetchSummary() {
+  const summary = $id('fetchSummary');
+  if (!summary || fetchedPreview.length === 0) return;
+  const selectedCount = fetchedPreview.filter(m => m.selected && !m.added).length;
+  const addedCount = fetchedPreview.filter(m => m.added).length;
+  summary.innerHTML = `共拉取 <b style="color:#fff;">${fetchedPreview.length}</b> 个 · 已选 <b style="color:var(--b-accent);">${selectedCount}</b> 个 · 已在列表中 <b style="color:var(--b-green);">${addedCount}</b> 个`;
+}
+
+function toggleAllFetched(val) {
+  fetchedPreview.forEach(m => { if (!m.added) m.selected = val; });
+  renderFetchPreview();
 }
 
 async function testAllFetched() {
-  if (!assertEditable()) return;
-  if (!fetchedPreview || fetchedPreview.length === 0) return;
   const ctx = currentTestContext();
-  if (!ctx.baseUrl) return alert('请先填写 Base URL');
+  if (!ctx.baseUrl) return showAlert({ title: '配置校验', icon: '⚠️', message: '请先填写 Base URL 端点' });
   setStatus(`正在批量测活 ${fetchedPreview.length} 个模型...`, '#F59E0B');
   let okCount = 0, failCount = 0;
-  for (let i = 0; i < fetchedPreview.length; i++) {
-    const btn = document.querySelectorAll('#fetchPreviewList .test-btn')[i];
-    if (!btn) continue;
-    btn.classList.add('testing');
-    btn.classList.remove('ok', 'fail');
-    btn.innerHTML = '⏳';
-    try {
-      const res = await window.pywebview.api.test_model(ctx.baseUrl, ctx.apiKey, ctx.api, fetchedPreview[i].id);
-      if (res.success) {
-        btn.classList.add('ok');
-        btn.innerHTML = '✓';
-        btn.title = `可用 · ${res.latency_ms}ms`;
-        okCount++;
-      } else {
-        btn.classList.add('fail');
-        btn.innerHTML = '✗';
-        btn.title = `失败: ${res.error || '未知错误'}`;
-        failCount++;
-      }
-    } catch (e) {
-      btn.classList.add('fail');
-      btn.innerHTML = '✗';
-      failCount++;
-    }
-    btn.classList.remove('testing');
-  }
-  setStatus(`批量测活完成：${okCount} 个可用，${failCount} 个失败`, failCount > 0 ? (okCount > 0 ? '#F59E0B' : '#EF4444') : '#10B981');
-}
-
-function closeFetchPreview() {
-  fetchedPreview = [];
-  const c = document.getElementById('fetchPreviewContainer');
-  if (c) c.style.display = 'none';
-}
-
-// ============================================================
-// 全部模型测活 + 定时测活 (Periodic Health Check)
-// ============================================================
-let testAllInProgress = false;
-let testAllResults = { ok: 0, fail: 0, lastAt: null, disabled: 0, reenabled: 0 };
-let scheduleIntervalSec = 0;
-let scheduleTimer = null;
-let scheduleCountdown = null;
-let scheduleNextAt = 0;
-let disableThreshold = 3;   // 连续失败 N 次自动禁用
-let autoDisableEnabled = true;
-
-function updateHealthSummary() {
-  const wrap = document.getElementById('healthSummary');
-  if (!wrap) return;
-  const hasResult = testAllResults.lastAt !== null;
-  wrap.style.display = (hasResult || testAllInProgress) ? 'inline-flex' : 'none';
-  document.getElementById('healthOkCount').innerText = testAllResults.ok;
-  document.getElementById('healthFailCount').innerText = testAllResults.fail;
-  const meta = document.getElementById('healthMeta');
-  if (testAllInProgress) {
-    meta.innerText = '⏳ 测活中...';
-    meta.classList.add('testing');
-  } else if (testAllResults.lastAt) {
-    const t = new Date(testAllResults.lastAt);
-    const hh = String(t.getHours()).padStart(2, '0');
-    const mm = String(t.getMinutes()).padStart(2, '0');
-    const ss = String(t.getSeconds()).padStart(2, '0');
-    meta.innerText = `上次 ${hh}:${mm}:${ss}`;
-    meta.classList.remove('testing');
-  }
-}
-
-async function testAllModels() {
-  if (testAllInProgress) return;
-  if (!currentEditable) { alert('当前配置是只读预览，无法测活。'); return; }
+  
   const pid = syncCurrentFormToMemory();
-  if (!pid) return alert('请先输入服务商 ID');
-  const p = currentConfig.providers[pid];
-  const models = (p && p.models) || [];
-  if (models.length === 0) return alert('当前服务商还没有任何模型');
-  const ctx = currentTestContext();
-  if (!ctx.baseUrl) return alert('请先填写 Base URL');
+  const p = currentConfig.providers[pid] || {};
 
-  testAllInProgress = true;
-  testAllResults = { ok: 0, fail: 0, lastAt: null, disabled: 0, reenabled: 0 };
-  updateHealthSummary();
-  setStatus(`⏳ 正在依次测活 ${models.length} 个模型...`, '#F59E0B');
-
-  const tags = document.querySelectorAll('#modelsContainer .model-tag');
-  tags.forEach(t => t.classList.add('testing-all'));
-
-  const startTime = Date.now();
-  for (let i = 0; i < models.length; i++) {
-    const m = models[i];
-    const tag = tags[i];
-    const btn = tag ? tag.querySelector('.test-btn') : null;
-    if (btn) { btn.classList.add('testing'); btn.classList.remove('ok', 'fail'); btn.innerHTML = '⏳'; }
-    let res;
-    try {
-      res = await window.pywebview.api.test_model(ctx.baseUrl, ctx.apiKey, ctx.api, m.id);
-    } catch (e) {
-      res = { success: false, error: String(e) };
+  const rows = document.querySelectorAll('#fetchPreviewList .fetch-row');
+  for (const row of rows) {
+    const mid = row.dataset.mid;
+    if (!mid) continue;
+    const btn = row.querySelector('.test-btn');
+    if (btn) {
+      btn.classList.add('testing');
+      btn.classList.remove('ok', 'fail');
+      btn.innerHTML = '⏳ 测活中';
     }
-    if (res.success) {
-      if (btn) { btn.classList.add('ok'); btn.innerHTML = '✓'; btn.title = `可用 · ${res.latency_ms}ms`; }
-      testAllResults.ok++;
-      // 成功后清零连续失败计数并恢复启用
-      if (m._failStreak && m._failStreak > 0) {
-        if (m.disabled && autoDisableEnabled) {
-          m.disabled = false;
-          testAllResults.reenabled++;
+
+    const fetchedItem = fetchedPreview.find(m => m.id === mid);
+    let testKey = ctx.apiKey;
+    let customHeaders = null;
+    
+    if (fetchedItem && fetchedItem.sourceRefId && fetchedItem.sourceRefId !== 'default') {
+      const poolItem = (p.apiKeys || []).find(k => k.id === fetchedItem.sourceRefId);
+      if (poolItem && poolItem.key) {
+        testKey = poolItem.key;
+        customHeaders = { Authorization: `Bearer ${poolItem.key}` };
+      }
+    }
+
+    try {
+      const res = await window.pywebview.api.test_model(ctx.baseUrl, testKey, ctx.api, mid, customHeaders);
+      if (res.success) {
+        okCount++;
+        if (btn) {
+          btn.classList.add('ok');
+          btn.innerHTML = `✓ ${res.latency_ms}ms`;
+          btn.title = `测活成功 · 延迟 ${res.latency_ms}ms`;
+        }
+      } else {
+        failCount++;
+        if (btn) {
+          btn.classList.add('fail');
+          btn.innerHTML = '✗ 失败';
+          btn.title = `失败: ${res.error || '未知错误'}`;
         }
       }
-      m._failStreak = 0;
-      m._lastError = null;
-    } else {
-      if (btn) { btn.classList.add('fail'); btn.innerHTML = '✗'; btn.title = `失败: ${res.error || '未知错误'}`; }
-      testAllResults.fail++;
-      m._failStreak = (m._failStreak || 0) + 1;
-      m._lastError = res.error || '未知错误';
-      // 达到阈值后自动禁用
-      if (autoDisableEnabled && !m.disabled && m._failStreak >= disableThreshold) {
-        m.disabled = true;
-        testAllResults.disabled++;
-        if (btn) btn.title = `连续失败 ${m._failStreak} 次，已自动禁用 (${m._lastError})`;
+    } catch (e) {
+      failCount++;
+      if (btn) {
+        btn.classList.add('fail');
+        btn.innerHTML = '✗ 异常';
       }
     }
     if (btn) btn.classList.remove('testing');
-    updateHealthSummary();
   }
-  tags.forEach(t => t.classList.remove('testing-all'));
-  // 重新渲染以反映 disabled 状态变化
+  setStatus(`批量测活完成：${okCount} 可用 / ${failCount} 失败`, failCount > 0 ? '#F59E0B' : '#10B981');
+}
+
+function commitFetchedModels() {
+  const pid = syncCurrentFormToMemory();
+  if (!pid) return showAlert({ title: '未选择服务商', icon: '⚠️', message: '请先选择服务商' });
+  const p = currentConfig.providers[pid];
+  if (!p) return;
+  const list = (p.models || []).slice();
+  let addedCount = 0;
+  fetchedPreview.forEach(m => {
+    if (m.added || !m.selected) return;
+    if (list.some(x => x.id === m.id)) return;
+    const next = { id: m.id };
+    const trimmed = String(m.name || '').trim();
+    if (trimmed && trimmed !== m.id) next.name = trimmed;
+
+    if (m.sourceRefId && m.sourceRefId !== 'default') {
+      next.apiKeyRef = m.sourceRefId;
+      const pool = p.apiKeys || [];
+      const poolItem = pool.find(k => k.id === m.sourceRefId);
+      if (poolItem && poolItem.key) {
+        next.headers = { Authorization: `Bearer ${poolItem.key}` };
+      }
+    }
+
+    list.push(next);
+    m.added = true;
+    m.selected = false;
+    addedCount++;
+  });
+  p.models = list;
   renderModels(p.models);
-  testAllInProgress = false;
-  testAllResults.lastAt = Date.now();
-  updateHealthSummary();
-  const totalSec = ((Date.now() - startTime) / 1000).toFixed(1);
-  const disabledText = testAllResults.disabled > 0 ? ` / ${testAllResults.disabled} 已被禁用` : '';
-  const reText = testAllResults.reenabled > 0 ? ` / ${testAllResults.reenabled} 重新启用` : '';
-  setStatus(`✅ 全部测活完成 (耗时 ${totalSec}s)：${testAllResults.ok} 可用 / ${testAllResults.fail} 失败${disabledText}${reText}`, testAllResults.fail > 0 ? '#F59E0B' : '#10B981');
-}
-
-function toggleSchedulePanel() {
-  const dd = document.getElementById('scheduleDropdown');
-  dd.style.display = (dd.style.display === 'none' || !dd.style.display) ? 'block' : 'none';
-}
-
-function setAutoDisable(enabled) {
-  autoDisableEnabled = !!enabled;
-  setStatus(autoDisableEnabled ? '已开启自动禁用不可用模型' : '已关闭自动禁用', autoDisableEnabled ? '#10B981' : '#F59E0B');
-  if (autoDisableEnabled) {
-    const status = document.getElementById('scheduleStatus');
-    if (status && scheduleIntervalSec > 0) {
-      status.innerText = `⏱ 失败 ${disableThreshold} 次后自动禁用 · ${Math.max(0, Math.round((scheduleNextAt - Date.now()) / 1000))}秒后轮询`;
-    }
+  renderSidebar();
+  renderFetchPreview();
+  switchModelWorkTab('models');
+  if (addedCount > 0) {
+    setStatus(`✅ 已添加 ${addedCount} 个模型到 [${pid}]，点击「💾 保存」持久化`, '#10B981');
+  } else {
+    setStatus('未选中可添加的模型', '#F59E0B');
   }
 }
 
-function setDisableThreshold(n) {
-  disableThreshold = Math.max(1, parseInt(n, 10) || 3);
-  setStatus(`失败阈值已设为 ${disableThreshold} 次`, '#3B82F6');
-  if (selectedPid) {
-    const cur = currentConfig.providers[selectedPid];
-    if (cur) renderModels(cur.models || []);
-  }
-}
+// Config Load & Save
+async function loadData() {
+  setStatus('正在加载配置...', '#F59E0B');
+  const data = await window.pywebview.api.get_config();
+  currentConfig = data.config || { providers: {} };
+  currentConfigPath = data.path;
+  if ($id('pathDisplay')) $id('pathDisplay').innerText = `📁 ${data.path}`;
+  renderSidebar();
+  await refreshDefaultModel();
 
-function setScheduleInterval(sec) {
-  scheduleIntervalSec = parseInt(sec, 10) || 0;
-  if (scheduleTimer) { clearInterval(scheduleTimer); scheduleTimer = null; }
-  if (scheduleCountdown) { clearInterval(scheduleCountdown); scheduleCountdown = null; }
-  const btn = document.getElementById('scheduleBtn');
-  const label = document.getElementById('scheduleLabel');
-  const status = document.getElementById('scheduleStatus');
-  if (scheduleIntervalSec <= 0) {
-    btn.classList.remove('active');
-    label.innerText = '定时';
-    status.classList.remove('active');
-    status.innerText = '定时测活已关闭';
-    return;
-  }
-  btn.classList.add('active');
-  const minute = scheduleIntervalSec >= 60 ? `${scheduleIntervalSec / 60}分钟` : `${scheduleIntervalSec}秒`;
-  label.innerText = minute;
-  scheduleNextAt = Date.now() + scheduleIntervalSec * 1000;
-  status.classList.add('active');
-  status.innerText = `⏱ 每${minute}自动测活所有模型`;
-  scheduleTimer = setInterval(runScheduledTest, scheduleIntervalSec * 1000);
-  scheduleCountdown = setInterval(updateScheduleStatus, 1000);
-  updateScheduleStatus();
-}
+  const keys = Object.keys(currentConfig.providers || {});
+  const preferredPid = (data.selectedProviderId && currentConfig.providers[data.selectedProviderId])
+    ? data.selectedProviderId
+    : (keys.length > 0 ? keys[0] : null);
 
-function updateScheduleStatus() {
-  if (scheduleIntervalSec <= 0) return;
-  const status = document.getElementById('scheduleStatus');
-  if (testAllInProgress) {
-    status.innerText = `🔄 正在执行定时测活...`;
-    return;
-  }
-  const remain = Math.max(0, Math.round((scheduleNextAt - Date.now()) / 1000));
-  const mm = Math.floor(remain / 60);
-  const ss = remain % 60;
-  const remainText = mm > 0 ? `${mm}分${ss}秒` : `${ss}秒`;
-  status.innerText = `⏱ 下次自动测活：${remainText}后`;
-}
-
-async function runScheduledTest() {
-  if (testAllInProgress) return;
-  if (!currentEditable) return;
-  const providers = currentConfig.providers || {};
-  const allProviders = Object.keys(providers);
-  if (allProviders.length === 0) return;
-  let newlyDisabled = 0;
-  let newlyReenabled = 0;
-  let totalOk = 0, totalFail = 0;
-  for (const pid of allProviders) {
-    const p = providers[pid];
-    const models = (p && p.models) || [];
-    if (!p.baseUrl || models.length === 0) continue;
-    for (const m of models) {
-      let res;
-      try {
-        res = await window.pywebview.api.test_model(p.baseUrl, p.apiKey || '', p.api || 'openai-completions', m.id);
-      } catch (e) {
-        res = { success: false, error: String(e) };
-      }
-      if (res.success) {
-        totalOk++;
-        if (m._failStreak && m._failStreak > 0 && m.disabled && autoDisableEnabled) {
-          m.disabled = false;
-          newlyReenabled++;
-        }
-        m._failStreak = 0;
-        m._lastError = null;
-      } else {
-        totalFail++;
-        m._failStreak = (m._failStreak || 0) + 1;
-        m._lastError = res.error || '未知错误';
-        if (autoDisableEnabled && !m.disabled && m._failStreak >= disableThreshold) {
-          m.disabled = true;
-          newlyDisabled++;
-        }
-      }
-    }
-  }
-  scheduleNextAt = Date.now() + scheduleIntervalSec * 1000;
-  // 刷新当前显示
-  if (selectedPid) {
-    const cur = currentConfig.providers[selectedPid];
-    if (cur) renderModels(cur.models || []);
-  }
-  const note = newlyDisabled > 0 || newlyReenabled > 0
-    ? `（${newlyDisabled > 0 ? `禁用 ${newlyDisabled} 个, ` : ''}${newlyReenabled > 0 ? `恢复 ${newlyReenabled} 个` : ''}）`
-    : '';
-  setStatus(`⏱ 定时测活：${totalOk} 可用 / ${totalFail} 失败${note}`, '#3B82F6');
-}
-
-document.addEventListener('click', (e) => {
-  const scheduleWrap = document.querySelector('.schedule-wrap');
-  if (scheduleWrap && !scheduleWrap.contains(e.target)) {
-    const dd = document.getElementById('scheduleDropdown');
-    if (dd) dd.style.display = 'none';
-  }
-});
-
-
-function deleteCurrentProvider() {
-  if (!assertEditable()) return;
-  if (!selectedPid) return;
-  if (!confirm(`确定删除服务商 [${selectedPid}] 吗？`)) return;
-  const deletedPid = selectedPid;
-  delete currentConfig.providers[selectedPid];
-  newProvider();
-  saveAll();
-  setStatus(`🗑️ 已删除服务商 [${deletedPid}]`, '#EF4444');
+  if (preferredPid) selectProvider(preferredPid);
+  else newProvider();
+  setStatus('已就绪', '#10B981');
 }
 
 async function saveAll() {
-  if (!assertEditable()) return false;
   const pid = syncCurrentFormToMemory();
   setStatus('正在保存全局配置 (Ctrl+S)...', '#F59E0B');
   const res = await window.pywebview.api.save_config(currentConfig, currentConfigPath);
   if (res.success) {
-    // 写入成功后同步清除当前路径草稿
-    delete configDrafts[currentConfigPath];
     const countText = `${res.providerCount || 0} providers / ${res.modelCount || 0} models`;
-    setStatus(`✅ 已保存配置 (${countText}) · 快捷键 [Ctrl+S]`, '#10B981');
+    setStatus(`✅ 已保存配置 (${countText})`, '#10B981');
     renderSidebar();
     if (pid) {
       selectedPid = pid;
@@ -2719,52 +4312,85 @@ async function restartPi() {
   if (!saved) return;
   setStatus('正在启动新的 Pi 交互终端...', '#3B82F6');
   await window.pywebview.api.restart_pi();
-  setStatus('已在新窗口启动 Pi，新窗口会读取最新配置', '#10B981');
+  setStatus('已在新终端启动 Pi', '#10B981');
 }
 
 async function exportCurrentProvider() {
-  if (!selectedPid) {
-    setStatus('请先在左侧选择一个服务商再导出', '#F59E0B');
-    return;
-  }
+  if (!selectedPid) return setStatus('请先选择服务商', '#F59E0B');
   syncCurrentFormToMemory();
-  setStatus('正在导出当前服务商 TXT...', '#F59E0B');
+  setStatus('正在导出服务商 TXT...', '#F59E0B');
   const res = await window.pywebview.api.export_provider_txt(currentConfig, currentConfigPath, selectedPid);
-  if (res.success) {
-    setStatus(`已导出当前 TXT：${res.path}`, '#10B981');
-  } else {
-    setStatus('导出失败: ' + res.error, '#EF4444');
-  }
+  if (res.success) setStatus(`已导出 TXT：${res.path}`, '#10B981');
+  else setStatus('导出失败: ' + res.error, '#EF4444');
 }
 
 async function exportAllProviders() {
   syncCurrentFormToMemory();
   setStatus('正在导出全部服务商 TXT...', '#F59E0B');
   const res = await window.pywebview.api.export_all_providers_txt(currentConfig, currentConfigPath);
-  if (res.success) {
-    setStatus(`已导出全部 TXT：${res.path}`, '#10B981');
-  } else {
-    setStatus('导出失败: ' + res.error, '#EF4444');
-  }
+  if (res.success) setStatus(`已导出全部 TXT：${res.path}`, '#10B981');
+  else setStatus('导出失败: ' + res.error, '#EF4444');
 }
 
 function setStatus(msg, color = '#10B981') {
-  const el = document.getElementById('statusMsg');
-  el.innerText = '● ' + msg;
-  el.style.color = color;
+  const el = $id('statusMsg');
+  if (el) {
+    el.innerText = '● ' + msg;
+    el.style.color = color;
+  }
 }
 
+// Resizer logic
+function initResizers() {
+  const resizer = $id('resizerSidebar');
+  const sidebar = $id('sidebar');
+  if (!resizer || !sidebar) return;
+  let isResizing = false;
+  let startX = 0;
+  let startW = 0;
+
+  resizer.addEventListener('mousedown', (e) => {
+    isResizing = true;
+    startX = e.clientX;
+    startW = sidebar.offsetWidth;
+    resizer.classList.add('resizing');
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!isResizing) return;
+    const newW = Math.min(380, Math.max(220, startW + (e.clientX - startX)));
+    sidebar.style.width = newW + 'px';
+  });
+
+  window.addEventListener('mouseup', () => {
+    if (isResizing) {
+      isResizing = false;
+      resizer.classList.remove('resizing');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    }
+  });
+}
+
+// Global Shortcuts
 window.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
     e.preventDefault();
     saveAll();
   }
+  if (e.key === 'Escape') {
+    closeDrawer();
+  }
 });
 
 window.addEventListener('pywebviewready', () => {
-  refreshTargets(false);
+  initResizers();
+  loadData();
 });
 </script>
+
 </body>
 </html>
 """
@@ -2777,7 +4403,7 @@ def main():
         js_api=api,
         width=1120,
         height=720,
-        min_size=(980, 620),
+        min_size=(1020, 640),
         frameless=True,
         easy_drag=False,
         background_color="#0F172A"
