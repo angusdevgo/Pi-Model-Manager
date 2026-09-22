@@ -8,6 +8,7 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, 'w')
 
 import fnmatch
+import html as _html
 import json
 import os
 import re
@@ -172,17 +173,18 @@ def pi_name_sort_key(text):
     return str(text).casefold()
 
 
-def build_order_report(path_value=None):
-    """生成「工具顺序 ↔ Pi 顺序」一致性自检报告（纯文本，供界面直接展示）。
+# ==========================================================
+# 「工具 ↔ Pi」顺序对照（左栏 = 工具窗口，右栏 = Pi 实际）
+# ----------------------------------------------------------
+# 左栏：工具窗口里看到的厂商顺序与模型名称（= models.json 保存顺序）
+# 右栏：Pi 实际生效的结果 —— 厂商分组顺序（🧩 补丁生效时 = 顺序文件内容，
+#       否则 = Pi 原生字母序）+ 各厂商内部的模型顺序（= models.json 数组顺序，
+#       内置厂商为 Pi 原生目录顺序 + 自建模型追加）
+# 每行右侧给出「✅ 一致 / ⚠️ 不一致」结果，长报告不再让人逐行读流水账。
+# ==========================================================
 
-    Pi 侧一共存在三种顺序，其中只有「厂商内部的模型顺序」可以由工具控制：
-      1. 厂商分组顺序 —— /model 选择器与 `pi --list-models` 都按厂商 ID 字母序分组
-         （Pi 源码硬编码），models.json 的厂商键顺序对 Pi 无效。
-         如需让 Pi 跟随工具顺序，可使用工具内的「🧩 Pi 顺序补丁」（文件见本报告【5】）。
-      2. 厂商内部的模型顺序 —— 自定义厂商 = models.json 数组顺序（工具拖拽生效）；
-         内置厂商 = Pi 原生目录顺序（目录内模型在工具侧锁定拖拽）。
-      3. 默认/当前模型置顶 —— /model 选择器把「当前模型」放第 1、「默认模型」放第 2。
-    """
+def _order_snapshot(path_value=None):
+    """收集顺序自检所需的全部派生数据（build_order_report / build_order_compare 共用）。"""
     path = normalize_config_path(path_value)
     try:
         disk_cfg = read_config_file(path) if path.exists() else {"providers": {}}
@@ -194,21 +196,277 @@ def build_order_report(path_value=None):
         display_cfg = load_config(path)
     except Exception:
         display_cfg = {"providers": {}}
-
     disk_providers = disk_cfg.get("providers") or {}
     display_providers = display_cfg.get("providers") or {}
     settings = load_pi_settings()
-    default_provider = str(settings.get("defaultProvider") or "")
-    default_model = str(settings.get("defaultModel") or "")
     prefs = get_tool_prefs()
-
     tool_order = list(display_providers.keys())
-    pi_order = sorted(tool_order, key=pi_name_sort_key)
     try:
         pst = pi_order_patch_status()
     except Exception as e:
         pst = {"error": str(e)}
-    patch_on = bool(pst.get("fullyPatched")) and not pst.get("versionChanged")
+    return {
+        "path": path,
+        "diskProviders": disk_providers,
+        "displayProviders": display_providers,
+        "toolOrder": tool_order,
+        "piOrder": sorted(tool_order, key=pi_name_sort_key),
+        "patchOn": bool(pst.get("fullyPatched")) and not pst.get("versionChanged"),
+        "pst": pst,
+        "defaultProvider": str(settings.get("defaultProvider") or ""),
+        "defaultModel": str(settings.get("defaultModel") or ""),
+        "prefs": prefs,
+    }
+
+
+def _provider_model_ids(providers, pid):
+    """取某厂商的模型 ID 列表（保持文件中的数组顺序）。"""
+    if not pid:
+        return []
+    p = providers.get(pid) or {}
+    return [str(m.get("id")) for m in (p.get("models") or [])
+            if isinstance(m, dict) and m.get("id")]
+
+
+def build_order_compare(path_value=None, alpha=False):
+    """构造「工具 ↔ Pi」左右两栏对照数据（含逐行结果 / 汇总 / 结论）。"""
+    sn = _order_snapshot(path_value)
+    display_providers = sn["displayProviders"]
+    disk_providers = sn["diskProviders"]
+    custom_order = sn["toolOrder"]
+    patch_on = sn["patchOn"]
+    default_provider = sn["defaultProvider"]
+    default_model = sn["defaultModel"]
+    pst = sn["pst"]
+
+    # 左栏 = 工具窗口实际显示顺序（打开「⇅ Pi 字母序」时窗口里看到的就是字母序）
+    tool_order = sorted(custom_order, key=pi_name_sort_key) if alpha else list(custom_order)
+
+    # 右栏 = Pi 实际生效顺序
+    order_file = [str(x) for x in (pst.get("order") or [])]
+    if patch_on and order_file:
+        known = set(custom_order)
+        pi_order = [p for p in order_file if p in known]
+        pi_order += [p for p in sorted(known - set(pi_order), key=pi_name_sort_key)]
+        pi_source = "order-file"
+    else:
+        # 未打补丁（或顺序文件为空 → 补丁助手回退）时，Pi 一律按字母序分组
+        pi_order = sorted(custom_order, key=pi_name_sort_key)
+        pi_source = "alpha-fallback" if patch_on else "alpha-native"
+    stale_order_file = bool(patch_on and order_file and pi_order != tool_order)
+
+    # 逐行对照（按位置比对）
+    n = max(len(tool_order), len(pi_order))
+    rows = []
+    same_count = 0
+    for i in range(n):
+        left_id = tool_order[i] if i < len(tool_order) else ""
+        right_id = pi_order[i] if i < len(pi_order) else ""
+        same = bool(left_id) and left_id == right_id
+        if same:
+            same_count += 1
+        rows.append({
+            "i": i + 1,
+            "leftId": left_id,
+            "rightId": right_id,
+            "leftModels": _provider_model_ids(display_providers, left_id),
+            "rightModels": _provider_model_ids(disk_providers, right_id),
+            "same": same,
+            "leftStar": default_model if (left_id and left_id == default_provider) else "",
+            "rightStar": default_model if (right_id and right_id == default_provider) else "",
+        })
+
+    # 厂商内部模型顺序：工具显示顺序 vs models.json 已保存顺序（= Pi 侧顺序）
+    unsaved = []
+    model_total = 0
+    tool_model_total = 0
+    for pid in custom_order:
+        disp = _provider_model_ids(display_providers, pid)
+        disk = _provider_model_ids(disk_providers, pid)
+        tool_model_total += len(disp)
+        model_total += len(disk)
+        if disp != disk:
+            unsaved.append(pid)
+    model_ok = len(custom_order) - len(unsaved)
+
+    disabled_rows = [(pid, str(m.get("id"))) for pid, p in display_providers.items()
+                     for m in (p.get("models") or [])
+                     if isinstance(m, dict) and m.get("disabled") is True and m.get("id")
+                     and not m.get("_isBuiltinModel")]
+
+    try:
+        _bad_esc = scan_tool_js_escapes()
+        _self_ok, _self_msg = verify_tool_html_js()
+    except Exception as _e:
+        _bad_esc, _self_ok, _self_msg = [], True, "自检异常（已跳过）: %s" % _e
+    self_ok = (not _bad_esc) and _self_ok
+
+    # 结论
+    all_providers_same = (n > 0 and same_count == n and not stale_order_file)
+    if not custom_order:
+        verdict_cls, verdict = "info", "ℹ️ 未检测到厂商配置（models.json 为空）"
+    elif all_providers_same and not unsaved:
+        verdict_cls = "ok"
+        verdict = ("✅ 完全一致：工具窗口与 Pi 的厂商分组顺序、厂商内部模型顺序全部一致"
+                   + "（%d 厂商 / %d 模型）" % (len(custom_order), model_total))
+    elif unsaved:
+        verdict_cls, verdict = "warn", ("⚠️ 有 %d 个厂商的顺序尚未写盘：%s —— 点「💾 保存」后 Pi 即按新顺序"
+                                        % (len(unsaved), "、".join(unsaved)))
+    elif stale_order_file:
+        verdict_cls, verdict = "warn", "⚠️ Pi 的顺序文件与工具当前顺序不同：点「💾 保存」或重开工具即可同步"
+    else:
+        verdict_cls = "warn"
+        verdict = ("⚠️ 厂商分组顺序不一致：Pi 固定按字母序分组（未开启「🧩 顺序补丁」）；"
+                   "厂商内部的模型顺序 %d/%d 一致 ✅" % (model_ok, len(custom_order)))
+
+    tool_label = "工具窗口顺序" + ("（⇅ Pi 字母序）" if alpha else "")
+    if pi_source == "order-file":
+        pi_label = "Pi 实际分组（🧩 补丁生效）"
+    elif pi_source == "alpha-fallback":
+        pi_label = "Pi 实际分组（补丁已开·顺序文件空 → 字母序）"
+    else:
+        pi_label = "Pi 实际分组（原生字母序）"
+
+    summary = [
+        {"label": "厂商分组顺序",
+         "value": ("%d/%d 一致 ✅" % (same_count, n)) if all_providers_same
+                  else ("%d/%d 一致 ⚠️" % (same_count, n)),
+         "ok": all_providers_same},
+        {"label": "厂商内部模型顺序",
+         "value": ("%d/%d 已落盘 ✅" % (model_ok, len(custom_order))) if not unsaved
+                  else ("⚠️ 待保存：" + "、".join(unsaved)),
+         "ok": not unsaved},
+        {"label": "默认模型",
+         "value": ("★ %s/%s" % (default_provider, default_model)) if default_model
+                  else "⚠️ settings.json 未设置",
+         "cls": "info" if default_model else "bad"},
+        {"label": "禁用模型（Pi 侧不存在）",
+         "value": "无" if not disabled_rows else ("%d 个：" % len(disabled_rows)
+                                                + "、".join("%s/%s" % r for r in disabled_rows[:4])),
+         "cls": "info"},
+        {"label": "Pi 排序补丁",
+         "value": ("%d/%d 个文件已打 🧩" % (pst.get("patchedCount", 0), pst.get("targetCount", 0)))
+                  if patch_on else "未开启（Pi 固定字母序）",
+         "cls": "ok" if patch_on else "info"},
+        {"label": "工具自身体检",
+         "value": "✅ 通过" if self_ok else "❌ 内嵌 JS 异常，界面可能停在静态初始态",
+         "cls": "ok" if self_ok else "bad"},
+    ]
+
+    return {
+        "success": True,
+        "alpha": bool(alpha),
+        "patchOn": patch_on,
+        "piSource": pi_source,
+        "staleOrderFile": stale_order_file,
+        "unsavedIds": unsaved,
+        "toolLabel": tool_label,
+        "piLabel": pi_label,
+        "toolCount": len(tool_order),
+        "piCount": len(pi_order),
+        "toolModelCount": tool_model_total,
+        "modelCount": model_total,
+        "sameCount": same_count,
+        "rows": rows,
+        "summary": summary,
+        "verdict": {"cls": verdict_cls, "text": verdict},
+        "disabledCount": len(disabled_rows),
+        "selfCheckOk": self_ok,
+        "selfCheckMsg": "" if self_ok else str(_self_msg)[:300],
+        "configPath": str(sn["path"]),
+        "orderFilePath": str(pst.get("orderFilePath") or PI_PROVIDER_ORDER_PATH),
+        "title": "顺序自检 · 工具 ↔ Pi" + ("（🧩 补丁生效）" if patch_on else ""),
+        "hint": ("左栏 = 工具窗口实际显示；右栏 = Pi 实际生效结果。"
+                 + "📋 复制全文 可复制完整的六节文本报告。"),
+    }
+
+
+def build_order_compare_html(cmp):
+    """把对照数据渲染成弹窗 HTML（左右两栏 + 逐行一致/不一致）。"""
+    def _e(s):
+        return _html.escape(str(s if s is not None else ""), quote=True)
+
+    def _models(models, star):
+        if not models:
+            return '<div class="oc-m oc-empty">（无模型）</div>'
+        parts = []
+        for mid in models:
+            if star and mid == star:
+                parts.append('<span class="oc-star">★ ' + _e(mid) + '</span>')
+            else:
+                parts.append(_e(mid))
+        return '<div class="oc-m">' + ' · '.join(parts) + '</div>'
+
+    v = cmp.get("verdict") or {}
+    out = ['<div class="oc">']
+    out.append('<div class="oc-verdict ' + _e(v.get("cls") or "info") + '">' + _e(v.get("text") or "") + '</div>')
+    out.append('<div class="oc-tbl">')
+    out.append('<div class="oc-hd">'
+               '<div class="oc-c">' + _e(cmp.get("toolLabel")) + '<span class="oc-n">'
+               + _e("%d 厂商 · %d 模型" % (cmp.get("toolCount", 0), cmp.get("toolModelCount", 0)))
+               + '</span></div>'
+               '<div class="oc-c">' + _e(cmp.get("piLabel")) + '<span class="oc-n">'
+               + _e("%d 厂商 · %d 模型" % (cmp.get("piCount", 0), cmp.get("modelCount", 0)))
+               + '</span></div>'
+               '<div class="oc-c oc-res">结果</div></div>')
+    unsaved = set(cmp.get("unsavedIds") or [])
+    rows = cmp.get("rows") or []
+    if not rows:
+        out.append('<div class="oc-tr"><div class="oc-c oc-empty" style="grid-column:1 / -1;">'
+                   '未检测到厂商配置（models.json 为空）</div></div>')
+    for r in rows:
+        left_id = r.get("leftId") or ""
+        out.append('<div class="oc-tr' + ('' if r.get("same") else ' bad') + '">')
+        out.append('<div class="oc-c"><div class="oc-top"><span class="oc-i">' + str(r.get("i", 0))
+                   + '</span><b>' + _e(left_id or "—") + '</b>'
+                   + ('<span class="oc-chip">未保存</span>' if left_id in unsaved else '')
+                   + '</div>' + _models(r.get("leftModels"), r.get("leftStar")) + '</div>')
+        out.append('<div class="oc-c"><div class="oc-top"><span class="oc-i">' + str(r.get("i", 0))
+                   + '</span><b>' + _e(r.get("rightId") or "—") + '</b></div>'
+                   + _models(r.get("rightModels"), r.get("rightStar")) + '</div>')
+        out.append('<div class="oc-c oc-res">'
+                   + ('<span class="oc-badge">✅</span>' if r.get("same") else '<span class="oc-badge">⚠️</span>')
+                   + '</div>')
+        out.append('</div>')
+    out.append('</div>')
+
+    out.append('<div class="oc-sum">')
+    for item in cmp.get("summary") or []:
+        cls = item.get("cls") or ("ok" if item.get("ok") else "bad")
+        out.append('<div class="oc-sr"><span>' + _e(item.get("label"))
+                   + '</span><b class="' + _e(cls) + '">' + _e(item.get("value")) + '</b></div>')
+    out.append('</div>')
+
+    out.append('<div class="oc-foot">配置：' + _e(cmp.get("configPath"))
+               + '<br>顺序文件：' + _e(cmp.get("orderFilePath"))
+               + (('<br>⚠️ ' + _e(cmp.get("selfCheckMsg"))) if cmp.get("selfCheckMsg") else '')
+               + '</div>')
+    out.append('</div>')
+    return "".join(out)
+
+
+def build_order_report(path_value=None):
+    """生成「工具顺序 ↔ Pi 顺序」一致性自检报告（纯文本，供复制/存档）。
+
+    Pi 侧一共存在三种顺序，其中只有「厂商内部的模型顺序」可以由工具控制：
+      1. 厂商分组顺序 —— /model 选择器与 `pi --list-models` 都按厂商 ID 字母序分组
+         （Pi 源码硬编码），models.json 的厂商键顺序对 Pi 无效。
+         如需让 Pi 跟随工具顺序，可使用工具内的「🧩 Pi 顺序补丁」（文件见本报告【5】）。
+      2. 厂商内部的模型顺序 —— 自定义厂商 = models.json 数组顺序（工具拖拽生效）；
+         内置厂商 = Pi 原生目录顺序（目录内模型在工具侧锁定拖拽）。
+      3. 默认/当前模型置顶 —— /model 选择器把「当前模型」放第 1、「默认模型」放第 2。
+    """
+    sn = _order_snapshot(path_value)
+    path = sn["path"]
+    disk_providers = sn["diskProviders"]
+    display_providers = sn["displayProviders"]
+    default_provider = sn["defaultProvider"]
+    default_model = sn["defaultModel"]
+    prefs = sn["prefs"]
+    tool_order = sn["toolOrder"]
+    pi_order = sn["piOrder"]
+    pst = sn["pst"]
+    patch_on = sn["patchOn"]
     pi_effective_order = tool_order if patch_on else pi_order
 
     lines = ["📄 配置文件: " + str(path), ""]
@@ -1926,6 +2184,19 @@ class ApiBridge:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def get_order_compare(self, alpha=False):
+        """顺序自检（左右两栏对照）：返回已渲染的 HTML + 完整文本报告（供 📋 复制全文）。"""
+        try:
+            cmp = build_order_compare(None, bool(alpha))
+            cmp["html"] = build_order_compare_html(cmp)
+            try:
+                cmp["reportText"] = build_order_report(None)
+            except Exception as e:
+                cmp["reportText"] = "（完整报告生成失败: %s）" % e
+            return cmp
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     def get_order_patch_status(self):
         """Pi 排序补丁状态。"""
         try:
@@ -2927,6 +3198,90 @@ HTML_CONTENT = """<!DOCTYPE html>
     opacity: 0.72;
     line-height: 1.5;
   }
+  /* 顺序自检：左右两栅对照（左 = 工具窗口，右 = Pi 实际） */
+  .modal-html {
+    font-size: 12.5px;
+    line-height: 1.55;
+    max-height: 60vh;
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+  .oc { min-width: 0; }
+  .oc-verdict {
+    padding: 9px 12px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 12px;
+    border: 1px solid transparent;
+    line-height: 1.5;
+  }
+  .oc-verdict.ok { background: rgba(16,185,129,0.13); border-color: rgba(16,185,129,0.40); color: #6EE7B7; }
+  .oc-verdict.warn { background: rgba(245,158,11,0.13); border-color: rgba(245,158,11,0.40); color: #FCD34D; }
+  .oc-verdict.info { background: rgba(99,102,241,0.13); border-color: rgba(99,102,241,0.40); color: #A5B4FC; }
+  .oc-tbl {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 46px;
+    border: 1px solid var(--b-line);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .oc-hd, .oc-tr { display: contents; }
+  .oc-c {
+    padding: 8px 11px;
+    border-top: 1px solid var(--b-line);
+    min-width: 0;
+  }
+  .oc-hd .oc-c {
+    border-top: 0;
+    background: rgba(255,255,255,0.045);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--b-text-2);
+    letter-spacing: .3px;
+  }
+  .oc-tr.bad .oc-c { background: rgba(245,158,11,0.09); }
+  .oc-n { display: block; font-size: 10px; font-weight: 400; opacity: .7; margin-top: 2px; }
+  .oc-top { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .oc-i {
+    font-size: 10px;
+    color: var(--b-text-2);
+    background: rgba(255,255,255,0.07);
+    border-radius: 4px;
+    padding: 1px 5px;
+    flex: none;
+  }
+  .oc-top b { font-size: 12px; word-break: break-all; }
+  .oc-m { font-size: 10.5px; color: var(--b-text-2); margin-top: 4px; line-height: 1.55; word-break: break-word; }
+  .oc-star { color: #FCD34D; font-weight: 600; }
+  .oc-chip {
+    font-size: 9.5px;
+    color: #FCD34D;
+    border: 1px solid rgba(245,158,11,0.45);
+    border-radius: 4px;
+    padding: 0 4px;
+    white-space: nowrap;
+  }
+  .oc-empty { opacity: .6; font-style: italic; }
+  .oc-res { text-align: center; }
+  .oc-badge { font-size: 13px; }
+  .oc-sum { margin-top: 12px; display: grid; gap: 6px; }
+  .oc-sr {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 11.5px;
+    padding: 6px 10px;
+    background: rgba(0,0,0,0.25);
+    border-radius: 6px;
+  }
+  .oc-sr span { color: var(--b-text-2); }
+  .oc-sr b { font-weight: 600; text-align: right; }
+  .oc-sr b.ok { color: #6EE7B7; }
+  .oc-sr b.bad { color: #FCD34D; }
+  .oc-sr b.info { color: #A5B4FC; }
+  .oc-foot { margin-top: 10px; font-size: 10.5px; color: var(--b-text-2); opacity: .75; line-height: 1.6; word-break: break-all; }
   .modal-footer {
     padding: 12px 18px 14px 18px;
     display: flex;
@@ -3026,7 +3381,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       <button class="btn btn-emerald" onclick="restartPi()" title="重启 Pi 交互终端">
         <span>🔄 重启</span>
       </button>
-      <button class="btn btn-indigo" id="orderReportBtn" onclick="showOrderReport()" title="核对「工具顺序 ↔ Pi 顺序」并说明差异原因">
+      <button class="btn btn-indigo" id="orderReportBtn" onclick="showOrderReport()" title="左右两栏对照：工具窗口顺序 ↔ Pi 实际顺序（逐行给出✅/⚠️结果）">
         <span>🔍 顺序自检</span>
       </button>
       <button class="btn btn-purple" id="orderPatchBtn" onclick="showPiOrderPatchDialog()" title="让 Pi 的厂商分组顺序跟随工具（可一键还原原版）">
@@ -3388,15 +3743,24 @@ let globalDialogCopyText = '';
 
 function applyDialogBody(opts, msgEl) {
   const text = opts.message || opts.text || '';
+  const copyText = opts.copyText || text;
   if (!msgEl) return;
-  msgEl.innerText = text;
-  if (opts.mono) {
+  if (opts.html) {
+    msgEl.className = 'modal-html';
+    msgEl.innerHTML = String(opts.html);
+    msgEl.style.fontSize = '';
+    msgEl.style.lineHeight = '';
+    msgEl.style.whiteSpace = '';
+    msgEl.style.wordBreak = '';
+  } else if (opts.mono) {
+    msgEl.innerText = text;
     msgEl.className = 'modal-report';
     msgEl.style.fontSize = '';
     msgEl.style.lineHeight = '';
     msgEl.style.whiteSpace = '';
     msgEl.style.wordBreak = '';
   } else {
+    msgEl.innerText = text;
     msgEl.className = '';
     msgEl.style.fontSize = '12.5px';
     msgEl.style.lineHeight = '1.65';
@@ -3406,8 +3770,8 @@ function applyDialogBody(opts, msgEl) {
 
   const hintEl = $id('globalDialogHint');
   if (hintEl) {
-    const lines = text ? text.split(String.fromCharCode(10)).length : 0;
-    const auto = (opts.mono && lines > 22)
+    const lines = copyText ? copyText.split(String.fromCharCode(10)).length : 0;
+    const auto = (!opts.html && opts.mono && lines > 22)
       ? ('共 ' + lines + ' 行，内容较长：可在框内上下滚动查看，或点左下角「📋 复制全文」整段复制。')
       : '';
     const hint = [auto, opts.hint].filter(Boolean).join('  ·  ');
@@ -3415,10 +3779,10 @@ function applyDialogBody(opts, msgEl) {
     hintEl.style.display = hint ? 'block' : 'none';
   }
 
-  globalDialogCopyText = text;
+  globalDialogCopyText = copyText;
   const copyBtn = $id('globalDialogCopyBtn');
   if (copyBtn) {
-    if (opts.allowCopy && text) {
+    if (opts.allowCopy && copyText) {
       copyBtn.style.display = 'inline-flex';
       copyBtn.innerText = '📋 复制全文';
     } else {
@@ -3867,23 +4231,23 @@ async function refreshOrderFileIfPatched() {
 async function showOrderReport() {
   setStatus('正在核对「工具顺序 ↔ Pi 顺序」...', '#F59E0B');
   try {
-    const res = await window.pywebview.api.get_order_report();
+    const alpha = !!(uiPrefs && uiPrefs.alignProviderOrder);
+    const res = await window.pywebview.api.get_order_compare(alpha);
     if (!res || !res.success) {
       setStatus('顺序自检失败: ' + ((res && res.error) || '未知错误'), '#EF4444');
       await showAlert({ title: '顺序自检失败', icon: '❌', type: 'error', message: (res && res.error) || '未知错误' });
       return;
     }
     setStatus('顺序自检完成', '#10B981');
-    const sumParts = (res && res.summary) ? String(res.summary).split(' · ') : [];
-    const head = sumParts.length ? sumParts[0] : '';
     await showAlert({
-      title: '顺序自检' + (head ? ' · ' + head : '（工具 ↔ Pi）'),
+      title: res.title || '顺序自检 · 工具 ↔ Pi',
       icon: '🔍',
-      message: res.text,
+      html: res.html,
+      copyText: res.reportText || '',
       wide: true,
-      mono: true,
       allowCopy: true,
-      hint: sumParts.length > 1 ? sumParts.slice(1).join(' · ') : ''
+      hint: res.hint || '',
+      okText: '关闭'
     });
   } catch (e) {
     setStatus('顺序自检异常: ' + e, '#EF4444');

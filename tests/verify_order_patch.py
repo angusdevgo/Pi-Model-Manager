@@ -199,7 +199,7 @@ chk("提示行元素存在", 'id="globalDialogHint"' in _html)
 chk("脚本含 applyDialogBody", "function applyDialogBody" in _html)
 chk("脚本含 handleDialogCopy", "function handleDialogCopy" in _html)
 chk("两个弹窗调用 applyDialogBody", _html.count("applyDialogBody(opts, msgEl);") == 2)
-chk("mono 模式 3 处（自检/补丁/重打提示）", _html.count("mono: true") == 3, _html.count("mono: true"))
+chk("mono 模式 2 处（补丁弹窗 / 重打提示）", _html.count("mono: true") == 2, _html.count("mono: true"))
 chk("allowCopy 模式 3 处", _html.count("allowCopy: true") == 3, _html.count("allowCopy: true"))
 chk("updateOrderPatchBtn 可复用状态（省一次扫描）", "async function updateOrderPatchBtn(status)" in _html)
 chk("ensure_order_patch 仅 2 处调用（启动 + 偏好切换刷新）", _html.count("api.ensure_order_patch()") == 2, _html.count("api.ensure_order_patch()"))
@@ -209,6 +209,79 @@ chk("报告返回 summary（用于标题结论）", bool(_rep.get("success") and
 _txt = _rep.get("text") or ""
 chk("报告六节 + 结论齐全（后端不截断）", all(k in _txt for k in ["【1】", "【2】", "【3】", "【4】", "【5】", "【6】", "── 结论 ──"]))
 chk("报告行数 > 30（确属长文，需弹窗滚动）", _txt.count(chr(10)) > 30, _txt.count(chr(10)))
+
+print("\n[11] 顺序自检：左右两栏对照（左 = 工具窗口，右 = Pi 实际）")
+_cfg = agent / "models.json"
+_order_cfg = {"providers": {
+    "zulu": {"models": [{"id": "z1"}, {"id": "z2"}]},
+    "alpha": {"models": [{"id": "a1"}]},
+    "mike": {"models": [{"id": "m1"}, {"id": "m2"}, {"id": "m3"}]},
+}}
+_cfg.write_text(json.dumps(_order_cfg), encoding="utf-8")
+_cmp = D.build_order_compare(str(_cfg))
+chk("对照数据可生成", bool(_cmp.get("success")))
+chk("左栏 = 工具窗口顺序（models.json 键序）", [r["leftId"] for r in _cmp["rows"]] == ["zulu", "alpha", "mike"])
+chk("行数 = 厂商数", len(_cmp["rows"]) == 3, len(_cmp["rows"]))
+chk("每行带 leftModels 名称", _cmp["rows"][0]["leftModels"] == ["z1", "z2"])
+chk("汇总 6 项", len(_cmp["summary"]) == 6, len(_cmp["summary"]))
+chk("含禁用模型小节（值 = 无）", any(s["label"].startswith("禁用模型") for s in _cmp["summary"]))
+chk("含工具自身体检小节", any(s["label"] == "工具自身体检" for s in _cmp["summary"]))
+_h_raw = D.build_order_compare_html(_cmp)
+chk("HTML 含两栏表格 .oc-tbl", "oc-tbl" in _h_raw)
+chk("HTML 两栏用 display:contents 行", ".oc-hd, .oc-tr { display: contents; }" in D.HTML_CONTENT)
+chk("HTML 左右栅头含厂商/模型计数", ("厂商 ·" in _h_raw) and ("模型" in _h_raw))
+chk("HTML 汇总行数 = 6", _h_raw.count("oc-sr") >= 6, _h_raw.count("oc-sr"))
+
+# 补丁关闭 → Pi 原生字母序，应出现逐行⚠️与 warn 结论
+_status_real = D.pi_order_patch_status
+D.pi_order_patch_status = lambda: {"enabled": False, "fullyPatched": False, "targetCount": 4, "patchedCount": 0,
+                                   "versionChanged": False, "order": [], "piVersion": "x", "targets": []}
+_c_off = D.build_order_compare(str(_cfg))
+_h_off = D.build_order_compare_html(_c_off)
+chk("补丁关闭：右栏 = Pi 字母序", [r["rightId"] for r in _c_off["rows"]] == ["alpha", "mike", "zulu"])
+chk("patch-off: rows fully misaligned", _c_off["sameCount"] == 0, _c_off["sameCount"])
+chk("补丁关闭：结论为 warn", _c_off["verdict"]["cls"] == "warn")
+chk("patch-off: mismatched rows carry bad class", _h_off.count("oc-tr bad") == 3, _h_off.count("oc-tr bad"))
+chk("patch-off: per-row warn badge = 3", _h_off.count('oc-badge">' + chr(9888)) == 3, _h_off.count('oc-badge">' + chr(9888)))
+chk("patch-off: no ok badge", _h_off.count('oc-badge">' + chr(9989)) == 0, _h_off.count('oc-badge">' + chr(9989)))
+
+# 补丁开启但顺序文件过期（与工具当前顺序不同）→ 应直接报「顺序文件过期」
+D.pi_order_patch_status = lambda: {"enabled": True, "fullyPatched": True, "targetCount": 4, "patchedCount": 4,
+                                   "versionChanged": False, "order": ["mike", "zulu", "alpha"],
+                                   "piVersion": "x", "targets": []}
+_c_stale = D.build_order_compare(str(_cfg))
+chk("顺序文件过期：staleOrderFile = True", bool(_c_stale["staleOrderFile"]))
+chk("顺序文件过期：结论提示重新同步", "同步" in _c_stale["verdict"]["text"])
+
+# 补丁开启且顺序文件一致 → 全 ✅
+D.pi_order_patch_status = lambda: {"enabled": True, "fullyPatched": True, "targetCount": 4, "patchedCount": 4,
+                                   "versionChanged": False, "order": ["zulu", "alpha", "mike"],
+                                   "piVersion": "x", "targets": []}
+_c_on = D.build_order_compare(str(_cfg))
+_h_on = D.build_order_compare_html(_c_on)
+chk("补丁开启且同步：右栏 = 左栏", [r["rightId"] for r in _c_on["rows"]] == [r["leftId"] for r in _c_on["rows"]])
+chk("补丁开启且同步：结论为 ok", _c_on["verdict"]["cls"] == "ok")
+chk("patch-on+synced: no bad row", "oc-tr bad" not in _h_on)
+chk("patch-on+synced: per-row ok badge = 3", _h_on.count('oc-badge">' + chr(9989)) == 3, _h_on.count('oc-badge">' + chr(9989)))
+chk("patch-on+synced: no warn badge", _h_on.count('oc-badge">' + chr(9888)) == 0, _h_on.count('oc-badge">' + chr(9888)))
+chk("补丁开启：右栏标题标注补丁生效", "补丁生效" in _c_on["piLabel"])
+D.pi_order_patch_status = _status_real
+
+# XSS：厂商名/模型名必须转义
+_xss_cfg = {"providers": {"<img src=x onerror=alert(1)>": {"models": [{"id": "a\"><script>x</script>"}]}}}
+(agent / "models.json").write_text(json.dumps(_xss_cfg), encoding="utf-8")
+_h_x = D.build_order_compare_html(D.build_order_compare(str(agent / "models.json")))
+chk("厂商名/模型名已 HTML 转义（防注入）", ("&lt;img src=x" in _h_x) and ("<img src=x" not in _h_x))
+chk("模型名尖括号已转义", "<script>" not in _h_x)
+
+_api = D.ApiBridge()
+chk("ApiBridge 暴露 get_order_compare", hasattr(_api, "get_order_compare"))
+_oc = _api.get_order_compare(False)
+chk("get_order_compare 返回 html", bool(_oc.get("success") and len(_oc.get("html") or "") > 500), len(_oc.get("html") or ""))
+chk("get_order_compare 带回完整文本报告（供复制）", "【6】" in (_oc.get("reportText") or ""))
+chk("get_order_compare 支持字母序视图参数", bool(_api.get_order_compare(True).get("success")))
+chk("前端改用 get_order_compare", ("api.get_order_compare(alpha)" in _html))
+chk("前端新增 .modal-html 样式", ".modal-html" in _html and ("oc-verdict" in _html))
 
 print("\n==== 结果: %d/%d 全部通过 ====" % (sum(ok), len(ok)))
 sys.exit(0 if all(ok) else 1)
