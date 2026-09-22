@@ -64,6 +64,22 @@
 #### 6. 🔄 配套热同步扩展 (models-sync.ts)
 - 附带 TypeScript 编写的 Pi Agent 官方原生扩展，加载后常驻监听 `models.json` 变动，保存即自动热更新正在运行的 Pi 会话模型列表，**无需退出重启终端，也无需手动执行 `/reload`**。
 
+#### 7. 🧭 顺序一致性（工具 ↔ Pi 透明化）
+Pi 侧一共存在 **三种顺序**，本工具把每一种都讲清楚并提供对应开关，拒绝“拖了却没生效”的玄学：
+
+| 顺序类型 | 谁说了算 | 工具是否可控制 |
+| --- | --- | --- |
+| ① 厂商分组顺序 | **Pi 硬编码**：`/model` 选择器与 `pi --list-models` 都按 `a.provider.localeCompare(b.provider)` 字母序分组 | ❌ 不可控制（`models.json` 的厂商键顺序对 Pi 无效） |
+| ② 厂商内部的模型顺序 | 自定义厂商 = `models.json` 的 `models` **数组顺序**；内置厂商 = Pi 原生目录顺序 | ✅ 完全可控（拖拽 → 保存 → 重启 Pi 即生效） |
+| ③ 默认 / 当前模型置顶 | Pi 把「当前模型」放第 1、「默认模型」放第 2 | ✅ 工具侧同款置顶显示 |
+
+- **⭐ 默认置顶（模型列表右上角开关）**：把 Pi 默认模型在列表中置顶显示，并打上琥珀色高亮与 `⭐` 手柄，**仅改变显示层，绝不改动保存顺序**（该行在置顶期间禁止拖放，避免下标错位）；点击右侧 `☆ 设默认` 切换默认模型后置顶会自动跟随。
+- **⇅ Pi 字母序（服务商标题栏开关）**：一键把左侧厂商列切换成 Pi 的字母序视图（此时厂商拖拽会被锁定并提示），让两边观感完全一致；关闭后恢复您的自定义拖拽顺序。
+- **🔍 顺序自检（顶部操作栏按钮）**：一键生成三节式核对报告 —— 厂商分组顺序差异、每个厂商内部的模型顺序是否已落盘、默认模型与禁用模型清单，并给出 `✅ / ⚠️` 结论，方便直接截图留档。
+- **开关持久化**：以上两个显示开关保存在 `~/.pi/agent/model-manager-settings.json`，不污染 `models.json` / `settings.json`，重启工具后保持选择。
+
+> 💡 一句话总结：**厂商内部的模型顺序，工具说了算；厂商之间的先后顺序，Pi 固定为字母序。** 若您确实需要 Pi 也按工具顺序排列厂商，只能修改 Pi 安装目录里的排序逻辑（补丁式做法，Pi 升级会被覆盖），本工具不擅自改动第三方包文件。
+
 ---
 
 ### 🚀 快速开始
@@ -161,6 +177,22 @@ Adding custom LLM providers (e.g., self-hosted **Ollama**, **vLLM**, **LM Studio
 
 #### 6. 🔄 Live Hot-Reload Extension (models-sync.ts)
 - Native TypeScript extension for Pi that monitors `models.json` changes in the background, updating active terminal sessions instantly without restarts or manual `/reload` calls.
+
+#### 7. 🧭 Order Consistency (Tool ↔ Pi, Fully Transparent)
+Pi exposes **three different orderings**; the tool documents each one and ships a switch for it, so a drag never silently fails again:
+
+| Ordering | Source of truth | Controlled by tool? |
+| --- | --- | --- |
+| ① Provider group order | **Hardcoded in Pi**: both the `/model` selector and `pi --list-models` group providers via `a.provider.localeCompare(b.provider)` (alphabetical) | ❌ Not controllable (`models.json` key order is ignored by Pi) |
+| ② Model order inside a provider | Custom providers = the `models` **array order** in `models.json`; built-in providers = Pi's native catalog order | ✅ Fully controllable (drag → save → restart Pi) |
+| ③ Default / current model hoisting | Pi puts the *current* model first and the *default* model second | ✅ Mirrored by the tool |
+
+- **⭐ Pin Default (toggle in the model toolbar)**: hoists Pi's default model to the top of the list with an amber highlight and a `⭐` handle. It is **display-only and never mutates the saved order**; the pinned row is locked against drops while pinned (avoids index skew) and follows the model when you click `☆ Set default`.
+- **⇅ Pi Alphabetical (toggle on the provider panel header)**: switches the provider list to Pi's alphabetical view (provider dragging is locked and explained in a tooltip). Turn it off to get your own drag order back.
+- **🔍 Order Self-Check (button in the header actions)**: produces a three-section report — provider-grouping difference, whether each provider's internal model order is already persisted, plus the default model and disabled-model inventory — with `✅ / ⚠️` verdicts, ready to be screenshotted for your records.
+- **Persisted preferences**: both display toggles live in `~/.pi/agent/model-manager-settings.json`, keeping `models.json` / `settings.json` untouched, and survive restarts of the tool.
+
+> 💡 TL;DR: **the model order inside a provider is yours to control; the order between providers is fixed to alphabetical in Pi.** If you truly need Pi itself to follow the tool's provider order, that requires patching the sorting logic inside Pi's installation (overwritten on every Pi upgrade) — this tool never rewrites third-party package files on its own.
 
 ---
 

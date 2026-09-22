@@ -108,6 +108,173 @@ def save_pi_settings(settings_dict):
         return False
 
 
+TOOL_SETTINGS_PATH = DEFAULT_AGENT_DIR / "model-manager-settings.json"
+
+# 工具界面偏好默认值。与 Pi「顺序语义」相关的开关都持久化在这里。
+DEFAULT_TOOL_PREFS = {
+    # 模型列表顶部置顶 Pi 默认模型（仅显示层，不改动 models.json 保存顺序）
+    "pinDefaultModel": True,
+    # 厂商列按 Pi 的字母序显示（Pi 侧固定按厂商 ID 字母序分组，无法配置）
+    "alignProviderOrder": False,
+}
+
+
+def load_tool_settings():
+    """读取工具自身偏好文件 model-manager-settings.json（容错 BOM / 注释 / 损坏）。"""
+    if not TOOL_SETTINGS_PATH.exists():
+        return {}
+    try:
+        raw = TOOL_SETTINGS_PATH.read_text(encoding="utf-8-sig")
+        clean = strip_json_comments(raw).strip()
+        data = json.loads(clean) if clean else {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_tool_settings(settings):
+    try:
+        TOOL_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        TOOL_SETTINGS_PATH.write_text(
+            json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def get_tool_prefs():
+    prefs = dict(DEFAULT_TOOL_PREFS)
+    stored = load_tool_settings()
+    for key in DEFAULT_TOOL_PREFS:
+        if isinstance(stored.get(key), bool):
+            prefs[key] = stored[key]
+    return prefs
+
+
+def set_tool_pref(name, value):
+    if name not in DEFAULT_TOOL_PREFS:
+        return False
+    stored = load_tool_settings()
+    stored[name] = bool(value)
+    return save_tool_settings(stored)
+
+
+def pi_name_sort_key(text):
+    """模拟 JS `String.prototype.localeCompare` 的字母序排序键（忽略大小写）。
+
+    Pi 的 /model 选择器（model-selector.js -> sortModels）与 `pi --list-models`
+    （cli/list-models.js）都用 `a.provider.localeCompare(b.provider)` 对厂商分组，
+    即按厂商 ID 的字母序、忽略大小写。
+    """
+    return str(text).casefold()
+
+
+def build_order_report(path_value=None):
+    """生成「工具顺序 ↔ Pi 顺序」一致性自检报告（纯文本，供界面直接展示）。
+
+    Pi 侧一共存在三种顺序，其中只有「厂商内部的模型顺序」可以由工具控制：
+      1. 厂商分组顺序 —— /model 选择器与 `pi --list-models` 都按厂商 ID 字母序分组
+         （Pi 源码硬编码），models.json 的厂商键顺序对 Pi 无效。
+      2. 厂商内部的模型顺序 —— 自定义厂商 = models.json 数组顺序（工具拖拽生效）；
+         内置厂商 = Pi 原生目录顺序（目录内模型在工具侧锁定拖拽）。
+      3. 默认/当前模型置顶 —— /model 选择器把「当前模型」放第 1、「默认模型」放第 2。
+    """
+    path = normalize_config_path(path_value)
+    try:
+        disk_cfg = read_config_file(path) if path.exists() else {"providers": {}}
+    except Exception:
+        disk_cfg = {"providers": {}}
+    if not isinstance(disk_cfg.get("providers"), dict):
+        disk_cfg = {"providers": {}}
+    try:
+        display_cfg = load_config(path)
+    except Exception:
+        display_cfg = {"providers": {}}
+
+    disk_providers = disk_cfg.get("providers") or {}
+    display_providers = display_cfg.get("providers") or {}
+    settings = load_pi_settings()
+    default_provider = str(settings.get("defaultProvider") or "")
+    default_model = str(settings.get("defaultModel") or "")
+    prefs = get_tool_prefs()
+
+    tool_order = list(display_providers.keys())
+    pi_order = sorted(tool_order, key=pi_name_sort_key)
+
+    lines = ["📄 配置文件: " + str(path), ""]
+    lines.append("【1】厂商分组顺序 —— Pi 固定按字母序，配置改不了")
+    lines.append("  · 工具当前顺序: " + " → ".join(tool_order[:14]) + (" …" if len(tool_order) > 14 else ""))
+    lines.append("  · Pi 实际顺序  : " + " → ".join(pi_order[:14]) + (" …" if len(pi_order) > 14 else ""))
+    if not tool_order:
+        lines.append("  ⚠️  暂无厂商配置")
+    elif tool_order == pi_order:
+        lines.append("  ✅ 两边一致：工具里的厂商顺序恰好就是字母序")
+    else:
+        lines.append("  ⚠️  不一致：Pi 的 /model 选择器与 `pi --list-models` 都按")
+        lines.append("      `a.provider.localeCompare(b.provider)` 分组（pi 0.87 硬编码，见")
+        lines.append("      model-selector.js sortModels / cli/list-models.js），models.json")
+        lines.append("      里的厂商键顺序对 Pi 无效 —— 工具拖拽厂商只改变工具自身视图。")
+        lines.append("      → 想让工具也显示成 Pi 的字母序：点侧栏标题上的「⇅ Pi 字母序」开关。")
+    lines.append("")
+
+    lines.append("【2】厂商内部的模型顺序 —— 工具说了算，保存后重启 Pi 即生效")
+    ok_providers = 0
+    mismatch_providers = []
+    total_models = 0
+    for pid in tool_order:
+        p = display_providers.get(pid) or {}
+        rows = [m for m in (p.get("models") or []) if isinstance(m, dict) and m.get("id")]
+        disp_ids = [str(m.get("id")) for m in rows]
+        disk_ids = [str(m.get("id")) for m in ((disk_providers.get(pid) or {}).get("models") or [])
+                    if isinstance(m, dict) and m.get("id")]
+        total_models += len(disp_ids)
+        if disp_ids == disk_ids:
+            ok_providers += 1
+            mark, note = "✅", ""
+        else:
+            mismatch_providers.append(pid)
+            mark, note = "⚠️", "  ← 工具显示顺序与 models.json 保存顺序不同，点击「💾 保存」写盘"
+        if p.get("_isBuiltin"):
+            catalog_ids = [str(m.get("id")) for m in rows if m.get("_isBuiltinModel")]
+            extra_ids = [str(m.get("id")) for m in rows if not m.get("_isBuiltinModel")]
+            lines.append(f"  {mark} [{pid}] 内置厂商 · {len(disp_ids)} 个模型{note}")
+            lines.append(f"       · 目录内模型 {len(catalog_ids)} 个：顺序由 Pi 原生目录决定（工具已锁定拖拽 → 两边必然一致）")
+            if extra_ids:
+                lines.append("       · 自建模型 " + str(len(extra_ids)) + " 个：Pi 侧追加在目录之后，顺序 = " + " → ".join(extra_ids))
+        else:
+            lines.append(f"  {mark} [{pid}] 自定义厂商 · {len(disp_ids)} 个模型{note}")
+            lines.append("       " + (" → ".join(disp_ids) if disp_ids else "（空）"))
+    lines.append("")
+
+    lines.append("【3】默认模型置顶（Pi 的 /model 选择器行为）")
+    if default_model:
+        lines.append(f"  ★ Pi 默认模型: {default_provider}/{default_model}")
+        lines.append("  · Pi 选择器把「当前正在使用的模型」放第 1 位、「默认模型」放第 2 位，")
+        lines.append("    其余模型保持上面的保存顺序。")
+        lines.append("  · 工具侧：" + ("已开启「⭐ 默认置顶」→ 默认模型在该厂商列表顶部置顶显示（仅显示）"
+                              if prefs.get("pinDefaultModel") else "「⭐ 默认置顶」已关闭 → 列表 = 保存顺序"))
+    else:
+        lines.append("  ⚠️  settings.json 未设置 defaultProvider / defaultModel（可在模型行的「☆ 设默认」按钮设置）")
+    lines.append("")
+
+    disabled_rows = [(pid, str(m.get("id"))) for pid, p in display_providers.items()
+                     for m in (p.get("models") or [])
+                     if isinstance(m, dict) and m.get("disabled") is True and m.get("id")
+                     and not m.get("_isBuiltinModel")]
+    lines.append("【4】禁用模型（保存后不写入 models.json → Pi 侧不存在）")
+    lines.append("  " + ("、".join(f"{pid}/{mid}" for pid, mid in disabled_rows) if disabled_rows else "无"))
+    lines.append("")
+
+    lines.append("── 结论 ──")
+    lines.append(f"  厂商 {len(tool_order)} 个 / 模型 {total_models} 个；厂商内部顺序一致 {ok_providers}/{len(tool_order)}")
+    if mismatch_providers:
+        lines.append("  ⚠️  以下厂商尚未把当前顺序写入 models.json：" + "、".join(mismatch_providers))
+    else:
+        lines.append("  ✅ 工具里的「厂商内部模型顺序」= models.json 保存顺序 = Pi 重启后的顺序")
+    lines.append("  ℹ️  厂商之间的先后顺序在 Pi 侧固定为字母序（Pi 硬编码），工具无法改写。")
+    return "\n".join(lines)
+
+
 def model_reference(pid, model_id):
     return f"{pid}/{model_id}"
 
@@ -1144,6 +1311,28 @@ class ApiBridge:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def get_tool_prefs(self):
+        """读取工具界面偏好（顺序相关开关）。"""
+        try:
+            return {"success": True, "prefs": get_tool_prefs()}
+        except Exception as e:
+            return {"success": False, "error": str(e), "prefs": dict(DEFAULT_TOOL_PREFS)}
+
+    def set_tool_pref(self, name, value):
+        """持久化单个工具界面偏好。"""
+        try:
+            set_tool_pref(name, value)
+            return {"success": True, "prefs": get_tool_prefs()}
+        except Exception as e:
+            return {"success": False, "error": str(e), "prefs": dict(DEFAULT_TOOL_PREFS)}
+
+    def get_order_report(self):
+        """工具顺序 ↔ Pi 顺序一致性自检报告。"""
+        try:
+            return {"success": True, "text": build_order_report(None)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     def set_default_model(self, provider_id, model_id):
         try:
             s = load_pi_settings()
@@ -1766,6 +1955,22 @@ HTML_CONTENT = """<!DOCTYPE html>
     white-space: nowrap;
   }
 
+  /* 顺序对齐：置顶的 Pi 默认模型行 + 已开启的顺序开关 */
+  .model-row.pinned {
+    background: linear-gradient(90deg, rgba(245, 158, 11, 0.12), transparent 45%);
+    box-shadow: inset 2px 0 0 var(--b-amber);
+  }
+  .model-row.pinned .model-row-handle {
+    color: var(--b-amber);
+    opacity: 1;
+    cursor: not-allowed;
+  }
+  .btn.is-on {
+    background: rgba(16, 185, 129, 0.18);
+    color: #6EE7B7;
+    border-color: rgba(16, 185, 129, 0.45);
+  }
+
   .model-row-actions {
     width: 290px;
     flex-shrink: 0;
@@ -2165,6 +2370,9 @@ HTML_CONTENT = """<!DOCTYPE html>
       <button class="btn btn-emerald" onclick="restartPi()" title="重启 Pi 交互终端">
         <span>🔄 重启</span>
       </button>
+      <button class="btn btn-indigo" onclick="showOrderReport()" title="核对「工具顺序 ↔ Pi 顺序」并说明差异原因">
+        <span>🔍 顺序自检</span>
+      </button>
     </div>
     
     <div class="window-controls pywebview-no-drag-region">
@@ -2184,6 +2392,8 @@ HTML_CONTENT = """<!DOCTYPE html>
         <span class="count-chip" id="sidebarCount">0</span>
       </div>
       <button class="btn btn-secondary" style="padding: 2px 7px; font-size: 11px;" onclick="newProvider()">➕ 新建</button>
+      <button class="btn btn-secondary" id="providerOrderToggle" style="padding: 2px 7px; font-size: 11px;"
+              onclick="toggleUiPref('alignProviderOrder')" title="按 Pi 的字母序显示厂商">⇅ Pi 字母序</button>
     </div>
     <div class="sidebar-search">
       <input class="search-input" id="providerSearch" placeholder="🔍 搜索服务商..." oninput="renderSidebar()">
@@ -2210,6 +2420,8 @@ HTML_CONTENT = """<!DOCTYPE html>
 
       <div style="display: flex; gap: 6px; align-items: center;">
         <input class="search-input" id="modelSearch" style="width: 140px;" placeholder="🔍 过滤模型/别名..." oninput="renderModels()">
+        <button class="btn btn-secondary" id="pinDefaultToggle" style="padding: 3px 9px; font-size: 11px;"
+                onclick="toggleUiPref('pinDefaultModel')" title="把 Pi 默认模型置顶显示（仅显示，不改动保存顺序）">⭐ 默认置顶</button>
         <button class="btn btn-indigo" id="testAllBtn" onclick="testAllModels()" title="依次测活当前服务商的所有模型">⚡ 全部测活</button>
         <button class="btn btn-secondary" id="openDrawerBtn" onclick="openDrawer(selectedPid)" title="查看或编辑服务商连接参数与密钥">⚙️ 厂商设置</button>
       </div>
@@ -2495,6 +2707,8 @@ let currentEditable = true;
 let fetchedPreview = [];
 let currentDefaultProvider = '';
 let currentDefaultModel = '';
+// 工具界面偏好（与 Pi 顺序语义相关，持久化在 ~/.pi/agent/model-manager-settings.json）
+let uiPrefs = { pinDefaultModel: true, alignProviderOrder: false };
 let isProviderEditing = false;
 let isViewKeyMasked = true;
 // 密钥池编辑区当前是为哪个服务商渲染的（null = 未渲染/已清空），
@@ -2521,6 +2735,8 @@ function showConfirm(options) {
     if (iconEl) iconEl.innerText = opts.icon || (opts.danger ? '🗑️' : '⚠️');
     if (titleEl) titleEl.innerText = opts.title || '确认提示';
     if (msgEl) msgEl.innerText = opts.message || opts.text || '';
+    const box = $id('globalDialogBox');
+    if (box) box.style.width = opts.wide ? '860px' : '440px';
 
     if (cancelBtn) {
       cancelBtn.style.display = 'inline-flex';
@@ -2553,6 +2769,8 @@ function showAlert(options) {
 
     if (iconEl) iconEl.innerText = opts.icon || (opts.type === 'error' ? '❌' : opts.type === 'success' ? '✅' : 'ℹ️');
     if (titleEl) titleEl.innerText = opts.title || (opts.type === 'error' ? '错误' : opts.type === 'success' ? '成功' : '提示');
+    const box = $id('globalDialogBox');
+    if (box) box.style.width = opts.wide ? '860px' : '440px';
     if (msgEl) msgEl.innerText = opts.message || opts.text || '';
 
     if (cancelBtn) cancelBtn.style.display = 'none';
@@ -2693,6 +2911,76 @@ async function setDefaultModel(providerId, modelId) {
   }
 }
 
+// ==========================================
+// 顺序对齐（工具 ↔ Pi）
+// ------------------------------------------
+// Pi 侧一共存在三种顺序，工具只能控制「厂商内部的模型顺序」：
+//   1. 厂商分组顺序：/model 选择器与 `pi --list-models` 都按厂商 ID 的字母序分组
+//      （Pi 源码硬编码 localeCompare），models.json 的键顺序对 Pi 无效。
+//   2. 厂商内部的模型顺序：自定义厂商 = models.json 数组顺序（工具拖拽生效，持久化后
+//      重启 Pi 即按此顺序显示）；内置厂商 = Pi 原生目录顺序（目录内模型锁定拖拽）。
+//   3. 默认/当前模型置顶：/model 选择器把「当前模型」放第 1、「默认模型」放第 2。
+// 两个开关都是「显示层偏好」，不会改动 models.json 的保存顺序。
+async function loadUiPrefs() {
+  try {
+    const res = await window.pywebview.api.get_tool_prefs();
+    if (res && res.success && res.prefs) uiPrefs = Object.assign(uiPrefs, res.prefs);
+  } catch (e) {}
+  syncOrderToggleButtons();
+}
+
+function syncOrderToggleButtons() {
+  const pinBtn = $id('pinDefaultToggle');
+  if (pinBtn) {
+    pinBtn.classList.toggle('is-on', !!uiPrefs.pinDefaultModel);
+    pinBtn.title = uiPrefs.pinDefaultModel
+      ? '已开启：Pi 默认模型在该厂商列表顶部置顶显示（仅显示层，不改动保存顺序）'
+      : '点击开启：把 Pi 默认模型置顶显示，与 Pi 的 /model 选择器观感一致';
+  }
+  const orderBtn = $id('providerOrderToggle');
+  if (orderBtn) {
+    orderBtn.classList.toggle('is-on', !!uiPrefs.alignProviderOrder);
+    orderBtn.title = uiPrefs.alignProviderOrder
+      ? '已开启：厂商按 Pi 的字母序显示（Pi 侧固定按厂商名排序，不可配置）'
+      : '点击开启：厂商按 Pi 的字母序显示（当前为自定义拖拽顺序，仅影响工具视图）';
+  }
+}
+
+async function toggleUiPref(name) {
+  uiPrefs[name] = !uiPrefs[name];
+  syncOrderToggleButtons();
+  try { await window.pywebview.api.set_tool_pref(name, uiPrefs[name]); } catch (e) {}
+  renderSidebar();
+  if (selectedPid && currentConfig.providers[selectedPid]) {
+    renderModels(currentConfig.providers[selectedPid].models || []);
+  }
+  if (name === 'pinDefaultModel') {
+    setStatus(uiPrefs.pinDefaultModel
+      ? '⭐ 已开启默认模型置顶显示（仅显示层，保存顺序不变）'
+      : '已关闭默认模型置顶显示（列表 = 保存顺序）', '#10B981');
+  } else {
+    setStatus(uiPrefs.alignProviderOrder
+      ? '⇅ 厂商列已切换为 Pi 的字母序（Pi 侧固定按厂商名分组）'
+      : '厂商列已恢复为自定义拖拽顺序', '#10B981');
+  }
+}
+
+async function showOrderReport() {
+  setStatus('正在核对「工具顺序 ↔ Pi 顺序」...', '#F59E0B');
+  try {
+    const res = await window.pywebview.api.get_order_report();
+    if (!res || !res.success) {
+      setStatus('顺序自检失败: ' + ((res && res.error) || '未知错误'), '#EF4444');
+      await showAlert({ title: '顺序自检失败', icon: '❌', type: 'error', message: (res && res.error) || '未知错误' });
+      return;
+    }
+    setStatus('顺序自检完成', '#10B981');
+    await showAlert({ title: '顺序一致性自检（工具 ↔ Pi）', icon: '🔍', message: res.text, wide: true });
+  } catch (e) {
+    setStatus('顺序自检异常: ' + e, '#EF4444');
+  }
+}
+
 // Rescan Built-ins
 async function rescanBuiltins() {
   setStatus('正在扫描 Pi 内置服务商与模型目录...', '#F59E0B');
@@ -2757,6 +3045,10 @@ function renderSidebar() {
   const query = searchInput ? searchInput.value.trim().toLowerCase() : '';
   
   let pids = activeEntries.map(([pid]) => pid);
+  // 开关开启时：厂商按 Pi 的字母序显示（Pi 侧固定按厂商 ID localeCompare 排序）
+  if (uiPrefs.alignProviderOrder) {
+    pids = pids.slice().sort((a, b) => String(a).localeCompare(String(b)));
+  }
   if (query) {
     pids = pids.filter(pid => {
       const p = currentConfig.providers[pid] || {};
@@ -2802,8 +3094,15 @@ function renderSidebar() {
     row.ondblclick = () => { selectProvider(pid); openDrawer(pid); toggleProviderEditMode(true); };
 
     const handle = el('span', 'p-row-handle', '≡');
-    handle.title = '按住拖拽调整服务商顺序';
-    handle.addEventListener('pointerdown', () => { row.draggable = true; });
+    if (uiPrefs.alignProviderOrder) {
+      // Pi 侧厂商分组顺序固定为字母序，此时拖拽不会对 Pi 产生任何影响
+      handle.title = '已开启「⇅ Pi 字母序」：Pi 侧固定按厂商名排序，拖拽不会影响 Pi（可点侧栏标题的开关关闭）';
+      handle.style.opacity = '0.3';
+      handle.style.cursor = 'not-allowed';
+    } else {
+      handle.title = '按住拖拽调整服务商顺序（仅影响工具视图：Pi 侧始终按厂商名分组）';
+      handle.addEventListener('pointerdown', () => { row.draggable = true; });
+    }
 
     const dotClass = p.api === 'anthropic-messages' ? 'proto-claude-dot'
       : p.api === 'google-generative-ai' ? 'proto-gemini-dot'
@@ -3276,7 +3575,8 @@ function renderModels(models) {
 
   const searchInput = $id('modelSearch');
   const query = searchInput ? searchInput.value.trim().toLowerCase() : '';
-  let displayList = actualList;
+  // 复制一份再操作：displayList 可能与 p.models 共享引用，不能原地排序
+  let displayList = actualList.slice();
   if (query) {
     displayList = displayList.filter(m => {
       const id = String(m.id || '').toLowerCase();
@@ -3285,14 +3585,30 @@ function renderModels(models) {
     });
   }
 
+  // Pi 的 /model 选择器会把「当前模型」与「默认模型」置顶显示。
+  // 工具侧对应地把 Pi 默认模型置顶（仅显示层，不修改保存顺序）。
+  const pinnedId = (uiPrefs.pinDefaultModel && currentDefaultProvider && currentDefaultProvider === pid)
+    ? currentDefaultModel : '';
+  if (pinnedId) {
+    const idx = displayList.findIndex(m => m.id === pinnedId);
+    if (idx > 0) {
+      const pinnedRow = displayList.splice(idx, 1)[0];
+      displayList.unshift(pinnedRow);
+    }
+  }
+
   if (displayList.length === 0) {
     container.appendChild(emptyState('未搜索到匹配模型', `关键词: "${query}"`));
     return;
   }
 
   displayList.forEach((m) => {
-    const row = el('div', 'model-row' + (m.disabled ? ' disabled' : ''));
+    const isPinned = Boolean(pinnedId) && m.id === pinnedId;
+    const row = el('div', 'model-row' + (m.disabled ? ' disabled' : '') + (isPinned ? ' pinned' : ''));
     row.dataset.mid = m.id;
+    if (isPinned) {
+      row.title = 'Pi 的 /model 选择器会把默认模型置顶显示：此处仅为显示层置顶，保存位置不变';
+    }
 
     // Drag-and-drop ordering
     row.addEventListener('dragstart', (e) => {
@@ -3314,12 +3630,20 @@ function renderModels(models) {
       e.preventDefault();
       row.classList.remove('drag-over');
       const srcMid = e.dataTransfer.getData('text/plain');
-      if (srcMid && srcMid !== m.id) await moveModelToTarget(pid, srcMid, m.id);
+      if (!srcMid || srcMid === m.id) return;
+      if (isPinned) {
+        setStatus('⭐ 默认模型行在 Pi 侧始终置顶显示：请关闭「⭐ 默认置顶」后再调整它的保存位置', '#F59E0B');
+        return;
+      }
+      await moveModelToTarget(pid, srcMid, m.id);
     });
 
     // Handle：内置模型的顺序由 Pi 原生目录决定，禁止拖拽以保证两边顺序一致
     const handle = el('span', 'model-row-handle', '≡');
-    if (m._isBuiltinModel) {
+    if (isPinned) {
+      handle.innerText = '⭐';
+      handle.title = 'Pi 默认模型：/model 选择器总是把它置顶显示（关闭「⭐ 默认置顶」后可拖拽调整保存位置）';
+    } else if (m._isBuiltinModel) {
       handle.title = '内置模型顺序由 Pi 原生目录决定，不可调整';
       handle.style.opacity = '0.3';
       handle.style.cursor = 'not-allowed';
@@ -4275,6 +4599,7 @@ async function loadData() {
   currentConfig = data.config || { providers: {} };
   currentConfigPath = data.path;
   if ($id('pathDisplay')) $id('pathDisplay').innerText = `📁 ${data.path}`;
+  await loadUiPrefs();
   renderSidebar();
   await refreshDefaultModel();
 
