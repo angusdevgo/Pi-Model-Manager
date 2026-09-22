@@ -4,7 +4,7 @@
 说明:  全流程在临时沙箱中进行，绝不触碰真实 Pi 安装目录；
        原版文件来源：补丁已打时取备份目录，未打补丁时取真实安装目录。
 """
-import os, sys, json, shutil, pathlib, subprocess, hashlib, re, tempfile
+import os, sys, json, shutil, pathlib, subprocess, hashlib, re, tempfile, time
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 REAL = pathlib.Path(os.environ.get(
@@ -168,6 +168,47 @@ raw_src = (REPO / "desktop_app.py").read_text(encoding="utf-8")
 fake.write_text(raw_src.replace("lines.join('" + BS + BS + "n')", "lines.join('" + BS + "n')", 1),
                 encoding="utf-8")
 chk("隐患检出能力（模拟被破坏的源码）", len(D.scan_tool_js_escapes(fake)) == 1)
+
+print("\n[9] 性能门禁（启动不卡顿：字面量预筛 + 缓存）")
+_pkg_real = D.get_pi_package_dir()
+t0 = time.perf_counter()
+_found = D.find_pi_patch_targets(_pkg_real, use_cache=False)
+_cold = time.perf_counter() - t0
+chk("冷扫描 < 1.0s（实测 %.3fs）" % _cold, _cold < 1.0)
+chk("冷扫描命中文件数 > 0", len(_found) > 0, len(_found))
+t0 = time.perf_counter()
+D.find_pi_patch_targets(_pkg_real, use_cache=True)
+_warm = time.perf_counter() - t0
+chk("热取缓存 < 0.3s（实测 %.3fs）" % _warm, _warm < 0.3)
+chk("字面量预筛：真锚点命中", D.text_has_provider_cmp("x.provider.localeCompare(y.provider)"))
+chk("字面量预筛：不误报（缺 provider 参数）", not D.text_has_provider_cmp("x.provider.localeCompare(y)"))
+chk("字面量预筛：不误报（无关键串）", not D.text_has_provider_cmp("nothing to see here" + "z" * 5000))
+chk("字面量预筛：大文本不误报", not D.text_has_provider_cmp("z" * 20000 + ".provider.localeCompare(" + "y" * 20000))
+_ok_hit = [f for f in _found if D.text_has_provider_cmp(D.read_pi_source(f)) or D.PI_PATCH_START in D.read_pi_source(f)]
+chk("扫出的文件均含锚点或已是补丁态", len(_ok_hit) == len(_found), "%d/%d" % (len(_ok_hit), len(_found)))
+
+print("\n[10] 长报告弹窗显示完整性（可滚动 + 可复制）")
+_html = D.HTML_CONTENT
+chk("弹窗容器限高（不再溢出窗口）", "max-height: 88vh" in _html)
+chk("内容区可滚动", re.search(r"\.modal-body\s*\{[^}]*overflow-y:\s*auto", _html, re.S) is not None)
+chk("内容区 flex 滚动修正 min-height:0", re.search(r"\.modal-body\s*\{[^}]*min-height:\s*0", _html, re.S) is not None)
+chk("报告等宽样式 .modal-report", ".modal-report" in _html and "white-space: pre;" in _html)
+chk("报告区限高 56vh", re.search(r"\.modal-report\s*\{[^}]*max-height:\s*56vh", _html, re.S) is not None)
+chk("复制全文按钮存在", 'id="globalDialogCopyBtn"' in _html)
+chk("提示行元素存在", 'id="globalDialogHint"' in _html)
+chk("脚本含 applyDialogBody", "function applyDialogBody" in _html)
+chk("脚本含 handleDialogCopy", "function handleDialogCopy" in _html)
+chk("两个弹窗调用 applyDialogBody", _html.count("applyDialogBody(opts, msgEl);") == 2)
+chk("mono 模式 3 处（自检/补丁/重打提示）", _html.count("mono: true") == 3, _html.count("mono: true"))
+chk("allowCopy 模式 3 处", _html.count("allowCopy: true") == 3, _html.count("allowCopy: true"))
+chk("updateOrderPatchBtn 可复用状态（省一次扫描）", "async function updateOrderPatchBtn(status)" in _html)
+chk("ensure_order_patch 仅 2 处调用（启动 + 偏好切换刷新）", _html.count("api.ensure_order_patch()") == 2, _html.count("api.ensure_order_patch()"))
+chk("启动块已去掉 uiPrefs 前置判断（后端控开关）", "if (uiPrefs.patchPiOrder) {" not in _html)
+_rep = D.ApiBridge().get_order_report()
+chk("报告返回 summary（用于标题结论）", bool(_rep.get("success") and _rep.get("summary")), (_rep.get("summary") or "")[:60])
+_txt = _rep.get("text") or ""
+chk("报告六节 + 结论齐全（后端不截断）", all(k in _txt for k in ["【1】", "【2】", "【3】", "【4】", "【5】", "【6】", "── 结论 ──"]))
+chk("报告行数 > 30（确属长文，需弹窗滚动）", _txt.count(chr(10)) > 30, _txt.count(chr(10)))
 
 print("\n==== 结果: %d/%d 全部通过 ====" % (sum(ok), len(ok)))
 sys.exit(0 if all(ok) else 1)

@@ -75,7 +75,9 @@ Pi 侧一共存在 **三种顺序**，本工具把每一种都讲清楚并提供
 
 - **⭐ 默认置顶（模型列表右上角开关）**：把 Pi 默认模型在列表中置顶显示，并打上琥珀色高亮与 `⭐` 手柄，**仅改变显示层，绝不改动保存顺序**（该行在置顶期间禁止拖放，避免下标错位）；点击右侧 `☆ 设默认` 切换默认模型后置顶会自动跟随。
 - **⇅ Pi 字母序（服务商标题栏开关）**：一键把左侧厂商列切换成 Pi 的字母序视图（此时厂商拖拽会被锁定并提示），让两边观感完全一致；关闭后恢复您的自定义拖拽顺序。
-- **🔍 顺序自检（顶部操作栏按钮）**：一键生成六节式核对报告 —— 厂商分组顺序差异、每个厂商内部的模型顺序是否已落盘、默认模型、禁用模型清单、Pi 排序补丁状态、**工具自身体检（内嵌 JS 转义 + `node --check` 语法门禁）**，并给出 `✅ / ⚠️` 结论，方便直接截图留档。
+- **🔍 顺序自检（顶部操作栏按钮）**：一键生成六节式核对报告 —— 厂商分组顺序差异、每个厂商内部的模型顺序是否已落盘、默认模型、禁用模型清单、Pi 排序补丁状态、**工具自身体检（内嵌 JS 转义 + `node --check` 语法门禁）**，并给出 `✅ / ⚠️` 结论，方便直接截图留档。报告弹窗**限高 88vh + 独立滚动区**（等宽字体），标题直接显示结论摘要（如 `厂商 6 个 / 模型 16 个；厂商内部顺序一致 6/6`），左下角 **📋 复制全文** 可整段复制。
+- **🪟 长文弹窗显示完整性**：顺序自检、补丁状态等长文本弹窗统一改为「容器限高 `88vh` + `overflow-y:auto` + `min-height:0`」，再也不会出现内容溢出屏幕、看不到顶部/底部（含底部按钮）的情况。
+- **⚡ 启动性能**：补丁目标扫描加入**字面量预筛 + 窗口内精确校验**（不再在 4 MB 压缩包上整文件跑大正则），冷扫描 **4.6 s → 0.08 s**；启动时自动维护从 3 次接口调用合并为 1 次，启动关键链路合计 **≈0.3 s**。
 - **🧩 顺序补丁（顶部操作栏按钮）**：让 **Pi 跟随工具的厂商顺序**，见下方第 8 节。
 - **开关持久化**：以上两个显示开关保存在 `~/.pi/agent/model-manager-settings.json`，不污染 `models.json` / `settings.json`，重启工具后保持选择。
 
@@ -95,10 +97,11 @@ Pi 侧一共存在 **三种顺序**，本工具把每一种都讲清楚并提供
 | 自动维护 | 开启后：① 工具每次 **💾 保存** 自动同步顺序文件并校验补丁；② 工具**启动时**检测到补丁缺失（如被 `npm i -g` 覆盖）自动重打。状态栏会提示结果 |
 | 安全保障 | 修改前**字节级备份**原文件到 `~/.pi/agent/pi-order-patch-backup/`；写入采用临时文件 + 原子替换；每改一个文件都跑 `node --check` **语法门禁**，不过则**立即回滚**；「🩹 还原原版」可字节级完美还原（已验证 SHA256 一致） |
 | 已知边界 | Pi 升级（`npm i -g @earendil-works/pi-coding-agent`）会覆盖 `dist`，补丁需重打 —— 已开启自动维护时会自动重打；若未来 Pi 改写了排序实现导致锚点失配，补丁会**安全失败并明确报错**，不会破坏安装 |
+| 性能 | 扫描阶段用**字面量预筛 + 窗口内精确校验**（避开 4 MB 压缩包上的正则回溯）：冷扫描 **0.08 s**（优化前 4.6 s）；日常「保存 / 启动」只读 4 个目标文件 ≈ 0.1 s；仅在**真正需要重打补丁**时（如 Pi 刚升级）会有约 3~4 s 的正则替换开销，属一次性成本 |
 
 > 🛡️ 本补丁只涉及本地单机显示顺序，不修改任何鉴权、订阅或网络请求逻辑；随时可一键还原。
 >
-> 🔬 **自检脚本**：`python tests/verify_order_patch.py` —— 在临时沙箱中跑完「打补丁 → 幂等复打 → 模拟升级重打 → 比较器行为 → 回退字母序 → 字节级还原 → 工具自身门禁」全流程（68 项断言），绝不触碰真实安装目录。
+> 🔬 **自检脚本**：`python tests/verify_order_patch.py` —— 在临时沙箱中跑完「打补丁 → 幂等复打 → 模拟升级重打 → 比较器行为 → 回退字母序 → 字节级还原 → 工具自身门禁 → 性能门禁 → 弹窗显示完整性」全流程（94 项断言），绝不触碰真实安装目录。
 >
 > 🧪 **工具自身门禁（防“界面空白”）**：工具内嵌的 JS 一旦有语法问题（例如源码里的 `\n` 被 Python 三引号提前解释成真换行，导致整个 `<script>` 解析失败、界面停在静态初始态），浏览器**不会给出可见报错**，非常难查。现在启动前会做两重体检：`scan_tool_js_escapes()`（转义体检）+ `node --check`（语法门禁），失败则**弹窗明确报错**并写入 stderr，不再静默失效；报告【6】随时可查。（历史上出现过一次该故障：界面显示空厂商列表 + 状态栏停在「● 就绪」——若您见到这个组合，请关闭并重开工具，然后看报告【6】。）
 
@@ -218,7 +221,9 @@ Pi exposes **three different orderings**; the tool documents each one and ships 
 
 - **⭐ Pin Default (toggle in the model toolbar)**: hoists Pi's default model to the top of the list with an amber highlight and a `⭐` handle. It is **display-only and never mutates the saved order**; the pinned row is locked against drops while pinned (avoids index skew) and follows the model when you click `☆ Set default`.
 - **⇅ Pi Alphabetical (toggle on the provider panel header)**: switches the provider list to Pi's alphabetical view (provider dragging is locked and explained in a tooltip). Turn it off to get your own drag order back.
-- **🔍 Order Self-Check (button in the header actions)**: produces a six-section report — provider-grouping difference, whether each provider's internal model order is already persisted, the default model, the disabled-model inventory, the order-patch status and a **tool self-check (embedded-JS escape audit + `node --check` syntax gate)** — with `✅ / ⚠️` verdicts, ready to be screenshotted for your records.
+- **🔍 Order Self-Check (button in the header actions)**: produces a six-section report — provider-grouping difference, whether each provider's internal model order is already persisted, the default model, the disabled-model inventory, the order-patch status and a **tool self-check (embedded-JS escape audit + `node --check` syntax gate)** — with `✅ / ⚠️` verdicts, ready to be screenshotted for your records. The report dialog is **capped at 88vh with its own scrollable body** (monospace), puts the verdict summary right in the title (e.g. `厂商 6 个 / 模型 16 个；厂商内部顺序一致 6/6`), and offers **📋 Copy all** in the bottom-left corner.
+- **🪟 Long-message dialogs never clip again**: every long-text dialog (order self-check, patch status) now uses «container capped at `88vh` + `overflow-y:auto` + `min-height:0`», so content can no longer overflow the screen and hide the top, the bottom or the footer buttons.
+- **⚡ Startup performance**: the patch-target scan now uses a **literal pre-filter + small-window exact match** instead of running a backtracking regex across the whole 4 MB bundle — cold scan **4.6 s → 0.08 s** — and startup auto-maintenance collapsed from three API round-trips into one, bringing the whole startup chain to **≈0.3 s**.
 - **🧩 Order Patch (button in the header actions)**: makes **Pi follow the tool's provider order** — see section 8 below.
 - **Persisted preferences**: all display toggles live in `~/.pi/agent/model-manager-settings.json`, keeping `models.json` / `settings.json` untouched, and survive restarts of the tool.
 
@@ -238,10 +243,11 @@ By default Pi groups providers **alphabetically** by provider ID and ignores the
 | Auto-maintenance | Once enabled: ① every **💾 Save** in the tool re-syncs the order file and verifies the patch; ② tool startup detects a missing patch (e.g. wiped by `npm i -g`) and re-applies it. The status bar reports the outcome |
 | Safety | **Byte-level backup** of every file to `~/.pi/agent/pi-order-patch-backup/`; writes are atomic (temp file + replace); every modified file must pass a `node --check` **syntax gate** or it is **rolled back immediately**; «🩹 Restore original» reverts byte-identically (SHA256-verified) |
 | Known limits | Upgrading Pi (`npm i -g @earendil-works/pi-coding-agent`) overwrites `dist`, so the patch must be re-applied — auto-maintenance does this for you. If a future Pi rewrites its sorting code so the anchors no longer match, the patch **fails safely with a clear error** and never damages the installation |
+| Performance | The scan uses a **literal pre-filter + small-window exact match** (avoiding regex backtracking over the 4 MB bundle): cold scan **0.08 s** (down from 4.6 s). Day-to-day «save / startup» only reads the four target files (≈0.1 s). The ~3–4 s regex substitution cost is paid **only when a patch genuinely has to be applied** (e.g. right after a Pi upgrade) — a one-off |
 
 > 🛡️ The patch only affects local, single-machine display ordering. It modifies no authentication, subscription or network logic, and can be reverted at any time with one click.
 >
-> 🔬 **Self-test**: `python tests/verify_order_patch.py` — runs the whole «patch → idempotent re-patch → simulated upgrade re-patch → comparator behaviour → alphabetical fallback → byte-level restore → tool self-check» cycle (68 assertions) inside a throwaway sandbox; the real installation is never touched.
+> 🔬 **Self-test**: `python tests/verify_order_patch.py` — runs the whole «patch → idempotent re-patch → simulated upgrade re-patch → comparator behaviour → alphabetical fallback → byte-level restore → tool self-check → performance gate → dialog display integrity» cycle (94 assertions) inside a throwaway sandbox; the real installation is never touched.
 >
 > 🧪 **Tool self-check gate (never go blank again)**: a syntax problem in the tool's embedded JS (for example a JS `\n` in the Python triple-quoted HTML string being turned into a real newline, which breaks the whole `<script>` block and freezes the UI in its static initial state) produces **no visible browser error**, making it very hard to diagnose. Startup now runs two audits — `scan_tool_js_escapes()` (escape audit) plus a `node --check` syntax gate — and **raises an explicit popup** (and writes to stderr) on failure instead of failing silently; report section 【6】 exposes the same verdicts at any time. (This failure mode did occur once: an empty provider list with the status bar still showing the initial «● 就绪» — if you see that combination, close and reopen the tool, then check report 【6】.)
 
