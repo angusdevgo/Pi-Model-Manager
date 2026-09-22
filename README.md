@@ -75,7 +75,7 @@ Pi 侧一共存在 **三种顺序**，本工具把每一种都讲清楚并提供
 
 - **⭐ 默认置顶（模型列表右上角开关）**：把 Pi 默认模型在列表中置顶显示，并打上琥珀色高亮与 `⭐` 手柄，**仅改变显示层，绝不改动保存顺序**（该行在置顶期间禁止拖放，避免下标错位）；点击右侧 `☆ 设默认` 切换默认模型后置顶会自动跟随。
 - **⇅ Pi 字母序（服务商标题栏开关）**：一键把左侧厂商列切换成 Pi 的字母序视图（此时厂商拖拽会被锁定并提示），让两边观感完全一致；关闭后恢复您的自定义拖拽顺序。
-- **🔍 顺序自检（顶部操作栏按钮）**：一键生成五节式核对报告 —— 厂商分组顺序差异、每个厂商内部的模型顺序是否已落盘、默认模型、禁用模型清单、Pi 排序补丁状态，并给出 `✅ / ⚠️` 结论，方便直接截图留档。
+- **🔍 顺序自检（顶部操作栏按钮）**：一键生成六节式核对报告 —— 厂商分组顺序差异、每个厂商内部的模型顺序是否已落盘、默认模型、禁用模型清单、Pi 排序补丁状态、**工具自身体检（内嵌 JS 转义 + `node --check` 语法门禁）**，并给出 `✅ / ⚠️` 结论，方便直接截图留档。
 - **🧩 顺序补丁（顶部操作栏按钮）**：让 **Pi 跟随工具的厂商顺序**，见下方第 8 节。
 - **开关持久化**：以上两个显示开关保存在 `~/.pi/agent/model-manager-settings.json`，不污染 `models.json` / `settings.json`，重启工具后保持选择。
 
@@ -98,7 +98,9 @@ Pi 侧一共存在 **三种顺序**，本工具把每一种都讲清楚并提供
 
 > 🛡️ 本补丁只涉及本地单机显示顺序，不修改任何鉴权、订阅或网络请求逻辑；随时可一键还原。
 >
-> 🔬 **自检脚本**：`python tests/verify_order_patch.py` —— 在临时沙箱中跑完「打补丁 → 幂等复打 → 模拟升级重打 → 比较器行为 → 回退字母序 → 字节级还原」全流程（58 项断言），绝不触碰真实安装目录。
+> 🔬 **自检脚本**：`python tests/verify_order_patch.py` —— 在临时沙箱中跑完「打补丁 → 幂等复打 → 模拟升级重打 → 比较器行为 → 回退字母序 → 字节级还原 → 工具自身门禁」全流程（68 项断言），绝不触碰真实安装目录。
+>
+> 🧪 **工具自身门禁（防“界面空白”）**：工具内嵌的 JS 一旦有语法问题（例如源码里的 `\n` 被 Python 三引号提前解释成真换行，导致整个 `<script>` 解析失败、界面停在静态初始态），浏览器**不会给出可见报错**，非常难查。现在启动前会做两重体检：`scan_tool_js_escapes()`（转义体检）+ `node --check`（语法门禁），失败则**弹窗明确报错**并写入 stderr，不再静默失效；报告【6】随时可查。（历史上出现过一次该故障：界面显示空厂商列表 + 状态栏停在「● 就绪」——若您见到这个组合，请关闭并重开工具，然后看报告【6】。）
 
 ---
 
@@ -118,6 +120,7 @@ pip install pywebview
   # 或者带控制台调试输出：
   python desktop_app.py
   ```
+* **自检提示**：若启动时弹出「Pi Model Manager 自检警告」，说明工具源码里内嵌的 JS 有语法问题（详见 §7 / §8 的自身门禁），弹窗会直接给出行号；控制台启动（`python desktop_app.py`）可在 stderr 同步看到。
 
 ---
 
@@ -215,7 +218,7 @@ Pi exposes **three different orderings**; the tool documents each one and ships 
 
 - **⭐ Pin Default (toggle in the model toolbar)**: hoists Pi's default model to the top of the list with an amber highlight and a `⭐` handle. It is **display-only and never mutates the saved order**; the pinned row is locked against drops while pinned (avoids index skew) and follows the model when you click `☆ Set default`.
 - **⇅ Pi Alphabetical (toggle on the provider panel header)**: switches the provider list to Pi's alphabetical view (provider dragging is locked and explained in a tooltip). Turn it off to get your own drag order back.
-- **🔍 Order Self-Check (button in the header actions)**: produces a five-section report — provider-grouping difference, whether each provider's internal model order is already persisted, the default model, the disabled-model inventory and the order-patch status — with `✅ / ⚠️` verdicts, ready to be screenshotted for your records.
+- **🔍 Order Self-Check (button in the header actions)**: produces a six-section report — provider-grouping difference, whether each provider's internal model order is already persisted, the default model, the disabled-model inventory, the order-patch status and a **tool self-check (embedded-JS escape audit + `node --check` syntax gate)** — with `✅ / ⚠️` verdicts, ready to be screenshotted for your records.
 - **🧩 Order Patch (button in the header actions)**: makes **Pi follow the tool's provider order** — see section 8 below.
 - **Persisted preferences**: all display toggles live in `~/.pi/agent/model-manager-settings.json`, keeping `models.json` / `settings.json` untouched, and survive restarts of the tool.
 
@@ -238,7 +241,9 @@ By default Pi groups providers **alphabetically** by provider ID and ignores the
 
 > 🛡️ The patch only affects local, single-machine display ordering. It modifies no authentication, subscription or network logic, and can be reverted at any time with one click.
 >
-> 🔬 **Self-test**: `python tests/verify_order_patch.py` — runs the whole «patch → idempotent re-patch → simulated upgrade re-patch → comparator behaviour → alphabetical fallback → byte-level restore» cycle (58 assertions) inside a throwaway sandbox; the real installation is never touched.
+> 🔬 **Self-test**: `python tests/verify_order_patch.py` — runs the whole «patch → idempotent re-patch → simulated upgrade re-patch → comparator behaviour → alphabetical fallback → byte-level restore → tool self-check» cycle (68 assertions) inside a throwaway sandbox; the real installation is never touched.
+>
+> 🧪 **Tool self-check gate (never go blank again)**: a syntax problem in the tool's embedded JS (for example a JS `\n` in the Python triple-quoted HTML string being turned into a real newline, which breaks the whole `<script>` block and freezes the UI in its static initial state) produces **no visible browser error**, making it very hard to diagnose. Startup now runs two audits — `scan_tool_js_escapes()` (escape audit) plus a `node --check` syntax gate — and **raises an explicit popup** (and writes to stderr) on failure instead of failing silently; report section 【6】 exposes the same verdicts at any time. (This failure mode did occur once: an empty provider list with the status bar still showing the initial «● 就绪» — if you see that combination, close and reopen the tool, then check report 【6】.)
 
 ---
 
@@ -258,6 +263,7 @@ pip install pywebview
   # Or with console logging:
   python desktop_app.py
   ```
+* **Self-check notice**: if a «Pi Model Manager 自检警告» popup appears at launch, the tool's embedded JS has a syntax problem (see the self-check gate in sections 7 / 8). The popup reports the offending line; launching with `python desktop_app.py` mirrors it on stderr.
 
 ---
 

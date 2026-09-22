@@ -301,6 +301,25 @@ def build_order_report(path_value=None):
         lines.append(f"  · 备份目录: {pst.get('backupDir')}")
     lines.append("")
 
+    lines.append("【6】工具自身体检（内嵌 JS 语法 / 转义隐患）")
+    try:
+        _bad = scan_tool_js_escapes()
+        _ok, _msg = verify_tool_html_js()
+    except Exception as _e:
+        _bad, _ok, _msg = [], True, "自检异常（已跳过）: %s" % _e
+    if _bad:
+        lines.append("  ⚠️  源码中有 %d 处会被 Python 提前解释的转义（应写成双反斜杠）" % len(_bad))
+        for _ln, _esc, _txt in _bad[:5]:
+            lines.append("       第 %d 行 %s | %s" % (_ln, _esc, _txt))
+    else:
+        lines.append("  · 转义体检（HTML_CONTENT 源码区域）: ✅ 无隐患")
+    if _ok:
+        lines.append("  · 内嵌 JS 语法 node --check: ✅ 通过")
+    else:
+        lines.append("  · 内嵌 JS 语法 node --check: ❌ 失败 —— 界面会停在静态初始态（状态栏仍是初始文字）")
+        lines.append("       " + str(_msg).replace("\n", " ")[:300])
+    lines.append("")
+
     lines.append("── 结论 ──")
     lines.append(f"  厂商 {len(tool_order)} 个 / 模型 {total_models} 个；厂商内部顺序一致 {ok_providers}/{len(tool_order)}")
     if mismatch_providers:
@@ -3582,7 +3601,7 @@ function buildPatchStatusText(st) {
   lines.push('── 说明 ──');
   lines.push('· 补丁可随时一键还原（还原后 Pi 恢复原生字母序，工具侧“⇅ Pi 字母序”与之对应）。');
   lines.push('· Pi 通过 npm 升级会覆盖 dist 目录，但自动维护会在工具保存时或启动时重新打入。');
-  return lines.join('\n');
+  return lines.join('\\n');
 }
 
 async function showPiOrderPatchDialog() {
@@ -3621,13 +3640,13 @@ async function showPiOrderPatchDialog() {
           uiPrefs.patchPiOrder = false;
           setStatus('已还原 Pi 原版排序逻辑（工具自动维护已关闭）', '#10B981');
           await showAlert({ title: '已还原原版', icon: '🩹', type: 'success', wide: true,
-            message: '已还原 ' + (((rr.reverted) || []).length) + ' 个文件，Pi 恢复原生字母序分组。\n\n' +
-              '· 原版备份仍保留在: ' + ((r.status && r.status.backupDir) || '') + '\n' +
+            message: '已还原 ' + (((rr.reverted) || []).length) + ' 个文件，Pi 恢复原生字母序分组。\\n\\n' +
+              '· 原版备份仍保留在: ' + ((r.status && r.status.backupDir) || '') + '\\n' +
               '· 随时可再次点「🧩 顺序补丁」重新打入' });
         } else {
           setStatus('还原失败: ' + ((r && r.error) || '未知错误'), '#EF4444');
           await showAlert({ title: '还原失败', icon: '❌', type: 'error', wide: true,
-            message: ((r && r.error) || '未知错误') + '\n\n' + JSON.stringify(rr.failed || [], null, 2) });
+            message: ((r && r.error) || '未知错误') + '\\n\\n' + JSON.stringify(rr.failed || [], null, 2) });
         }
       } catch (e) {
         setStatus('还原异常: ' + e, '#EF4444');
@@ -3645,15 +3664,15 @@ async function showPiOrderPatchDialog() {
       uiPrefs.patchPiOrder = true;
       setStatus('✅ Pi 排序补丁已生效（已开启自动维护）', '#10B981');
       await showAlert({ title: '补丁已生效', icon: '✅', type: 'success', wide: true,
-        message: '✅ 已给 Pi 打入顺序补丁，并开启自动维护。\n\n' +
-          '· 已打文件: ' + (((rr.applied) || []).length) + ' 个（跳过已打 ' + (((rr.skipped) || []).length) + ' 个）\n' +
-          '· 替换锚点: ' + (rr.replacements || 0) + ' 处\n' +
-          '· 厂商顺序: ' + (((rr.order) || []).join(' → ') || '（空）') + '\n\n' +
+        message: '✅ 已给 Pi 打入顺序补丁，并开启自动维护。\\n\\n' +
+          '· 已打文件: ' + (((rr.applied) || []).length) + ' 个（跳过已打 ' + (((rr.skipped) || []).length) + ' 个）\\n' +
+          '· 替换锚点: ' + (rr.replacements || 0) + ' 处\\n' +
+          '· 厂商顺序: ' + (((rr.order) || []).join(' → ') || '（空）') + '\\n\\n' +
           '生效方式：重启 Pi（或重开 /model 选择器）后，Pi 的厂商分组顺序即为工具里的顺序。' });
     } else {
       setStatus('补丁失败: ' + ((r && r.error) || '未知错误'), '#EF4444');
       await showAlert({ title: '补丁未生效', icon: '❌', type: 'error', wide: true,
-        message: ((r && r.error) || '未知错误') + '\n\n失败明细:\n' + JSON.stringify(rr.failed || [], null, 2) });
+        message: ((r && r.error) || '未知错误') + '\\n\\n失败明细:\\n' + JSON.stringify(rr.failed || [], null, 2) });
     }
   } catch (e) {
     setStatus('补丁异常: ' + e, '#EF4444');
@@ -3909,7 +3928,7 @@ async function deleteProvider(pid) {
 
   if (p._isBuiltin) {
     // 内置厂商的模型目录由 Pi 自身提供，工具无法删除或隐藏它
-    showAlert('无法删除', `[${pid}] 是 Pi 原生内置服务商，其模型目录由 Pi 自身提供，无法从工具中删除或隐藏。\n\n如需调整连接参数，请在右侧抽屉中编辑。`);
+    showAlert('无法删除', `[${pid}] 是 Pi 原生内置服务商，其模型目录由 Pi 自身提供，无法从工具中删除或隐藏。\\n\\n如需调整连接参数，请在右侧抽屉中编辑。`);
     return;
   }
 
@@ -5357,9 +5376,9 @@ async function loadData() {
       if (p && p.status && p.status.action === 'patched') {
         setStatus('🧩 Pi 顺序补丁已自动重打（Pi 版本变化或补丁缺失）', '#10B981');
         await showAlert({ title: 'Pi 顺序补丁已自动重打', icon: '🧩', type: 'success', wide: true,
-          message: '检测到需要重打补丁，已自动完成：\n\n' +
-            '· Pi 版本: ' + (st.piVersion || '未知') + '\n' +
-            '· 补丁文件: ' + (st.patchedCount || 0) + '/' + (st.targetCount || 0) + '\n' +
+          message: '检测到需要重打补丁，已自动完成：\\n\\n' +
+            '· Pi 版本: ' + (st.piVersion || '未知') + '\\n' +
+            '· 补丁文件: ' + (st.patchedCount || 0) + '/' + (st.targetCount || 0) + '\\n' +
             '· 厂商顺序: ' + (((st.order) || []).join(' → ') || '（空）') });
       } else if (p && p.status && p.status.action === 'patch-failed') {
         setStatus('⚠️ Pi 顺序补丁自动重打失败: ' + (st.error || '未知错误') + '（点 🧩 顺序补丁 查看）', '#EF4444');
@@ -5496,7 +5515,95 @@ window.addEventListener('pywebviewready', () => {
 </html>
 """
 
+def scan_tool_js_escapes(src_path=None):
+    """体检：扫描 ``HTML_CONTENT`` **源码区域**中被 Python 提前解释掉的单反斜杠转义。
+
+    背景：``HTML_CONTENT`` 是普通（非 raw）三引号字符串，源码里 JS 的 ``'\\n'``
+    （单反斜杠）会被 Python 先变成真换行 → 单引号字符串未闭合 → 整个 <script>
+    解析失败（界面停在静态初始态、状态栏仍是初始文字，且浏览器不报可见错误）。
+
+    注意：必须扫**源码文本**而不是运行时字符串 —— 运行时字符串里出现单反斜杠 n
+    正是我们想要的结果（合法 JS 转义）。
+    返回 [(源码行号, 转义, 片段), ...]。
+    """
+    try:
+        raw = Path(src_path or __file__).read_text(encoding="utf-8")
+    except Exception:
+        return []
+    m = re.search(r'HTML_CONTENT\s*=\s*"""(.*?)"""', raw, re.S)
+    if not m:
+        return []
+    region = m.group(1)
+    base = raw[: m.start(1)].count("\n") + 1
+    pat = re.compile(r"(?<!\\)\\[ntrfv0abxsNuU]")
+    bad = []
+    for i, line in enumerate(region.split("\n")):
+        mm = pat.search(line)
+        if mm:
+            bad.append((base + i, mm.group(0), line.strip()[:120]))
+    return bad
+
+
+def verify_tool_html_js():
+    """工具自身内嵌 JS 的语法门禁（node --check）。返回 (ok, msg)。
+
+    无 node 时跳过（返回 True），不阻塞启动。
+    """
+    try:
+        m = re.search(r"<script>(.*?)</script>", HTML_CONTENT, re.S)
+    except Exception as e:
+        return True, "自检异常（已跳过）: %s" % e
+    if not m:
+        return True, "未找到内嵌脚本块"
+    tmp = Path(os.environ.get("TEMP", ".")) / "_pi_model_manager_selfcheck.js"
+    try:
+        _atomic_write_text(tmp, m.group(1))
+        ok, msg = verify_js_syntax(tmp)
+        if not ok:
+            # 把 node 的行号换算回 HTML 内容行号（脚本块起始行 + 相对行号）
+            offset = HTML_CONTENT[:m.start(1)].count("\n")
+            rel = 0
+            mm = re.search(r"(\d+)", msg or "")
+            if mm:
+                rel = int(mm.group(1))
+            prefix = "（HTML 内容第 %d 行附近；JS 第 %d 行）" % (offset + rel, rel)
+            return False, prefix + " " + msg
+        return True, ""
+    except Exception as e:
+        return True, "自检异常（已跳过）: %s" % e
+    finally:
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+
+
 def main():
+    # 启动前自检：内嵌 JS 一旦被 Python 提前转义（如 '\n' 变成真换行），
+    # 整个脚本会解析失败 → 界面停在静态态。这里主动报错，不再静默失效。
+    try:
+        bad_esc = scan_tool_js_escapes()
+        ok_js, msg_js = verify_tool_html_js()
+    except Exception:
+        bad_esc, ok_js, msg_js = [], True, ""
+    if bad_esc or not ok_js:
+        detail = ""
+        if bad_esc:
+            detail += "\n\n源码中有 %d 处会被 Python 提前解释的转义（应写成双反斜杠）：\n" % len(bad_esc)
+            detail += "\n".join("  第 %d 行 %s | %s" % (ln, esc, txt) for ln, esc, txt in bad_esc[:8])
+        if not ok_js:
+            detail += "\n\nnode --check 结果：\n" + (msg_js or "")
+        msg = "⚠️ 工具内嵌 JS 自检失败，界面可能停在静态初始态。\n" + detail
+        try:
+            print(msg, file=sys.stderr, flush=True)
+        except Exception:
+            pass
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(0, msg, "Pi Model Manager 自检警告", 0x30)
+        except Exception:
+            pass
+
     api = ApiBridge()
     window = webview.create_window(
         title="模型配置",
@@ -5511,6 +5618,7 @@ def main():
     )
     api.set_window(window)
     webview.start()
+
 
 if __name__ == "__main__":
     main()

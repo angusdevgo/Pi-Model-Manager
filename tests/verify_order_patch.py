@@ -152,5 +152,22 @@ api = D.ApiBridge()
 for name in ["get_order_patch_status", "apply_order_patch", "revert_order_patch", "ensure_order_patch"]:
     chk("ApiBridge." + name, callable(getattr(api, name, None)))
 
+print("\n[8] 工具自身门禁（内嵌 JS 语法 / 源码转义隐患）")
+BS = chr(92)
+esc = D.scan_tool_js_escapes()
+chk("HTML_CONTENT 源码无被 Python 提前解释的转义", esc == [], esc[:2])
+js_ok, js_msg = D.verify_tool_html_js()
+chk("内嵌 JS node --check 通过", bool(js_ok), (js_msg or "")[:160])
+blk = re.search(r"<script>(.*?)</script>", D.HTML_CONTENT, re.S)
+chk("内嵌脚本块存在", bool(blk))
+for fn in ["showPiOrderPatchDialog", "buildPatchStatusText", "updateOrderPatchBtn",
+           "loadData", "renderSidebar", "selectProvider"]:
+    chk("脚本含 " + fn, bool(blk) and fn in blk.group(1))
+fake = SB / "fake_dapp.py"
+raw_src = (REPO / "desktop_app.py").read_text(encoding="utf-8")
+fake.write_text(raw_src.replace("lines.join('" + BS + BS + "n')", "lines.join('" + BS + "n')", 1),
+                encoding="utf-8")
+chk("隐患检出能力（模拟被破坏的源码）", len(D.scan_tool_js_escapes(fake)) == 1)
+
 print("\n==== 结果: %d/%d 全部通过 ====" % (sum(ok), len(ok)))
 sys.exit(0 if all(ok) else 1)
