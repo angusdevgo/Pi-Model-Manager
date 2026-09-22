@@ -74,21 +74,109 @@ function readModelsFile(): { providers: Record<string, ProviderConfig> } {
   return { providers };
 }
 
+function inferModelSpecs(mid: string, model: Record<string, unknown>): { contextWindow: number; maxTokens: number; input: string[]; reasoning: boolean } {
+  const target = mid.toLowerCase();
+  let isVision = false;
+  if (/gemini|claude|gpt-4o|chatgpt-4o|\bo[13]\b|vl|vision|omni|4v|visual|mimo/.test(target)) {
+    isVision = true;
+  }
+  if (Array.isArray(model.input) && model.input.includes("image")) {
+    isVision = true;
+  }
+
+  let isReasoning = false;
+  if (/r1|reasoner|thinking|thought|qwq|zero|deepseek-v4|mimo/.test(target)) {
+    isReasoning = true;
+  } else if (/claude-3-7|claude-3\.7|\bo[13](-mini|-preview)?\b|flash-thinking|gemini-2\.5|gemini-3/.test(target)) {
+    isReasoning = true;
+  } else if (model.reasoning !== undefined) {
+    isReasoning = Boolean(model.reasoning);
+  }
+
+  let contextWindow = 128000;
+  let maxTokens = 16384;
+
+  if (target.includes("gemini")) {
+    contextWindow = target.includes("pro") && (target.includes("1.5") || target.includes("2.0") || target.includes("2.5")) ? 2000000 : 1048576;
+    maxTokens = 65536;
+    isVision = true;
+  } else if (target.includes("claude")) {
+    contextWindow = 200000;
+    maxTokens = /3-7|3\.7|3-5-sonnet|3\.5-sonnet|sonnet-4/.test(target) ? 64000 : 8192;
+    isVision = true;
+  } else if (target.includes("mimo")) {
+    contextWindow = 1048576;
+    maxTokens = 131072;
+    isVision = true;
+    isReasoning = true;
+  } else if (target.includes("deepseek")) {
+    if (target.includes("v4")) {
+      contextWindow = 1000000;
+      maxTokens = 384000;
+      isVision = true;
+      isReasoning = true;
+    } else if (/r1|reasoner/.test(target)) {
+      contextWindow = 128000;
+      maxTokens = 65536;
+      isReasoning = true;
+    } else {
+      contextWindow = 128000;
+      maxTokens = 8192;
+    }
+  } else if (/\bo[13]\b/.test(target)) {
+    contextWindow = 200000;
+    maxTokens = 100000;
+    isVision = true;
+    isReasoning = true;
+  } else if (/gpt-4o|chatgpt-4o|gpt-4\.5/.test(target)) {
+    contextWindow = 128000;
+    maxTokens = 16384;
+    isVision = true;
+  } else if (target.includes("qwen")) {
+    contextWindow = /plus|max|1m/.test(target) ? 1000000 : 128000;
+    maxTokens = 8192;
+    if (/vl|omni|audio/.test(target)) isVision = true;
+  } else if (target.includes("minimax") || target.includes("abab")) {
+    contextWindow = 245760;
+    maxTokens = 8192;
+  } else if (target.includes("hy4") || target.includes("hunyuan")) {
+    contextWindow = 256000;
+    maxTokens = 16384;
+  }
+
+  if (/1m|1000k|1024k/.test(target)) contextWindow = 1048576;
+  else if (/2m|2000k/.test(target)) contextWindow = 2000000;
+  else if (/256k/.test(target)) contextWindow = 256000;
+  else if (/200k/.test(target)) contextWindow = 200000;
+  else if (/128k/.test(target)) contextWindow = 128000;
+
+  if (typeof model.contextWindow === "number" && model.contextWindow > 0) contextWindow = model.contextWindow;
+  if (typeof model.maxTokens === "number" && model.maxTokens > 0) maxTokens = model.maxTokens;
+
+  return {
+    contextWindow,
+    maxTokens,
+    input: isVision ? ["text", "image"] : ["text"],
+    reasoning: isReasoning,
+  };
+}
+
 function normalizeModel(model: Record<string, unknown>, provider: ProviderConfig) {
   const id = String(model.id || "").trim();
   if (!id) return null;
   const name = typeof model.name === "string" && model.name.trim() ? model.name.trim() : id;
-  const input = Array.isArray(model.input) && model.input.length ? model.input : ["text"];
+  const inferred = inferModelSpecs(id, model);
+  const input = Array.isArray(model.input) && model.input.length ? model.input : inferred.input;
   return {
     ...model,
     id,
     name,
     api: (typeof model.api === "string" && model.api) || provider.api || "openai-completions",
-    reasoning: model.reasoning ?? false,
+    reasoning: model.reasoning !== undefined ? Boolean(model.reasoning) : inferred.reasoning,
     input,
     cost: model.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: model.contextWindow ?? 128000,
-    maxTokens: model.maxTokens ?? 16384,
+    contextWindow: model.contextWindow ?? inferred.contextWindow,
+    maxTokens: model.maxTokens ?? inferred.maxTokens,
   };
 }
 

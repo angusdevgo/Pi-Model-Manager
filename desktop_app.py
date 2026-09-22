@@ -1436,6 +1436,10 @@ def clean_pi_config(cfg):
     if not isinstance(providers, dict):
         cfg["providers"] = {}
         return cfg
+    try:
+        catalog = load_builtin_catalog()
+    except Exception:
+        catalog = {}
     for pid, provider in list(providers.items()):
         if not isinstance(provider, dict):
             continue
@@ -1522,6 +1526,19 @@ def clean_pi_config(cfg):
 
                 model.pop("_failStreak", None)
                 model.pop("_lastError", None)
+
+                # 自动推断并静默补齐能力元数据 (contextWindow / maxTokens / input / reasoning)
+                if not model.get("contextWindow") or not model.get("input") or not model.get("maxTokens"):
+                    specs = infer_model_specs(model_id, model, catalog)
+                    if not model.get("contextWindow"):
+                        model["contextWindow"] = specs["contextWindow"]
+                    if not model.get("maxTokens"):
+                        model["maxTokens"] = specs["maxTokens"]
+                    if not model.get("input"):
+                        model["input"] = specs["input"]
+                    if "reasoning" not in model and specs.get("reasoning"):
+                        model["reasoning"] = specs["reasoning"]
+
                 cleaned.append(model)
             provider["models"] = cleaned
     return cfg
@@ -1620,6 +1637,19 @@ def build_pi_disk_config(cfg):
                     entry_out["api"] = provider_api
                 if not entry_out.get("baseUrl") and provider_base and "baseUrl" not in out:
                     entry_out["baseUrl"] = provider_base
+
+                # 确保自建模型写盘时具备完整的上下文与多模态定义
+                if not entry_out.get("contextWindow") or not entry_out.get("input") or not entry_out.get("maxTokens"):
+                    specs = infer_model_specs(mid, entry_out, catalog)
+                    if not entry_out.get("contextWindow"):
+                        entry_out["contextWindow"] = specs["contextWindow"]
+                    if not entry_out.get("maxTokens"):
+                        entry_out["maxTokens"] = specs["maxTokens"]
+                    if not entry_out.get("input"):
+                        entry_out["input"] = specs["input"]
+                    if "reasoning" not in entry_out and specs.get("reasoning"):
+                        entry_out["reasoning"] = specs["reasoning"]
+
                 out_models.append(entry_out)
                 continue
 
@@ -1632,6 +1662,15 @@ def build_pi_disk_config(cfg):
             for key in ("api", "baseUrl", "reasoning", "contextWindow", "maxTokens", "input", "cost", "compat", "thinkingLevelMap", "samplingParams"):
                 if key in model and model.get(key) is not None:
                     base[key] = model[key]
+
+            # 内置模型若在 catalog 中缺少必要字段，同样兜底补齐
+            if not base.get("contextWindow") or not base.get("input") or not base.get("maxTokens"):
+                specs = infer_model_specs(mid, base, catalog)
+                if not base.get("contextWindow"): base["contextWindow"] = specs["contextWindow"]
+                if not base.get("maxTokens"): base["maxTokens"] = specs["maxTokens"]
+                if not base.get("input"): base["input"] = specs["input"]
+                if "reasoning" not in base and specs.get("reasoning"): base["reasoning"] = specs["reasoning"]
+
             out_models.append(base)
 
             original_headers = catalog_models.get(mid, {}).get("headers") or {}
@@ -1941,6 +1980,162 @@ def export_all_providers_txt(config, config_path):
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 
+def infer_model_specs(mid, raw_item=None, catalog=None):
+    """根据模型 ID、上游原始数据与内置目录智能推断 contextWindow, maxTokens, input, reasoning。"""
+    raw_item = raw_item if isinstance(raw_item, dict) else {}
+    if catalog is None:
+        try:
+            catalog = load_builtin_catalog()
+        except Exception:
+            catalog = {}
+
+    clean_id = re.sub(r'^(cn:|global:|[a-zA-Z0-9_\-\.]+/)', '', str(mid or '')).lower().strip()
+    full_id = str(mid or '').lower().strip()
+
+    # 1. 尝试从 Pi 内置 catalog 匹配继承
+    if catalog:
+        for pid, pdata in catalog.items():
+            for m in pdata.get("models", []):
+                m_id = str(m.get("id") or "").lower().strip()
+                if m_id and (m_id == clean_id or m_id == full_id or clean_id.endswith(m_id)):
+                    specs = {}
+                    if m.get("contextWindow"): specs["contextWindow"] = int(m["contextWindow"])
+                    if m.get("maxTokens"): specs["maxTokens"] = int(m["maxTokens"])
+                    if m.get("input"): specs["input"] = list(m["input"])
+                    if "reasoning" in m: specs["reasoning"] = bool(m["reasoning"])
+                    if len(specs) >= 3:
+                        return {
+                            "contextWindow": specs.get("contextWindow", 128000),
+                            "maxTokens": specs.get("maxTokens", 16384),
+                            "input": specs.get("input", ["text", "image"]),
+                            "reasoning": specs.get("reasoning", False)
+                        }
+
+    # 2. 从 raw_item 尝试提取上游真实参数
+    cw = raw_item.get("context_length") or raw_item.get("context_window") or raw_item.get("max_context_tokens") or raw_item.get("contextWindow")
+    mt = raw_item.get("max_tokens") or raw_item.get("max_output_tokens") or raw_item.get("maxTokens")
+    inp = raw_item.get("input")
+    reasoning = raw_item.get("reasoning")
+
+    target = clean_id or full_id
+
+    # 视觉多模态判断
+    is_vision = False
+    if any(k in target for k in ["gemini", "claude", "gpt-4o", "chatgpt-4o", "o1", "o3", "vl", "vision", "omni", "4v", "visual", "mimo"]):
+        is_vision = True
+    elif inp and "image" in inp:
+        is_vision = True
+    elif any(raw_item.get(k) for k in ["multimodal", "is_multimodal"]):
+        is_vision = True
+
+    # 推理思考判断
+    is_reasoning = False
+    if any(k in target for k in ["r1", "reasoner", "thinking", "thought", "qwq", "zero", "deepseek-v4", "mimo"]):
+        is_reasoning = True
+    elif "claude-3-7" in target or "claude-3.7" in target:
+        is_reasoning = True
+    elif re.search(r'\bo[13](-mini|-preview)?\b', target):
+        is_reasoning = True
+    elif "flash-thinking" in target or "gemini-2.5" in target or "gemini-3" in target:
+        is_reasoning = True
+    elif reasoning is not None:
+        is_reasoning = bool(reasoning)
+
+    # 上下文窗口与最大输出推断
+    context_window = None
+    max_tokens = None
+
+    if "gemini" in target:
+        context_window = 2000000 if ("pro" in target and any(v in target for v in ["1.5", "2.0", "2.5"])) else 1048576
+        max_tokens = 65536
+        is_vision = True
+    elif "claude" in target:
+        context_window = 200000
+        max_tokens = 64000 if any(k in target for k in ["3-7", "3.7", "3-5-sonnet", "3.5-sonnet", "sonnet-4"]) else 8192
+        is_vision = True
+    elif "mimo" in target:
+        context_window = 1048576
+        max_tokens = 131072
+        is_vision = True
+        is_reasoning = True
+    elif "deepseek" in target:
+        if "v4" in target:
+            context_window = 1000000
+            max_tokens = 384000
+            is_reasoning = True
+            is_vision = True
+        elif any(k in target for k in ["r1", "reasoner"]):
+            context_window = 128000
+            max_tokens = 65536
+            is_reasoning = True
+        else:
+            context_window = 128000
+            max_tokens = 8192
+    elif re.search(r'\bo[13]\b', target):
+        context_window = 200000
+        max_tokens = 100000
+        is_reasoning = True
+        is_vision = True
+    elif "gpt-4o" in target or "chatgpt-4o" in target or "gpt-4.5" in target:
+        context_window = 128000
+        max_tokens = 16384
+        is_vision = True
+    elif "qwen" in target:
+        context_window = 1000000 if any(k in target for k in ["plus", "max", "1m"]) else 128000
+        max_tokens = 8192
+        if any(k in target for k in ["vl", "omni", "audio"]):
+            is_vision = True
+    elif "glm" in target:
+        context_window = 128000
+        max_tokens = 8192
+        if any(k in target for k in ["4v", "v", "vl"]):
+            is_vision = True
+    elif "kimi" in target or "moonshot" in target:
+        context_window = 128000
+        max_tokens = 8192
+        if any(k in target for k in ["vl", "vision"]):
+            is_vision = True
+    elif "minimax" in target or "abab" in target:
+        context_window = 245760
+        max_tokens = 8192
+    elif "hy4" in target or "hunyuan" in target:
+        context_window = 256000
+        max_tokens = 16384
+
+    # 关键词显式长度匹配
+    if "1m" in target or "1000k" in target or "1024k" in target:
+        context_window = 1048576
+    elif "2m" in target or "2000k" in target:
+        context_window = 2000000
+    elif "256k" in target:
+        context_window = 256000
+    elif "200k" in target:
+        context_window = 200000
+    elif "128k" in target:
+        context_window = 128000
+    elif "64k" in target:
+        context_window = 64000
+    elif "32k" in target:
+        context_window = 32000
+
+    # 优先采用 raw_item 提供的合法数值
+    if isinstance(cw, (int, float)) and cw >= 4096:
+        context_window = int(cw)
+    if isinstance(mt, (int, float)) and mt >= 512:
+        max_tokens = int(mt)
+
+    final_cw = int(context_window or 128000)
+    final_mt = int(max_tokens or 16384)
+    final_input = ["text", "image"] if is_vision else ["text"]
+    final_reasoning = bool(is_reasoning)
+
+    return {
+        "contextWindow": final_cw,
+        "maxTokens": final_mt,
+        "input": final_input,
+        "reasoning": final_reasoning
+    }
+
 def fetch_models(base_url, api_key):
     url = base_url.rstrip("/")
     if url.endswith("/v1"):
@@ -1971,12 +2166,27 @@ def fetch_models(base_url, api_key):
     elif isinstance(body, list):
         items = body
     
+    catalog = load_builtin_catalog()
     models = []
     for it in items:
-        mid = it.get("id") or it.get("name")
+        if not isinstance(it, dict):
+            mid = str(it)
+            raw = {}
+        else:
+            mid = it.get("id") or it.get("name")
+            raw = it
         if mid:
-            name = it.get("name") or mid
-            models.append({"id": str(mid), "name": str(name)})
+            mid_str = str(mid)
+            name = raw.get("name") or mid_str
+            specs = infer_model_specs(mid_str, raw, catalog)
+            models.append({
+                "id": mid_str,
+                "name": str(name),
+                "contextWindow": specs["contextWindow"],
+                "maxTokens": specs["maxTokens"],
+                "input": specs["input"],
+                "reasoning": specs["reasoning"]
+            })
     return sorted(models, key=lambda x: x["id"])
 
 def test_model(base_url, api_key, api_type, model_id, custom_headers=None):
@@ -2130,6 +2340,13 @@ class ApiBridge:
         try:
             models = fetch_models(base_url, api_key)
             return {"success": True, "models": models}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def infer_specs(self, model_id):
+        try:
+            specs = infer_model_specs(model_id, catalog=load_builtin_catalog())
+            return {"success": True, "specs": specs}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -2827,6 +3044,37 @@ HTML_CONTENT = """<!DOCTYPE html>
     border-radius: 2px;
     border: 1px solid var(--b-line);
     line-height: 1.4;
+  }
+
+  .model-meta-badges {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: 6px;
+    flex-shrink: 0;
+  }
+  .meta-badge {
+    font-size: 10px;
+    font-family: var(--b-mono);
+    padding: 1px 4px;
+    border-radius: 2px;
+    line-height: 1.2;
+    white-space: nowrap;
+  }
+  .meta-badge.badge-ctx {
+    background: rgba(59, 130, 246, 0.12);
+    color: #93C5FD;
+    border: 1px solid rgba(59, 130, 246, 0.25);
+  }
+  .meta-badge.badge-img {
+    background: rgba(16, 185, 129, 0.12);
+    color: #6EE7B7;
+    border: 1px solid rgba(16, 185, 129, 0.25);
+  }
+  .meta-badge.badge-reason {
+    background: rgba(168, 85, 247, 0.14);
+    color: #D8B4FE;
+    border: 1px solid rgba(168, 85, 247, 0.3);
   }
 
   .model-row-status {
@@ -4939,6 +5187,27 @@ function renderModels(models) {
     const idEl = el('span', 'model-row-id', m.id);
     idEl.title = m.id;
 
+    // Badges Container
+    const badgesWrap = el('div', 'model-meta-badges');
+    const ctx = m.contextWindow ? Math.round(m.contextWindow / 1000) + 'K' : '';
+    if (ctx) {
+      const bCtx = el('span', 'meta-badge badge-ctx', ctx);
+      bCtx.title = `上下文窗口: ${m.contextWindow.toLocaleString()} tokens`;
+      badgesWrap.appendChild(bCtx);
+    }
+    const hasImage = Array.isArray(m.input) && m.input.includes('image');
+    if (hasImage) {
+      const bImg = el('span', 'meta-badge badge-img', '📷 视觉');
+      bImg.title = '支持图像/多模态输入 (input: ["text", "image"])';
+      badgesWrap.appendChild(bImg);
+    }
+    if (m.reasoning) {
+      const bRea = el('span', 'meta-badge badge-reason', '🧠 思考');
+      bRea.title = '具备深度推理思考能力 (reasoning: true)';
+      badgesWrap.appendChild(bRea);
+    }
+    idEl.appendChild(badgesWrap);
+
     // Status Badge
     const statusWrap = el('div', 'model-row-status');
     if (m.disabled) {
@@ -5058,7 +5327,7 @@ function toggleModelEnabled(mid) {
   renderModels(p.models);
 }
 
-function addModelManual() {
+async function addModelManual() {
   const mid = $id('newModelId').value.trim();
   const mname = $id('newModelName').value.trim();
   if (!mid) return showAlert({ title: '校验失败', icon: '⚠️', message: '请输入模型 ID', type: 'error' });
@@ -5069,6 +5338,19 @@ function addModelManual() {
   const list = p.models.filter(x => x.id !== mid);
   const nextModel = { id: mid };
   if (mname) nextModel.name = mname;
+
+  // 自动推断 contextWindow / maxTokens / input / reasoning
+  try {
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.infer_specs) {
+      const res = await window.pywebview.api.infer_specs(mid);
+      if (res && res.success && res.specs) {
+        Object.assign(nextModel, res.specs);
+      }
+    }
+  } catch (e) {
+    console.error('infer_specs failed', e);
+  }
+
   list.push(nextModel);
   p.models = list;
   $id('newModelId').value = '';
@@ -5076,7 +5358,12 @@ function addModelManual() {
   renderModels(p.models);
   renderSidebar();
   $id('newModelId').focus();
-  setStatus(`已添加模型 [${mid}]，点击「💾 保存」持久化`, '#10B981');
+  const caps = [];
+  if (nextModel.contextWindow) caps.push(`${Math.round(nextModel.contextWindow / 1000)}K`);
+  if (Array.isArray(nextModel.input) && nextModel.input.includes('image')) caps.push('视觉');
+  if (nextModel.reasoning) caps.push('思考');
+  const capStr = caps.length ? ` [${caps.join(' · ')}]` : '';
+  setStatus(`已添加模型 [${mid}]${capStr}，点击「💾 保存」持久化`, '#10B981');
 }
 
 function removeModel(mid) {
@@ -5679,6 +5966,28 @@ function renderFetchPreview() {
     idWrap.style.cssText = 'flex: 1; display: flex; align-items: center; gap: 6px; padding-left: 6px; box-sizing: border-box; min-width: 140px; overflow: hidden;';
     const idSpan = el('span', 'model-row-id', m.id);
     idSpan.title = m.id;
+
+    // Badges in fetched view
+    const badgesWrap = el('div', 'model-meta-badges');
+    const ctx = m.contextWindow ? Math.round(m.contextWindow / 1000) + 'K' : '';
+    if (ctx) {
+      const bCtx = el('span', 'meta-badge badge-ctx', ctx);
+      bCtx.title = `推断上下文: ${m.contextWindow.toLocaleString()} tokens`;
+      badgesWrap.appendChild(bCtx);
+    }
+    const hasImage = Array.isArray(m.input) && m.input.includes('image');
+    if (hasImage) {
+      const bImg = el('span', 'meta-badge badge-img', '📷 视觉');
+      bImg.title = '支持图像/多模态输入';
+      badgesWrap.appendChild(bImg);
+    }
+    if (m.reasoning) {
+      const bRea = el('span', 'meta-badge badge-reason', '🧠 思考');
+      bRea.title = '具备深度推理思考能力';
+      badgesWrap.appendChild(bRea);
+    }
+    idSpan.appendChild(badgesWrap);
+
     idWrap.appendChild(idSpan);
 
     if (m.sourceRefId && m.sourceRefId !== 'default') {
@@ -5838,6 +6147,10 @@ function commitFetchedModels() {
     const next = { id: m.id };
     const trimmed = String(m.name || '').trim();
     if (trimmed && trimmed !== m.id) next.name = trimmed;
+    if (m.contextWindow) next.contextWindow = m.contextWindow;
+    if (m.maxTokens) next.maxTokens = m.maxTokens;
+    if (m.input) next.input = m.input;
+    if (m.reasoning) next.reasoning = m.reasoning;
 
     if (m.sourceRefId && m.sourceRefId !== 'default') {
       next.apiKeyRef = m.sourceRefId;
