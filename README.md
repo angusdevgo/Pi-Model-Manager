@@ -57,14 +57,23 @@
 - **即时别名修改**：模型 ID、显示别名支持在列表中一键点击就地重命名，失焦或回车自动写入。
 - **一键设为默认**：点击模型旁的 `☆ 设默认` 即可一键更新全局 `settings.json` 的默认提供商与模型。
 
-#### 5. 🪟 Windows 静默启动与快捷方式修复工装
+#### 5. 🧠 模型能力智能推断与静默升级 (Auto Metadata Inference)
+- **告别 128K 截断与无图限制**：Pi 原生对缺少元数据的自定义模型会保守回落至 128K 上下文且不支持多模态图片输入。Pi Model Manager 引入三级自动推断引擎，添加或写盘时全自动推导真实能力，**无需用户手动拨动繁琐的 UI 开关**。
+- **三级推断体系**：
+  1. **Pi 内置目录交叉继承**：自动剥离 `cn:`、`global:` 等中转前缀，精确匹配 Pi 官方原生 Catalog，继承官方完整的 `contextWindow`、`maxTokens`、`input` 及 `reasoning`。
+  2. **上游端点真实提取**：优先采纳 `/models` 接口返回的 `context_length`、`max_tokens` 与多模态特征。
+  3. **主流模型家族规则库**：深度适配 Gemini（1M~2M 上下文、64K 输出、视觉）、Claude（200K 上下文、64K 输出、视觉）、MiMo（1M 上下文、128K 输出、视觉+深度思考）、DeepSeek（V4 1M 上下文与 384K 输出、R1 深度思考）、OpenAI（o1/o3 200K 上下文+思考；GPT-4o 视觉）、Qwen/GLM/Moonshot 等。
+- **直观视觉能力徽章**：模型列表与拉取预览中实时展示上下文容量徽章（如 `1049K`、`200K`）、视觉多模态徽章（`📷 视觉`）与深度思考徽章（`🧠 思考`）。
+- **存量配置静默补齐**：保存配置时自动扫描并补全历史遗留模型，无感升级现有 `models.json`。
+
+#### 6. 🪟 Windows 静默启动与快捷方式修复工装
 - **无黑框后台静默启动**：内置 `launch.vbs` 和优化的 `PiModelManager.bat`，自动探测全局或环境变量中的 `pythonw.exe`，彻底告别 CMD 黑色控制台弹窗。
 - **快捷方式一键自愈工装**：提供 `Fix-Shortcut.bat` 与 `fix_shortcut.ps1`，一键扫描桌面所有 Pi 相关快捷方式，自动将执行路径修正为静默启动脚本并配置独立 Python 图标。
 
-#### 6. 🔄 配套热同步扩展 (models-sync.ts)
-- 附带 TypeScript 编写的 Pi Agent 官方原生扩展，加载后常驻监听 `models.json` 变动，保存即自动热更新正在运行的 Pi 会话模型列表，**无需退出重启终端，也无需手动执行 `/reload`**。
+#### 7. 🔄 配套热同步扩展 (models-sync.ts)
+- 附带 TypeScript 编写的 Pi Agent 官方原生扩展，加载后常驻监听 `models.json` 变动，保存即自动热更新正在运行的 Pi 会话模型列表，**无需退出重启终端，也无需手动执行 `/reload`**。同样内建自动推断引擎，保证热重载时与工具侧能力完全一致。
 
-#### 7. 🧭 顺序一致性（工具 ↔ Pi 透明化）
+#### 8. 🧭 顺序一致性（工具 ↔ Pi 透明化）
 Pi 侧一共存在 **三种顺序**，本工具把每一种都讲清楚并提供对应开关，拒绝“拖了却没生效”的玄学：
 
 | 顺序类型 | 谁说了算 | 工具是否可控制 |
@@ -85,7 +94,7 @@ Pi 侧一共存在 **三种顺序**，本工具把每一种都讲清楚并提供
 
 ---
 
-#### 8. 🧩 Pi 顺序补丁（让 Pi 的厂商分组顺序跟随工具）
+#### 9. 🧩 Pi 顺序补丁（让 Pi 的厂商分组顺序跟随工具）
 默认情况下，Pi 的 `/model` 选择器按厂商 ID **字母序**分组，工具里的厂商拖拽顺序对它无效。点击顶部 **🧩 顺序补丁** 即可让 Pi 改为**严格按工具顺序**分组：
 
 | 项目 | 说明 |
@@ -203,14 +212,23 @@ Adding custom LLM providers (e.g., self-hosted **Ollama**, **vLLM**, **LM Studio
 - **Inline Renaming**: Double-click or click to edit model IDs and aliases on the fly.
 - **Set as Default**: Set any model as the global default in `settings.json` with a single click.
 
-#### 5. 🪟 Windows Silent Launch & Shortcut Repair Tooling
+#### 5. 🧠 Smart Capability Inference & Silent Upgrades
+- **No More 128K Cap or Image Blocking**: Pi natively falls back to 128K context and text-only input for custom models missing metadata. Pi Model Manager features a 3-tier automatic inference engine that infers exact capabilities silently on add, fetch, and save — **zero tedious UI toggles required**.
+- **Three-Tier Pipeline**:
+  1. **Native Catalog Inheritance**: Strips proxy prefixes (e.g. `cn:`, `global:`) to cross-match against Pi's built-in catalog for official specs.
+  2. **Upstream Direct Extraction**: Harvests `context_length`, `max_tokens`, and multimodal tags directly from `/models` responses.
+  3. **Model Family Heuristics**: Fine-grained rules for Gemini (1M–2M context, 64K output, vision), Claude (200K context, 64K output, vision), MiMo (1M context, 128K output, vision + reasoning), DeepSeek (V4 1M context / 384K output, R1 reasoning), OpenAI (o1/o3 200K context + reasoning; GPT-4o vision), Qwen, GLM, etc.
+- **Visual Spec Badges**: Displays context capacity (e.g. `1049K`, `200K`), multimodal vision (`📷 视觉`), and reasoning (`🧠 思考`) directly in the model list and fetch preview.
+- **Silent Migration**: Automatically backfills existing configurations on save to upgrade legacy `models.json` entries without breaking user workflows.
+
+#### 6. 🪟 Windows Silent Launch & Shortcut Repair Tooling
 - **Console-Free Execution**: Bundled with `launch.vbs` and smart `PiModelManager.bat` to detect `pythonw.exe` and eliminate flashing command prompt windows.
 - **Desktop Shortcut Fixer**: Run `Fix-Shortcut.bat` to scan and repoint all Pi desktop shortcuts to the silent launcher with a clean Python icon.
 
-#### 6. 🔄 Live Hot-Reload Extension (models-sync.ts)
-- Native TypeScript extension for Pi that monitors `models.json` changes in the background, updating active terminal sessions instantly without restarts or manual `/reload` calls.
+#### 7. 🔄 Live Hot-Reload Extension (models-sync.ts)
+- Native TypeScript extension for Pi that monitors `models.json` changes in the background, updating active terminal sessions instantly without restarts or manual `/reload` calls. Features the same capability inference engine for runtime consistency.
 
-#### 7. 🧭 Order Consistency (Tool ↔ Pi, Fully Transparent)
+#### 8. 🧭 Order Consistency (Tool ↔ Pi, Fully Transparent)
 Pi exposes **three different orderings**; the tool documents each one and ships a switch for it, so a drag never silently fails again:
 
 | Ordering | Source of truth | Controlled by tool? |
@@ -231,7 +249,7 @@ Pi exposes **three different orderings**; the tool documents each one and ships 
 
 ---
 
-#### 8. 🧩 Pi Order Patch (make Pi's provider group order follow the tool)
+#### 9. 🧩 Pi Order Patch (make Pi's provider group order follow the tool)
 By default Pi groups providers **alphabetically** by provider ID and ignores the tool's drag order. Click **🧩 Order Patch** in the header to make Pi group providers **strictly in the tool's order**:
 
 | Item | Detail |
