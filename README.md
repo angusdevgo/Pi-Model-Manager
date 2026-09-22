@@ -69,16 +69,36 @@ Pi 侧一共存在 **三种顺序**，本工具把每一种都讲清楚并提供
 
 | 顺序类型 | 谁说了算 | 工具是否可控制 |
 | --- | --- | --- |
-| ① 厂商分组顺序 | **Pi 硬编码**：`/model` 选择器与 `pi --list-models` 都按 `a.provider.localeCompare(b.provider)` 字母序分组 | ❌ 不可控制（`models.json` 的厂商键顺序对 Pi 无效） |
+| ① 厂商分组顺序 | **Pi 硬编码**：`/model` 选择器、设置面板与 `pi --list-models` 都按 `a.provider.localeCompare(b.provider)` 字母序分组 | ⚠️ 默认不可控（`models.json` 的厂商键顺序对 Pi 无效）；可用下方 **🧩 顺序补丁** 让 Pi 跟随工具 |
 | ② 厂商内部的模型顺序 | 自定义厂商 = `models.json` 的 `models` **数组顺序**；内置厂商 = Pi 原生目录顺序 | ✅ 完全可控（拖拽 → 保存 → 重启 Pi 即生效） |
 | ③ 默认 / 当前模型置顶 | Pi 把「当前模型」放第 1、「默认模型」放第 2 | ✅ 工具侧同款置顶显示 |
 
 - **⭐ 默认置顶（模型列表右上角开关）**：把 Pi 默认模型在列表中置顶显示，并打上琥珀色高亮与 `⭐` 手柄，**仅改变显示层，绝不改动保存顺序**（该行在置顶期间禁止拖放，避免下标错位）；点击右侧 `☆ 设默认` 切换默认模型后置顶会自动跟随。
 - **⇅ Pi 字母序（服务商标题栏开关）**：一键把左侧厂商列切换成 Pi 的字母序视图（此时厂商拖拽会被锁定并提示），让两边观感完全一致；关闭后恢复您的自定义拖拽顺序。
-- **🔍 顺序自检（顶部操作栏按钮）**：一键生成三节式核对报告 —— 厂商分组顺序差异、每个厂商内部的模型顺序是否已落盘、默认模型与禁用模型清单，并给出 `✅ / ⚠️` 结论，方便直接截图留档。
+- **🔍 顺序自检（顶部操作栏按钮）**：一键生成五节式核对报告 —— 厂商分组顺序差异、每个厂商内部的模型顺序是否已落盘、默认模型、禁用模型清单、Pi 排序补丁状态，并给出 `✅ / ⚠️` 结论，方便直接截图留档。
+- **🧩 顺序补丁（顶部操作栏按钮）**：让 **Pi 跟随工具的厂商顺序**，见下方第 8 节。
 - **开关持久化**：以上两个显示开关保存在 `~/.pi/agent/model-manager-settings.json`，不污染 `models.json` / `settings.json`，重启工具后保持选择。
 
-> 💡 一句话总结：**厂商内部的模型顺序，工具说了算；厂商之间的先后顺序，Pi 固定为字母序。** 若您确实需要 Pi 也按工具顺序排列厂商，只能修改 Pi 安装目录里的排序逻辑（补丁式做法，Pi 升级会被覆盖），本工具不擅自改动第三方包文件。
+> 💡 一句话总结：**厂商内部的模型顺序，工具说了算；厂商之间的先后顺序，Pi 默认字母序 —— 想让它听工具的，打开「🧩 顺序补丁」。**
+
+---
+
+#### 8. 🧩 Pi 顺序补丁（让 Pi 的厂商分组顺序跟随工具）
+默认情况下，Pi 的 `/model` 选择器按厂商 ID **字母序**分组，工具里的厂商拖拽顺序对它无效。点击顶部 **🧩 顺序补丁** 即可让 Pi 改为**严格按工具顺序**分组：
+
+| 项目 | 说明 |
+| --- | --- |
+| 打补丁原理 | 把 Pi 中所有 `a.provider.localeCompare(b.provider)` 替换为读取顺序文件的排名比较，并注入一个约 1.6 KB 的运行时助手；**不改变任何业务逻辑**，仅在订单文件缺失/损坏时自动回退为 Pi 原生字母序 |
+| 覆盖位置 | 自动扫描 Pi 的 `dist/` 目录按内容匹配（当前版本为 `bundle/chunks/chunk-*.js`、`cli/list-models.js`、`modes/interactive/components/model-selector.js`、`settings-selector.js`，共 6 处锚点），**不依赖固定文件名**，升级换 chunk 名也能重新命中 |
+| 顺序来源 | `~/.pi/agent/pi-provider-order.json`，由工具在**每次保存后**自动刷新（内容 = 窗口里看到的厂商顺序；开启「⇅ Pi 字母序」时同步为字母序） |
+| 生效时机 | 补丁后重启 Pi；顺序文件支持**热读取**（改了顺序只需重开 `/model` 选择器，无需重启 Pi） |
+| 自动维护 | 开启后：① 工具每次 **💾 保存** 自动同步顺序文件并校验补丁；② 工具**启动时**检测到补丁缺失（如被 `npm i -g` 覆盖）自动重打。状态栏会提示结果 |
+| 安全保障 | 修改前**字节级备份**原文件到 `~/.pi/agent/pi-order-patch-backup/`；写入采用临时文件 + 原子替换；每改一个文件都跑 `node --check` **语法门禁**，不过则**立即回滚**；「🩹 还原原版」可字节级完美还原（已验证 SHA256 一致） |
+| 已知边界 | Pi 升级（`npm i -g @earendil-works/pi-coding-agent`）会覆盖 `dist`，补丁需重打 —— 已开启自动维护时会自动重打；若未来 Pi 改写了排序实现导致锚点失配，补丁会**安全失败并明确报错**，不会破坏安装 |
+
+> 🛡️ 本补丁只涉及本地单机显示顺序，不修改任何鉴权、订阅或网络请求逻辑；随时可一键还原。
+>
+> 🔬 **自检脚本**：`python tests/verify_order_patch.py` —— 在临时沙箱中跑完「打补丁 → 幂等复打 → 模拟升级重打 → 比较器行为 → 回退字母序 → 字节级还原」全流程（58 项断言），绝不触碰真实安装目录。
 
 ---
 
@@ -122,9 +142,15 @@ pi-model-manager/
 ├── PiModelManager.bat  # 智能探测路径启动批处理
 ├── Fix-Shortcut.bat    # 快捷方式一键修复引导入口
 ├── fix_shortcut.ps1    # PowerShell 快捷方式目标与图标重定向工装
+├── tests/
+│   └── verify_order_patch.py   # 🧩 顺序补丁全流程自检（沙箱运行，Pi 升级后可复验）
 ├── README.md           # 中英双语权威使用文档
 └── .gitignore          # 运行态文件过滤配置
 ```
+
+> 运行期文件（均在 `~/.pi/agent/`，不污染 Pi 配置）：`model-manager-settings.json`（工具开关）、
+> `pi-provider-order.json`（补丁读取的厂商顺序）、`pi-order-patch-state.json`（补丁状态）、
+> `pi-order-patch-backup/`（Pi 原文件字节级备份）。
 
 ---
 
@@ -183,16 +209,36 @@ Pi exposes **three different orderings**; the tool documents each one and ships 
 
 | Ordering | Source of truth | Controlled by tool? |
 | --- | --- | --- |
-| ① Provider group order | **Hardcoded in Pi**: both the `/model` selector and `pi --list-models` group providers via `a.provider.localeCompare(b.provider)` (alphabetical) | ❌ Not controllable (`models.json` key order is ignored by Pi) |
+| ① Provider group order | **Hardcoded in Pi**: the `/model` selector, the settings panel and `pi --list-models` all group providers via `a.provider.localeCompare(b.provider)` (alphabetical) | ⚠️ Not controllable by default (`models.json` key order is ignored by Pi); the **🧩 Order Patch** below makes Pi follow the tool instead |
 | ② Model order inside a provider | Custom providers = the `models` **array order** in `models.json`; built-in providers = Pi's native catalog order | ✅ Fully controllable (drag → save → restart Pi) |
 | ③ Default / current model hoisting | Pi puts the *current* model first and the *default* model second | ✅ Mirrored by the tool |
 
 - **⭐ Pin Default (toggle in the model toolbar)**: hoists Pi's default model to the top of the list with an amber highlight and a `⭐` handle. It is **display-only and never mutates the saved order**; the pinned row is locked against drops while pinned (avoids index skew) and follows the model when you click `☆ Set default`.
 - **⇅ Pi Alphabetical (toggle on the provider panel header)**: switches the provider list to Pi's alphabetical view (provider dragging is locked and explained in a tooltip). Turn it off to get your own drag order back.
-- **🔍 Order Self-Check (button in the header actions)**: produces a three-section report — provider-grouping difference, whether each provider's internal model order is already persisted, plus the default model and disabled-model inventory — with `✅ / ⚠️` verdicts, ready to be screenshotted for your records.
-- **Persisted preferences**: both display toggles live in `~/.pi/agent/model-manager-settings.json`, keeping `models.json` / `settings.json` untouched, and survive restarts of the tool.
+- **🔍 Order Self-Check (button in the header actions)**: produces a five-section report — provider-grouping difference, whether each provider's internal model order is already persisted, the default model, the disabled-model inventory and the order-patch status — with `✅ / ⚠️` verdicts, ready to be screenshotted for your records.
+- **🧩 Order Patch (button in the header actions)**: makes **Pi follow the tool's provider order** — see section 8 below.
+- **Persisted preferences**: all display toggles live in `~/.pi/agent/model-manager-settings.json`, keeping `models.json` / `settings.json` untouched, and survive restarts of the tool.
 
-> 💡 TL;DR: **the model order inside a provider is yours to control; the order between providers is fixed to alphabetical in Pi.** If you truly need Pi itself to follow the tool's provider order, that requires patching the sorting logic inside Pi's installation (overwritten on every Pi upgrade) — this tool never rewrites third-party package files on its own.
+> 💡 TL;DR: **the model order inside a provider is yours to control; the order between providers is alphabetical in Pi by default — turn on «🧩 Order Patch» to make it follow the tool.**
+
+---
+
+#### 8. 🧩 Pi Order Patch (make Pi's provider group order follow the tool)
+By default Pi groups providers **alphabetically** by provider ID and ignores the tool's drag order. Click **🧩 Order Patch** in the header to make Pi group providers **strictly in the tool's order**:
+
+| Item | Detail |
+| --- | --- |
+| How it works | Replaces every `a.provider.localeCompare(b.provider)` in Pi with a rank lookup backed by an order file, and injects a ~1.6 KB runtime helper. **No business logic is touched**, and a missing/corrupt order file falls back to Pi's native alphabetical ordering |
+| Coverage | Content-based scan of Pi's `dist/` tree (today: `bundle/chunks/chunk-*.js`, `cli/list-models.js`, `modes/interactive/components/model-selector.js`, `settings-selector.js` — 6 anchors). **No hardcoded filenames**, so renamed chunks are still matched after upgrades |
+| Order source | `~/.pi/agent/pi-provider-order.json`, refreshed by the tool **after every save** (it mirrors exactly what you see in the provider panel; enabling «⇅ Pi Alphabetical» mirrors alphabetical order) |
+| When it applies | Restart Pi once after patching. The order file is read **hot**, so later reorderings only need re-opening the `/model` selector — no Pi restart |
+| Auto-maintenance | Once enabled: ① every **💾 Save** in the tool re-syncs the order file and verifies the patch; ② tool startup detects a missing patch (e.g. wiped by `npm i -g`) and re-applies it. The status bar reports the outcome |
+| Safety | **Byte-level backup** of every file to `~/.pi/agent/pi-order-patch-backup/`; writes are atomic (temp file + replace); every modified file must pass a `node --check` **syntax gate** or it is **rolled back immediately**; «🩹 Restore original» reverts byte-identically (SHA256-verified) |
+| Known limits | Upgrading Pi (`npm i -g @earendil-works/pi-coding-agent`) overwrites `dist`, so the patch must be re-applied — auto-maintenance does this for you. If a future Pi rewrites its sorting code so the anchors no longer match, the patch **fails safely with a clear error** and never damages the installation |
+
+> 🛡️ The patch only affects local, single-machine display ordering. It modifies no authentication, subscription or network logic, and can be reverted at any time with one click.
+>
+> 🔬 **Self-test**: `python tests/verify_order_patch.py` — runs the whole «patch → idempotent re-patch → simulated upgrade re-patch → comparator behaviour → alphabetical fallback → byte-level restore» cycle (58 assertions) inside a throwaway sandbox; the real installation is never touched.
 
 ---
 
@@ -236,9 +282,15 @@ pi-model-manager/
 ├── PiModelManager.bat  # Smart environment detection launcher
 ├── Fix-Shortcut.bat    # Shortcut repair helper entrypoint
 ├── fix_shortcut.ps1    # PowerShell shortcut target & icon fixer
+├── tests/
+│   └── verify_order_patch.py   # 🧩 Order-patch end-to-end self-test (sandboxed, re-run after Pi upgrades)
 ├── README.md           # Bilingual documentation
 └── .gitignore          # Git ignore rules
 ```
+
+> Runtime files (all under `~/.pi/agent/`, never polluting Pi config): `model-manager-settings.json`
+> (tool toggles), `pi-provider-order.json` (provider order read by the patch),
+> `pi-order-patch-state.json` (patch state), `pi-order-patch-backup/` (byte-level backups of Pi originals).
 
 ---
 

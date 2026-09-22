@@ -11,6 +11,7 @@ import fnmatch
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -116,6 +117,8 @@ DEFAULT_TOOL_PREFS = {
     "pinDefaultModel": True,
     # 厂商列按 Pi 的字母序显示（Pi 侧固定按厂商 ID 字母序分组，无法配置）
     "alignProviderOrder": False,
+    # Pi 排序补丁自动维护（工具保存后自动打补丁 / Pi 升级后自动重打）
+    "patchPiOrder": False,
 }
 
 
@@ -175,6 +178,7 @@ def build_order_report(path_value=None):
     Pi 侧一共存在三种顺序，其中只有「厂商内部的模型顺序」可以由工具控制：
       1. 厂商分组顺序 —— /model 选择器与 `pi --list-models` 都按厂商 ID 字母序分组
          （Pi 源码硬编码），models.json 的厂商键顺序对 Pi 无效。
+         如需让 Pi 跟随工具顺序，可使用工具内的「🧩 Pi 顺序补丁」（文件见本报告【5】）。
       2. 厂商内部的模型顺序 —— 自定义厂商 = models.json 数组顺序（工具拖拽生效）；
          内置厂商 = Pi 原生目录顺序（目录内模型在工具侧锁定拖拽）。
       3. 默认/当前模型置顶 —— /model 选择器把「当前模型」放第 1、「默认模型」放第 2。
@@ -200,13 +204,23 @@ def build_order_report(path_value=None):
 
     tool_order = list(display_providers.keys())
     pi_order = sorted(tool_order, key=pi_name_sort_key)
+    try:
+        pst = pi_order_patch_status()
+    except Exception as e:
+        pst = {"error": str(e)}
+    patch_on = bool(pst.get("fullyPatched")) and not pst.get("versionChanged")
+    pi_effective_order = tool_order if patch_on else pi_order
 
     lines = ["📄 配置文件: " + str(path), ""]
-    lines.append("【1】厂商分组顺序 —— Pi 固定按字母序，配置改不了")
+    lines.append("【1】厂商分组顺序 —— Pi 默认按字母序，可用「🧩 顺序补丁」改为跟随工具")
     lines.append("  · 工具当前顺序: " + " → ".join(tool_order[:14]) + (" …" if len(tool_order) > 14 else ""))
-    lines.append("  · Pi 实际顺序  : " + " → ".join(pi_order[:14]) + (" …" if len(pi_order) > 14 else ""))
+    lines.append("  · Pi 实际顺序  : " + " → ".join(pi_effective_order[:14]) + (" …" if len(pi_effective_order) > 14 else "")
+                 + ("   （🧩 补丁生效中）" if patch_on else ""))
     if not tool_order:
         lines.append("  ⚠️  暂无厂商配置")
+    elif patch_on:
+        lines.append("  ✅ 已通过「🧩 顺序补丁」让 Pi 按工具顺序分组（重启 Pi 后生效；顺序文件热更新）")
+        lines.append("     如需恢复 Pi 原生行为：点顶部「🧩 顺序补丁」→「🩹 还原原版」")
     elif tool_order == pi_order:
         lines.append("  ✅ 两边一致：工具里的厂商顺序恰好就是字母序")
     else:
@@ -215,6 +229,7 @@ def build_order_report(path_value=None):
         lines.append("      model-selector.js sortModels / cli/list-models.js），models.json")
         lines.append("      里的厂商键顺序对 Pi 无效 —— 工具拖拽厂商只改变工具自身视图。")
         lines.append("      → 想让工具也显示成 Pi 的字母序：点侧栏标题上的「⇅ Pi 字母序」开关。")
+        lines.append("      → 想让 Pi 跟随工具的厂商顺序：点顶部「🧩 Pi 顺序补丁」（详见报告【5】）。")
     lines.append("")
 
     lines.append("【2】厂商内部的模型顺序 —— 工具说了算，保存后重启 Pi 即生效")
@@ -265,14 +280,524 @@ def build_order_report(path_value=None):
     lines.append("  " + ("、".join(f"{pid}/{mid}" for pid, mid in disabled_rows) if disabled_rows else "无"))
     lines.append("")
 
+    lines.append("【5】Pi 排序补丁（让 Pi 的厂商分组顺序 = 工具的厂商顺序）")
+    if pst.get("error"):
+        lines.append("  ⚠️  " + str(pst.get("error")))
+    else:
+        auto = "已开启" if pst.get("enabled") else "未开启"
+        lines.append(f"  · 自动维护: {auto}")
+        lines.append(f"  · Pi 安装目录: {pst.get('packageDir')}（版本 {pst.get('piVersion') or '未知'}）")
+        lines.append(f"  · 补丁状态: {pst.get('patchedCount', 0)}/{pst.get('targetCount', 0)} 个文件已打"
+                     + ("  ✅" if pst.get("fullyPatched") else "  ⚠️"))
+        for row in pst.get("targets") or []:
+            lines.append("       " + ("✅" if row.get("patched") else "⬜") + " " + str(row.get("rel")))
+        if pst.get("versionChanged"):
+            lines.append(f"  ⚠️  Pi 已升级（{pst.get('stateVersion')} → {pst.get('piVersion')}），"
+                         "需重新打补丁（保存任意修改或点「🧩 Pi 顺序补丁」即自动重打）")
+        lines.append(f"  · 顺序文件: {pst.get('orderFilePath')}")
+        lines.append("       当前内容 " + str(len(pst.get("order") or [])) + " 项: "
+                     + (" → ".join((pst.get("order") or [])[:14]) + (" …" if len(pst.get("order") or []) > 14 else "")
+                        if pst.get("order") else "（空，将回退为 Pi 原生字母序）"))
+        lines.append(f"  · 备份目录: {pst.get('backupDir')}")
+    lines.append("")
+
     lines.append("── 结论 ──")
     lines.append(f"  厂商 {len(tool_order)} 个 / 模型 {total_models} 个；厂商内部顺序一致 {ok_providers}/{len(tool_order)}")
     if mismatch_providers:
         lines.append("  ⚠️  以下厂商尚未把当前顺序写入 models.json：" + "、".join(mismatch_providers))
     else:
         lines.append("  ✅ 工具里的「厂商内部模型顺序」= models.json 保存顺序 = Pi 重启后的顺序")
-    lines.append("  ℹ️  厂商之间的先后顺序在 Pi 侧固定为字母序（Pi 硬编码），工具无法改写。")
+    lines.append("  ℹ️  厂商之间的先后顺序：Pi 原生固定为字母序"
+                 + ("；已用「🧩 顺序补丁」改为跟随工具 ✅" if patch_on
+                    else "，如需让 Pi 跟随工具 → 使用「🧩 顺序补丁」（报告【5】）。"))
     return "\n".join(lines)
+
+
+# ==========================================================
+# Pi 排序补丁：让 Pi 的「厂商分组顺序」= 工具里的厂商顺序
+# ----------------------------------------------------------
+# Pi 的 /model 选择器、设置面板与 `pi --list-models` 都硬编码了
+#     a.provider.localeCompare(b.provider)
+# 来对厂商分组排序，因此 models.json 里的厂商键顺序对 Pi 完全无效。
+#
+# 本补丁把上述比较替换为「读顺序文件 → 按排名比较」，从而实现：
+#   · 工具里拖拽/保存 → 顺序文件刷新 → Pi（重启或重开选择器）即按新顺序分组；
+#   · 未列入顺序文件的厂商排在最后（它们之间仍按字母序），不会报错；
+#   · 顺序文件缺失/损坏 → 自动回退为 Pi 原生字母序（零副作用）。
+#
+# 安全措施：锚点正则校验 → 原始文件备份 → 原子写入 → node --check 语法门禁
+#           → 失败立即回滚 → 支持一键还原（revert_pi_order_patch）。
+# ==========================================================
+
+PI_PATCH_VERSION = 1
+PI_PATCH_START = f"/* pi-model-manager:provider-order-patch v{PI_PATCH_VERSION} (start) */"
+PI_PATCH_END = f"/* pi-model-manager:provider-order-patch v{PI_PATCH_VERSION} (end) */"
+PI_PROVIDER_ORDER_PATH = DEFAULT_AGENT_DIR / "pi-provider-order.json"
+PI_PATCH_BACKUP_DIR = DEFAULT_AGENT_DIR / "pi-order-patch-backup"
+PI_PATCH_STATE_PATH = DEFAULT_AGENT_DIR / "pi-order-patch-state.json"
+
+# 补丁锚点：minify 后形如 a.provider.localeCompare(b2.provider)
+PI_PROVIDER_CMP_RE = re.compile(
+    r"([A-Za-z_$][\w$]*)\.provider\.localeCompare\(([A-Za-z_$][\w$]*)\.provider\)")
+# 还原锚点：__piomCmp$(a.provider,b2.provider)
+PI_PATCHED_CMP_RE = re.compile(
+    r"__piomCmp\$\(([A-Za-z_$][\w$]*)\.provider,([A-Za-z_$][\w$]*)\.provider\)")
+
+# 注入到 Pi 源码中的运行时排序助手（纯 ESM 安全：不使用 import/require 语句，
+# 依赖 Node 内置 process.getBuiltinModule，并对 require 作 TDZ 安全降级）
+PI_PATCH_HELPER = """/* pi-model-manager:provider-order-patch v1 (start) */
+const __piom$ = (() => {
+  const pr = globalThis.process;
+  const env = (pr && pr.env) || {};
+  const agentDir = env.PI_CODING_AGENT_DIR || ((env.USERPROFILE || env.HOME || "") + "/.pi/agent");
+  const orderFile = agentDir + "/pi-provider-order.json";
+  const cache = { mtime: -1, list: [] };
+  let fsMod;
+  const resolveFs = () => {
+    if (fsMod !== undefined) return fsMod;
+    fsMod = null;
+    try { if (pr && typeof pr.getBuiltinModule === "function") fsMod = pr.getBuiltinModule("node:fs") || null; } catch (e) {}
+    if (!fsMod) { try { if (typeof require === "function") fsMod = require("node:fs") || null; } catch (e) {} }
+    return fsMod;
+  };
+  return () => {
+    const fs = resolveFs();
+    if (!fs) return [];
+    try {
+      const st = fs.statSync(orderFile);
+      if (st.mtimeMs !== cache.mtime) {
+        const raw = JSON.parse(fs.readFileSync(orderFile, "utf8"));
+        const list = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.order) ? raw.order : []);
+        cache.list = list.map((x) => String(x));
+        cache.mtime = st.mtimeMs;
+      }
+    } catch (e) { cache.mtime = -1; cache.list = []; }
+    return cache.list;
+  };
+})();
+const __piomRank$ = (pid) => {
+  const list = __piom$();
+  const id = String(pid);
+  let i = list.indexOf(id);
+  if (i < 0) {
+    const low = id.toLowerCase();
+    i = list.findIndex((x) => x.toLowerCase() === low);
+  }
+  return i < 0 ? list.length + 1000 : i;
+};
+const __piomCmp$ = (a, b) => {
+  const ra = __piomRank$(a);
+  const rb = __piomRank$(b);
+  return ra !== rb ? ra - rb : String(a).localeCompare(String(b));
+};
+/* pi-model-manager:provider-order-patch v1 (end) */
+"""
+
+_PI_PATCH_TARGET_CACHE = {}
+
+
+def invalidate_pi_patch_cache():
+    _PI_PATCH_TARGET_CACHE.clear()
+
+
+def get_pi_package_dir():
+    """定位 Pi 的安装目录（补丁目标根目录）。"""
+    candidates = []
+    env_dir = os.environ.get("PI_PACKAGE_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir))
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        candidates.append(Path(appdata) / "npm" / "node_modules" / "@earendil-works" / "pi-coding-agent")
+    candidates.extend([
+        Path.home() / "AppData" / "Roaming" / "npm" / "node_modules" / "@earendil-works" / "pi-coding-agent",
+        Path.home() / ".npm-global" / "lib" / "node_modules" / "@earendil-works" / "pi-coding-agent",
+        Path("/usr/local/lib/node_modules/@earendil-works/pi-coding-agent"),
+        Path("/usr/lib/node_modules/@earendil-works/pi-coding-agent"),
+    ])
+    for c in candidates:
+        try:
+            if (c / "dist").is_dir():
+                return c
+        except Exception:
+            continue
+    return None
+
+
+def pi_installed_version(pkg_dir):
+    if not pkg_dir:
+        return ""
+    try:
+        data = json.loads((pkg_dir / "package.json").read_text(encoding="utf-8-sig"))
+        return str(data.get("version") or "")
+    except Exception:
+        return ""
+
+
+def find_pi_patch_targets(pkg_dir, use_cache=True):
+    """扫描 Pi dist 目录，找出所有含厂商排序锚点的 JS 文件（不依赖具体 chunk 名）。"""
+    if not pkg_dir:
+        return []
+    key = str(pkg_dir) + "|" + pi_installed_version(pkg_dir)
+    if use_cache and key in _PI_PATCH_TARGET_CACHE:
+        return _PI_PATCH_TARGET_CACHE[key]
+    found = []
+    dist = pkg_dir / "dist"
+    if dist.is_dir():
+        for f in sorted(dist.rglob("*.js")):
+            if f.name.endswith(".map"):
+                continue
+            try:
+                text = read_pi_source(f)
+            except Exception:
+                continue
+            if PI_PROVIDER_CMP_RE.search(text) or PI_PATCH_START in text:
+                found.append(f)
+    if use_cache:
+        _PI_PATCH_TARGET_CACHE[key] = found
+    return found
+
+
+def pi_patch_backup_path(pkg_dir, target):
+    try:
+        rel = target.relative_to(pkg_dir)
+        safe = "__".join(rel.parts)
+    except Exception:
+        safe = target.name
+    return PI_PATCH_BACKUP_DIR / safe
+
+
+def is_pi_file_patched(text):
+    return PI_PATCH_START in text
+
+
+def read_pi_source(path):
+    """以「保留原始换行符」方式读取源码（newline=""），确保打/还原补丁字节级可逆。"""
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        return fh.read()
+
+
+def patch_pi_source(text):
+    """把源文本中的厂商比较替换为按顺序文件排名比较，并注入助手。返回 (新文本, 替换数)。"""
+    if PI_PATCH_START in text:
+        return text, 0
+    new_text, count = PI_PROVIDER_CMP_RE.subn(
+        lambda m: f"__piomCmp$({m.group(1)}.provider,{m.group(2)}.provider)", text)
+    if count == 0:
+        return text, 0
+    nl = "\r\n" if "\r\n" in text else "\n"
+    helper = PI_PATCH_HELPER.replace("\r\n", "\n").replace("\n", nl)
+    return helper + new_text, count
+
+
+def unpatch_pi_source(text):
+    """还原：移除注入的助手并恢复原生比较。返回 (新文本, 替换数)。"""
+    if PI_PATCH_START not in text:
+        return text, 0
+    reverted = text
+    start = reverted.find(PI_PATCH_START)
+    end = reverted.find(PI_PATCH_END)
+    if start != -1 and end != -1:
+        end += len(PI_PATCH_END)
+        while end < len(reverted) and reverted[end] in "\r\n":
+            end += 1
+        reverted = reverted[:start] + reverted[end:]
+    else:
+        # 标记不完整（仅单侧残留）→ 逐行剔除标记行，避免污染
+        keep = [ln for ln in reverted.splitlines(True)
+                if PI_PATCH_START not in ln and PI_PATCH_END not in ln]
+        reverted = "".join(keep)
+    reverted, count = PI_PATCHED_CMP_RE.subn(
+        lambda m: f"{m.group(1)}.provider.localeCompare({m.group(2)}.provider)", reverted)
+    return reverted, count
+
+
+def _atomic_write_text(path, text):
+    tmp = path.with_name(path.name + ".pimm.tmp")
+    with open(tmp, "w", encoding="utf-8", newline="") as fh:
+        fh.write(text)
+    os.replace(str(tmp), str(path))
+
+
+def _backup_file(src, dst):
+    """字节级备份（保留原始换行/元数据，不做任何编码转换）。"""
+    tmp = dst.with_name(dst.name + ".pimm.tmp")
+    shutil.copy2(str(src), str(tmp))
+    os.replace(str(tmp), str(dst))
+
+
+def verify_js_syntax(path):
+    """用 node --check 做语法门禁（无 node 时跳过，不阻塞）。"""
+    node = shutil.which("node") or "node"
+    kwargs = {}
+    if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        proc = subprocess.run([node, "--check", str(path)], capture_output=True,
+                              text=True, timeout=120, **kwargs)
+    except FileNotFoundError:
+        return True, "未找到 node，跳过语法校验"
+    except Exception as e:
+        return True, f"语法校验异常（已跳过）: {e}"
+    if proc.returncode == 0:
+        return True, ""
+    return False, (proc.stderr or proc.stdout or "").strip()[:400]
+
+
+def write_pi_provider_order(path_value=None, order_list=None):
+    """写出 Pi 排序补丁读取的顺序文件（默认取工具窗口当前展示的厂商顺序）。"""
+    if order_list is None:
+        try:
+            cfg = load_config(path_value)
+            order_list = list((cfg.get("providers") or {}).keys())
+            # 工具开启了「⇅ Pi 字母序」时，窗口里看到的是字母序 → 顺序文件同步为字母序，
+            # 保证「Pi 分组顺序 == 工具窗口显示顺序」始终成立。
+            if get_tool_prefs().get("alignProviderOrder"):
+                order_list = sorted(order_list, key=pi_name_sort_key)
+        except Exception:
+            order_list = []
+    payload = {
+        "version": PI_PATCH_VERSION,
+        "updatedAt": datetime.now().isoformat(timespec="seconds"),
+        "source": "pi-model-manager：工具中的厂商显示顺序（补丁读取此顺序给 Pi 分组）",
+        "order": [str(x) for x in (order_list or [])],
+    }
+    try:
+        PI_PROVIDER_ORDER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PI_PROVIDER_ORDER_PATH.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except Exception:
+        return []
+    return payload["order"]
+
+
+def load_pi_patch_state():
+    if not PI_PATCH_STATE_PATH.exists():
+        return {}
+    try:
+        raw = PI_PATCH_STATE_PATH.read_text(encoding="utf-8-sig")
+        clean = strip_json_comments(raw).strip()
+        data = json.loads(clean) if clean else {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_pi_patch_state(state):
+    try:
+        PI_PATCH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PI_PATCH_STATE_PATH.write_text(
+            json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def apply_pi_order_patch(path_value=None, order_list=None):
+    """给 Pi 安装目录打入「厂商按工具顺序分组」补丁（幂等、带备份与语法门禁）。"""
+    result = {"success": False, "applied": [], "skipped": [], "failed": [],
+              "error": "", "targets": 0, "replacements": 0, "order": []}
+    pkg_dir = get_pi_package_dir()
+    if pkg_dir is None:
+        result["error"] = "未找到 Pi 安装目录（@earendil-works/pi-coding-agent）"
+        return result
+    order = write_pi_provider_order(path_value, order_list)
+    result["order"] = order
+    targets = find_pi_patch_targets(pkg_dir, use_cache=False)
+    result["targets"] = len(targets)
+    if not targets:
+        result["error"] = "未在 Pi 安装目录中找到可打补丁的排序代码（可能 Pi 版本已改动）"
+        return result
+    try:
+        PI_PATCH_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        result["error"] = f"无法创建备份目录: {e}"
+        return result
+
+    file_records = {}
+    for target in targets:
+        rel = str(target.relative_to(pkg_dir))
+        try:
+            original = read_pi_source(target)
+        except Exception as e:
+            result["failed"].append({"file": rel, "error": f"读取失败: {e}"})
+            continue
+        backup = pi_patch_backup_path(pkg_dir, target)
+        try:
+            if backup.exists():
+                old_backup = read_pi_source(backup)
+                # 备份内容与当前文件不一致 → Pi 已升级，刷新备份为新版原始文件
+                if old_backup != original and PI_PATCH_START not in original:
+                    _backup_file(target, backup)
+            else:
+                _backup_file(target, backup)
+        except Exception as e:
+            result["failed"].append({"file": rel, "error": f"备份失败: {e}"})
+            continue
+
+        if PI_PATCH_START in original:
+            result["skipped"].append(rel)
+            file_records[rel] = {"patched": True, "backup": str(backup)}
+            continue
+
+        patched, count = patch_pi_source(original)
+        if count == 0:
+            result["failed"].append({"file": rel, "error": "锚点未匹配，已跳过（Pi 可能改写了排序实现）"})
+            continue
+        try:
+            _atomic_write_text(target, patched)
+        except Exception as e:
+            result["failed"].append({"file": rel, "error": f"写入失败: {e}"})
+            continue
+        ok, msg = verify_js_syntax(target)
+        if not ok:
+            try:
+                _atomic_write_text(target, original)
+            except Exception:
+                pass
+            result["failed"].append({"file": rel, "error": f"语法门禁未通过，已回滚: {msg}"})
+            continue
+        result["applied"].append(rel)
+        result["replacements"] += count
+        file_records[rel] = {"patched": True, "backup": str(backup), "replacements": count}
+
+    invalidate_pi_patch_cache()
+    result["success"] = bool(result["applied"] or result["skipped"]) and not result["failed"]
+    state = {
+        "version": PI_PATCH_VERSION,
+        "piVersion": pi_installed_version(pkg_dir),
+        "appliedAt": datetime.now().isoformat(timespec="seconds"),
+        "packageDir": str(pkg_dir),
+        "order": order,
+        "files": file_records,
+        "lastResult": {"applied": result["applied"], "failed": result["failed"]},
+    }
+    save_pi_patch_state(state)
+    return result
+
+
+def revert_pi_order_patch():
+    """还原 Pi 原版排序逻辑（移除注入助手 + 恢复原生 localeCompare）。"""
+    result = {"success": False, "reverted": [], "failed": [], "error": ""}
+    pkg_dir = get_pi_package_dir()
+    if pkg_dir is None:
+        result["error"] = "未找到 Pi 安装目录"
+        return result
+    state = load_pi_patch_state()
+    candidates = set(find_pi_patch_targets(pkg_dir, use_cache=False))
+    for rel in (state.get("files") or {}):
+        candidates.add(Path(rel) if Path(rel).is_absolute() else (pkg_dir / rel))
+    if not candidates:
+        result["error"] = "未找到任何补丁目标"
+        return result
+    for target in sorted(candidates, key=lambda p: str(p)):
+        rel = str(target.relative_to(pkg_dir)) if str(target).startswith(str(pkg_dir)) else str(target)
+        if not target.exists():
+            continue
+        try:
+            current = read_pi_source(target)
+        except Exception as e:
+            result["failed"].append({"file": rel, "error": f"读取失败: {e}"})
+            continue
+        if not is_pi_file_patched(current):
+            continue
+        reverted, count = unpatch_pi_source(current)
+        try:
+            _atomic_write_text(target, reverted)
+        except Exception as e:
+            result["failed"].append({"file": rel, "error": f"写入失败: {e}"})
+            continue
+        ok, msg = verify_js_syntax(target)
+        if not ok:
+            try:
+                _atomic_write_text(target, current)
+            except Exception:
+                pass
+            result["failed"].append({"file": rel, "error": f"语法门禁未通过，已回滚: {msg}"})
+            continue
+        result["reverted"].append({"file": rel, "anchors": count})
+    invalidate_pi_patch_cache()
+    try:
+        if PI_PATCH_STATE_PATH.exists():
+            PI_PATCH_STATE_PATH.unlink()
+    except Exception:
+        pass
+    result["success"] = not result["failed"]
+    return result
+
+
+def pi_order_patch_status():
+    """补丁状态：安装位置 / Pi 版本 / 每个目标文件是否已打 / 是否需要重打。"""
+    prefs = get_tool_prefs()
+    status = {
+        "enabled": bool(prefs.get("patchPiOrder")),
+        "packageDir": "",
+        "piVersion": "",
+        "stateVersion": "",
+        "versionChanged": False,
+        "targets": [],
+        "targetCount": 0,
+        "patchedCount": 0,
+        "fullyPatched": False,
+        "needsRepatch": False,
+        "order": [],
+        "orderFilePath": str(PI_PROVIDER_ORDER_PATH),
+        "backupDir": str(PI_PATCH_BACKUP_DIR),
+        "statePath": str(PI_PATCH_STATE_PATH),
+        "error": "",
+    }
+    pkg_dir = get_pi_package_dir()
+    if pkg_dir is None:
+        status["error"] = "未找到 Pi 安装目录"
+        return status
+    status["packageDir"] = str(pkg_dir)
+    status["piVersion"] = pi_installed_version(pkg_dir)
+    state = load_pi_patch_state()
+    status["stateVersion"] = str(state.get("piVersion") or "")
+    status["versionChanged"] = bool(status["stateVersion"]) and status["stateVersion"] != status["piVersion"]
+    status["installAt"] = str(state.get("appliedAt") or "")
+    try:
+        if PI_PROVIDER_ORDER_PATH.exists():
+            raw = json.loads(PI_PROVIDER_ORDER_PATH.read_text(encoding="utf-8-sig"))
+            status["order"] = [str(x) for x in (raw.get("order") if isinstance(raw, dict) else raw) or []]
+            status["orderUpdatedAt"] = str(raw.get("updatedAt") or "") if isinstance(raw, dict) else ""
+    except Exception:
+        status["order"] = []
+    targets = find_pi_patch_targets(pkg_dir)
+    status["targetCount"] = len(targets)
+    for t in targets:
+        try:
+            patched = is_pi_file_patched(read_pi_source(t))
+        except Exception:
+            patched = False
+        status["targets"].append({"file": str(t), "rel": str(t.relative_to(pkg_dir)), "patched": patched})
+        if patched:
+            status["patchedCount"] += 1
+    status["fullyPatched"] = status["targetCount"] > 0 and status["patchedCount"] == status["targetCount"]
+    status["needsRepatch"] = bool(status["enabled"]) and (
+        not status["fullyPatched"] or status["versionChanged"])
+    return status
+
+
+def ensure_pi_order_patch(path_value=None):
+    """自动维护入口：开启偏好时，保存/重启后自动补打补丁并刷新顺序文件。"""
+    status = pi_order_patch_status()
+    if not status["enabled"]:
+        status["action"] = "disabled"
+        return status
+    if status["error"]:
+        status["action"] = "error"
+        return status
+    if status["fullyPatched"] and not status["versionChanged"]:
+        write_pi_provider_order(path_value)
+        refreshed = pi_order_patch_status()
+        refreshed["action"] = "order-refreshed"
+        return refreshed
+    result = apply_pi_order_patch(path_value)
+    updated = pi_order_patch_status()
+    updated["action"] = "patched" if result.get("success") else "patch-failed"
+    updated["applyResult"] = result
+    return updated
 
 
 def model_reference(pid, model_id):
@@ -1283,7 +1808,27 @@ class ApiBridge:
             save_config(data, config_path)
             saved = load_config(config_path, merge_builtins=False)
             model_count = sum(len(p.get("models", [])) for p in saved.get("providers", {}).values() if isinstance(p, dict))
-            return {"success": True, "providerCount": len(saved.get("providers", {})), "modelCount": model_count, "disabledCount": disabled_count}
+            # 保存后：刷新 Pi 排序补丁读取的顺序文件；如已开启自动维护则自动重打补丁
+            order_patch = None
+            try:
+                write_pi_provider_order(config_path)
+                prefs = get_tool_prefs()
+                if prefs.get("patchPiOrder"):
+                    st = ensure_pi_order_patch(config_path)
+                    order_patch = {
+                        "action": st.get("action") or "",
+                        "fullyPatched": bool(st.get("fullyPatched")),
+                        "targetCount": st.get("targetCount", 0),
+                        "patchedCount": st.get("patchedCount", 0),
+                        "piVersion": st.get("piVersion") or "",
+                        "error": st.get("error") or "",
+                    }
+                else:
+                    order_patch = {"action": "disabled", "error": ""}
+            except Exception as e:
+                order_patch = {"action": "error", "error": str(e)}
+            return {"success": True, "providerCount": len(saved.get("providers", {})), "modelCount": model_count,
+                    "disabledCount": disabled_count, "orderPatch": order_patch}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -1330,6 +1875,44 @@ class ApiBridge:
         """工具顺序 ↔ Pi 顺序一致性自检报告。"""
         try:
             return {"success": True, "text": build_order_report(None)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_order_patch_status(self):
+        """Pi 排序补丁状态。"""
+        try:
+            return {"success": True, "status": pi_order_patch_status()}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def apply_order_patch(self, enabled=True):
+        """立即给 Pi 打「厂商按工具顺序分组」补丁，并（默认）开启自动维护。"""
+        try:
+            if enabled:
+                set_tool_pref("patchPiOrder", True)
+            result = apply_pi_order_patch(None)
+            status = pi_order_patch_status()
+            return {"success": bool(result.get("success")), "result": result, "status": status,
+                    "error": "" if result.get("success") else (result.get("error") or "补丁未完全打入")}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def revert_order_patch(self, enabled=True):
+        """还原 Pi 原版排序逻辑，并（默认）关闭自动维护。"""
+        try:
+            if enabled:
+                set_tool_pref("patchPiOrder", False)
+            result = revert_pi_order_patch()
+            status = pi_order_patch_status()
+            return {"success": bool(result.get("success")), "result": result, "status": status,
+                    "error": "" if result.get("success") else (result.get("error") or "还原失败")}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def ensure_order_patch(self):
+        """启动/保存后的自动维护：需要时重打补丁并刷新顺序文件（未开启则什么都不做）。"""
+        try:
+            return {"success": True, "status": ensure_pi_order_patch(None)}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -2370,8 +2953,11 @@ HTML_CONTENT = """<!DOCTYPE html>
       <button class="btn btn-emerald" onclick="restartPi()" title="重启 Pi 交互终端">
         <span>🔄 重启</span>
       </button>
-      <button class="btn btn-indigo" onclick="showOrderReport()" title="核对「工具顺序 ↔ Pi 顺序」并说明差异原因">
+      <button class="btn btn-indigo" id="orderReportBtn" onclick="showOrderReport()" title="核对「工具顺序 ↔ Pi 顺序」并说明差异原因">
         <span>🔍 顺序自检</span>
+      </button>
+      <button class="btn btn-purple" id="orderPatchBtn" onclick="showPiOrderPatchDialog()" title="让 Pi 的厂商分组顺序跟随工具（可一键还原原版）">
+        <span>🧩 顺序补丁</span>
       </button>
     </div>
     
@@ -2682,6 +3268,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       <div id="globalDialogMessage" style="font-size: 12.5px; line-height: 1.65; color: var(--b-text); white-space: pre-wrap; word-break: break-word;"></div>
     </div>
     <div class="modal-footer" id="globalDialogFooter">
+      <button class="btn btn-secondary" id="globalDialogAltBtn" style="display:none;" onclick="handleDialogAlt()">备选</button>
       <button class="btn btn-ghost" id="globalDialogCancelBtn" onclick="closeGlobalDialog(false)">取消</button>
       <button class="btn btn-emerald" id="globalDialogConfirmBtn" onclick="closeGlobalDialog(true)">确认</button>
     </div>
@@ -2708,7 +3295,7 @@ let fetchedPreview = [];
 let currentDefaultProvider = '';
 let currentDefaultModel = '';
 // 工具界面偏好（与 Pi 顺序语义相关，持久化在 ~/.pi/agent/model-manager-settings.json）
-let uiPrefs = { pinDefaultModel: true, alignProviderOrder: false };
+let uiPrefs = { pinDefaultModel: true, alignProviderOrder: false, patchPiOrder: false };
 let isProviderEditing = false;
 let isViewKeyMasked = true;
 // 密钥池编辑区当前是为哪个服务商渲染的（null = 未渲染/已清空），
@@ -2719,6 +3306,16 @@ let keyPoolRenderedPid = null;
 // 全局统一 Modal 弹窗 Engine (替代原生 alert / confirm)
 // ==========================================
 let globalDialogResolver = null;
+let globalDialogAltHandler = null;
+
+function handleDialogAlt() {
+  const handler = globalDialogAltHandler;
+  globalDialogAltHandler = null;
+  closeGlobalDialog(false);
+  if (typeof handler === 'function') {
+    try { handler(); } catch (e) { console.error(e); }
+  }
+}
 
 function showConfirm(options) {
   return new Promise((resolve) => {
@@ -2748,6 +3345,19 @@ function showConfirm(options) {
       confirmBtn.className = 'btn ' + (opts.confirmClass || (opts.danger ? 'btn-rose' : 'btn-emerald'));
     }
 
+    // 可选第三个按钮（仅 showConfirm 支持；showAlert 会隐藏它）
+    const altBtn = $id('globalDialogAltBtn');
+    globalDialogAltHandler = typeof opts.onAlt === 'function' ? opts.onAlt : null;
+    if (altBtn) {
+      if (opts.altText) {
+        altBtn.style.display = 'inline-flex';
+        altBtn.innerText = opts.altText;
+        altBtn.className = 'btn ' + (opts.altClass || 'btn-secondary');
+      } else {
+        altBtn.style.display = 'none';
+      }
+    }
+
     if (modal) {
       modal.classList.add('open');
       setTimeout(() => confirmBtn && confirmBtn.focus(), 50);
@@ -2774,6 +3384,10 @@ function showAlert(options) {
     if (msgEl) msgEl.innerText = opts.message || opts.text || '';
 
     if (cancelBtn) cancelBtn.style.display = 'none';
+
+    const altBtn = $id('globalDialogAltBtn');
+    globalDialogAltHandler = null;
+    if (altBtn) altBtn.style.display = 'none';
 
     if (confirmBtn) {
       confirmBtn.innerText = opts.okText || '确定';
@@ -2927,6 +3541,123 @@ async function loadUiPrefs() {
     if (res && res.success && res.prefs) uiPrefs = Object.assign(uiPrefs, res.prefs);
   } catch (e) {}
   syncOrderToggleButtons();
+  updateOrderPatchBtn();
+}
+
+// ==========================================
+// Pi 排序补丁（让 Pi 的厂商分组顺序跟随工具）
+// ==========================================
+async function updateOrderPatchBtn() {
+  const btn = $id('orderPatchBtn');
+  if (!btn) return;
+  try {
+    const res = await window.pywebview.api.get_order_patch_status();
+    const st = (res && res.success && res.status) || {};
+    const on = st.patchedCount > 0 && st.patchedCount === st.targetCount;
+    btn.classList.toggle('is-on', !!on);
+    btn.title = on
+      ? '已打补丁：Pi 按工具的厂商顺序分组' + (st.versionChanged ? '（Pi 已升级，需重打）' : '')
+      : '点击进入：让 Pi 的厂商分组顺序跟随工具（可一键还原原版）';
+  } catch (e) { /* 忽略 */ }
+}
+
+function buildPatchStatusText(st) {
+  const lines = [];
+  lines.push('目标：让 Pi 的 /model 选择器与 `pi --list-models` 按「工具里的厂商顺序」分组。');
+  lines.push('原理：把 Pi 硬编码的 `a.provider.localeCompare(b.provider)` 换成读取顺序文件的排名比较；');
+  lines.push('      顺序文件由工具在每次保存后自动刷新（就是窗口里看到的厂商顺序）。');
+  lines.push('');
+  lines.push('── 当前状态 ──');
+  lines.push('· 自动维护（保存后 / Pi 升级后自动重打）: ' + (st.enabled ? '✅ 已开启' : '⭕ 未开启'));
+  lines.push('· Pi 安装目录: ' + (st.packageDir || '（未找到）'));
+  lines.push('· Pi 版本: ' + (st.piVersion || '未知') + (st.stateVersion ? '（补丁记录版本 ' + st.stateVersion + '）' : ''));
+  lines.push('· 补丁文件: ' + (st.patchedCount || 0) + '/' + (st.targetCount || 0) + (st.fullyPatched ? '  ✅ 已完整打入' : '  ⚠️ 未完整'));
+  (st.targets || []).forEach(function (t) { lines.push('    ' + (t.patched ? '✅' : '⬜') + ' ' + t.rel); });
+  if (st.versionChanged) lines.push('· ⚠️ Pi 已升级，锚点可能变化 → 点「打补丁 / 重打」即可自动重打');
+  lines.push('· 顺序文件: ' + (st.orderFilePath || ''));
+  lines.push('  当前顺序（' + ((st.order || []).length) + ' 项）: ' + ((st.order || []).join(' → ') || '（空，将回退为 Pi 原生字母序）'));
+  lines.push('· 原版备份: ' + (st.backupDir || ''));
+  if (st.error) lines.push('· ⚠️ ' + st.error);
+  lines.push('');
+  lines.push('── 说明 ──');
+  lines.push('· 补丁可随时一键还原（还原后 Pi 恢复原生字母序，工具侧“⇅ Pi 字母序”与之对应）。');
+  lines.push('· Pi 通过 npm 升级会覆盖 dist 目录，但自动维护会在工具保存时或启动时重新打入。');
+  return lines.join('\n');
+}
+
+async function showPiOrderPatchDialog() {
+  setStatus('正在读取 Pi 排序补丁状态...', '#F59E0B');
+  let st = {};
+  try {
+    const res = await window.pywebview.api.get_order_patch_status();
+    if (!res || !res.success) {
+      const msg = (res && res.error) || '未知错误';
+      setStatus('补丁状态读取失败: ' + msg, '#EF4444');
+      await showAlert({ title: 'Pi 顺序补丁', icon: '❌', type: 'error', message: msg, wide: true });
+      return;
+    }
+    st = res.status || {};
+  } catch (e) {
+    setStatus('补丁状态读取异常: ' + e, '#EF4444');
+    return;
+  }
+  setStatus('Pi 排序补丁: ' + (st.patchedCount || 0) + '/' + (st.targetCount || 0) + ' 个文件已打', '#10B981');
+  const ok = await showConfirm({
+    title: '🧩 Pi 顺序补丁（厂商分组顺序跟随工具）',
+    icon: '🧩',
+    wide: true,
+    message: buildPatchStatusText(st),
+    confirmText: st.fullyPatched ? '🔁 重新打补丁' : '🧩 打补丁 / 立即生效',
+    confirmClass: 'btn-purple',
+    cancelText: '关闭',
+    altText: st.patchedCount > 0 ? '🩹 还原原版' : null,
+    altClass: 'btn-secondary',
+    onAlt: async function () {
+      setStatus('正在还原 Pi 原版排序逻辑...', '#F59E0B');
+      try {
+        const r = await window.pywebview.api.revert_order_patch();
+        const rr = (r && r.result) || {};
+        if (r && r.success) {
+          uiPrefs.patchPiOrder = false;
+          setStatus('已还原 Pi 原版排序逻辑（工具自动维护已关闭）', '#10B981');
+          await showAlert({ title: '已还原原版', icon: '🩹', type: 'success', wide: true,
+            message: '已还原 ' + (((rr.reverted) || []).length) + ' 个文件，Pi 恢复原生字母序分组。\n\n' +
+              '· 原版备份仍保留在: ' + ((r.status && r.status.backupDir) || '') + '\n' +
+              '· 随时可再次点「🧩 顺序补丁」重新打入' });
+        } else {
+          setStatus('还原失败: ' + ((r && r.error) || '未知错误'), '#EF4444');
+          await showAlert({ title: '还原失败', icon: '❌', type: 'error', wide: true,
+            message: ((r && r.error) || '未知错误') + '\n\n' + JSON.stringify(rr.failed || [], null, 2) });
+        }
+      } catch (e) {
+        setStatus('还原异常: ' + e, '#EF4444');
+      }
+      updateOrderPatchBtn();
+    }
+  });
+  if (!ok) { updateOrderPatchBtn(); return; }
+  setStatus('正在给 Pi 打入排序补丁...', '#F59E0B');
+  try {
+    const r = await window.pywebview.api.apply_order_patch();
+    const rr = (r && r.result) || {};
+    updateOrderPatchBtn();
+    if (r && r.success) {
+      uiPrefs.patchPiOrder = true;
+      setStatus('✅ Pi 排序补丁已生效（已开启自动维护）', '#10B981');
+      await showAlert({ title: '补丁已生效', icon: '✅', type: 'success', wide: true,
+        message: '✅ 已给 Pi 打入顺序补丁，并开启自动维护。\n\n' +
+          '· 已打文件: ' + (((rr.applied) || []).length) + ' 个（跳过已打 ' + (((rr.skipped) || []).length) + ' 个）\n' +
+          '· 替换锚点: ' + (rr.replacements || 0) + ' 处\n' +
+          '· 厂商顺序: ' + (((rr.order) || []).join(' → ') || '（空）') + '\n\n' +
+          '生效方式：重启 Pi（或重开 /model 选择器）后，Pi 的厂商分组顺序即为工具里的顺序。' });
+    } else {
+      setStatus('补丁失败: ' + ((r && r.error) || '未知错误'), '#EF4444');
+      await showAlert({ title: '补丁未生效', icon: '❌', type: 'error', wide: true,
+        message: ((r && r.error) || '未知错误') + '\n\n失败明细:\n' + JSON.stringify(rr.failed || [], null, 2) });
+    }
+  } catch (e) {
+    setStatus('补丁异常: ' + e, '#EF4444');
+  }
 }
 
 function syncOrderToggleButtons() {
@@ -2958,11 +3689,25 @@ async function toggleUiPref(name) {
     setStatus(uiPrefs.pinDefaultModel
       ? '⭐ 已开启默认模型置顶显示（仅显示层，保存顺序不变）'
       : '已关闭默认模型置顶显示（列表 = 保存顺序）', '#10B981');
-  } else {
+  } else if (name === 'alignProviderOrder') {
     setStatus(uiPrefs.alignProviderOrder
       ? '⇅ 厂商列已切换为 Pi 的字母序（Pi 侧固定按厂商名分组）'
       : '厂商列已恢复为自定义拖拽顺序', '#10B981');
+    // 顺序文件与窗口显示保持一致（开启字母序时，Pi 侧补丁也跟随字母序）
+    await refreshOrderFileIfPatched();
+  } else {
+    setStatus(name + ' 已更新为 ' + (uiPrefs[name] ? '开启' : '关闭'), '#10B981');
   }
+}
+
+// 仅在「补丁正在生效」时刷新顺序文件，避免无谓写盘
+async function refreshOrderFileIfPatched() {
+  try {
+    const res = await window.pywebview.api.get_order_patch_status();
+    if (res && res.success && res.status && res.status.patchedCount > 0) {
+      await window.pywebview.api.ensure_order_patch();
+    }
+  } catch (e) { /* 忽略 */ }
 }
 
 async function showOrderReport() {
@@ -4603,6 +5348,25 @@ async function loadData() {
   renderSidebar();
   await refreshDefaultModel();
 
+  // 启动时自动维护 Pi 排序补丁（Pi 升级会覆盖 dist → 这里有偏好时自动重打）
+  if (uiPrefs.patchPiOrder) {
+    try {
+      const p = await window.pywebview.api.ensure_order_patch();
+      const st = (p && p.status) || {};
+      updateOrderPatchBtn();
+      if (p && p.status && p.status.action === 'patched') {
+        setStatus('🧩 Pi 顺序补丁已自动重打（Pi 版本变化或补丁缺失）', '#10B981');
+        await showAlert({ title: 'Pi 顺序补丁已自动重打', icon: '🧩', type: 'success', wide: true,
+          message: '检测到需要重打补丁，已自动完成：\n\n' +
+            '· Pi 版本: ' + (st.piVersion || '未知') + '\n' +
+            '· 补丁文件: ' + (st.patchedCount || 0) + '/' + (st.targetCount || 0) + '\n' +
+            '· 厂商顺序: ' + (((st.order) || []).join(' → ') || '（空）') });
+      } else if (p && p.status && p.status.action === 'patch-failed') {
+        setStatus('⚠️ Pi 顺序补丁自动重打失败: ' + (st.error || '未知错误') + '（点 🧩 顺序补丁 查看）', '#EF4444');
+      }
+    } catch (e) { /* 忽略 */ }
+  }
+
   const keys = Object.keys(currentConfig.providers || {});
   const preferredPid = (data.selectedProviderId && currentConfig.providers[data.selectedProviderId])
     ? data.selectedProviderId
@@ -4624,6 +5388,18 @@ async function saveAll() {
     if (pid) {
       selectedPid = pid;
       updateProviderViewPanel(pid);
+    }
+    // 保存后：同步 Pi 排序补丁（顺序文件 / 必要时自动重打）
+    const op = res.orderPatch;
+    if (op) {
+      uiPrefs.patchPiOrder = op.action !== 'disabled';
+      if (op.action === 'patched' || op.action === 'order-refreshed') {
+        setStatus(`✅ 已保存 (${countText}) · 🧩 Pi 顺序补丁已同步为当前厂商顺序`,
+          op.fullyPatched ? '#10B981' : '#F59E0B');
+      } else if (op.action === 'patch-failed' || op.action === 'error') {
+        setStatus(`✅ 已保存 (${countText}) · ⚠️ 补丁重打失败: ${op.error || '未知错误'}`, '#EF4444');
+      }
+      updateOrderPatchBtn();
     }
     return true;
   } else {
