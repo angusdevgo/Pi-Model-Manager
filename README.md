@@ -116,6 +116,23 @@ Pi 侧一共存在 **三种顺序**，本工具把每一种都讲清楚并提供
 
 ---
 
+#### 10. 🪐 DeepSeek Harness (DSH) 双端模型管理
+顶部目标页签会在检测到 `~/.dsh` 时自动出现 **🪐 DSH**，直接读写 DSH 的真实配置文件，与 Pi 侧共用同一套工作台：
+
+| 项目 | 说明 |
+| --- | --- |
+| 读写目标 | `~/.dsh/profiles/web/cordis.patch.yml`（`llm-pi-ai` 插件节点）+ `~/.dsh/.credentials.yaml`（`refs` 段） |
+| 从 Pi 导入 | 点 **📥 从 Pi 导入** 弹出勾选列表：可**只导入单个厂商**，也可任意多选；每行显示显示名、路由 ID、模型数与 `新增 / 已存在 / 与 xxx 同 ID` 徽章 |
+| 冲突处理 | 仅当勾选项里存在同名（含仅大小写不同，如 Pi 的 `Xiaomi` 与 DSH 的 `xiaomi`）时才追问：`覆盖冲突项` / `跳过冲突项` / 取消；结果按「新增 N / 覆盖 M / 跳过 K」汇报 |
+| 密钥池下沉 | Pi 侧的多 Key 绑定会按 Key 裂变成多条 DSH 路由（`cpamp`、`cpamp-<keyId>`），并写入 `CPAMP_API_KEY`、`CPAMP_<KEYID>_API_KEY` 等凭据引用 |
+| 内置路由可见 | DSH base 层自带的 `deepseek-official`（官方 API）与 `deepseek-account`（账号登录）也会列在侧栏并打上 `DSH内置` 徽章；面板里展示插件条目 / 凭据引用 / 启停状态 |
+| 内置路由禁用 | 这两条路由不在 `llm-pi-ai.providers` 里，DSH 本身无法删除；工具提供 **⏸️ 禁用内置路由 / ▶️ 恢复内置路由**，写入 `- id: llm-deepseek` + `disabled: true` 补丁，**重启 DSH 后生效** |
+| 空值防护 | DSH 的 `llm-pi-ai` 对空字符串零容忍（`provider "x" has an empty baseURL` 会直接打死整个适配器，所有路由一起消失）。工具写盘时**省略空值字段**（`baseURL` / `displayName` / `api` / 空 `input`），并丢弃 Fetch 无法发送的非法 `headers`，让 DSH 回退到内置目录默认值 |
+| 无损写回 | 保留 `cordis.patch.yml` 顶部注释块、`llm-pi-ai` 节点里 `providers` 以外的用户配置键，以及其它 patch 节点 |
+| 生效时机 | DSH 只在启动时组合 patch 层，因此**改完需重启 DSH**（本工具不代劳重启） |
+
+---
+
 ### 🚀 快速开始
 
 #### 1. 环境依赖
@@ -125,14 +142,14 @@ pip install pywebview
 ```
 
 #### 2. 启动应用
-* **推荐（静默启动）**：双击 `launch.vbs` 或运行 `Fix-Shortcut.bat` 生成桌面无黑框快捷方式后直接双击桌面图标启动。
+* **推荐（静默启动）**：双击 `launch.vbs` 或运行 `Fix-Shortcut.bat` 生成桌面无黑框快捷方式后直接双击桌面图标启动（优先运行 `dist/PiModelManager.exe`，没有则回退源码模式）。
 * **命令行启动**：
   ```bash
-  pythonw desktop_app.py
+  pythonw src\desktop_app.py
   # 或者带控制台调试输出：
-  python desktop_app.py
+  python src\desktop_app.py
   ```
-* **自检提示**：若启动时弹出「Pi Model Manager 自检警告」，说明工具源码里内嵌的 JS 有语法问题（详见 §7 / §8 的自身门禁），弹窗会直接给出行号；控制台启动（`python desktop_app.py`）可在 stderr 同步看到。
+* **自检提示**：若启动时弹出「Pi Model Manager 自检警告」，说明工具源码里内嵌的 JS 有语法问题（详见 §7 / §8 的自身门禁），弹窗会直接给出行号；控制台启动（`python src\desktop_app.py`）可在 stderr 同步看到。
 
 ---
 
@@ -151,21 +168,29 @@ pip install pywebview
 
 ```text
 pi-model-manager/
-├── desktop_app.py      # 桌面端主程序 (Pywebview GUI + 响应式前端)
-├── models-sync.ts      # Pi Coding Agent 官方热重载扩展插件
-├── launch.vbs          # Windows 静默无黑框后台启动脚本
-├── PiModelManager.bat  # 智能探测路径启动批处理
-├── Fix-Shortcut.bat    # 快捷方式一键修复引导入口
-├── fix_shortcut.ps1    # PowerShell 快捷方式目标与图标重定向工装
+├── src/
+│   ├── desktop_app.py      # 桌面端主程序 (Pywebview GUI + 响应式前端 + 内嵌 JS 门禁)
+│   └── models-sync.ts      # Pi Coding Agent 官方热重载扩展插件
+├── scripts/
+│   ├── build.ps1               # PyInstaller 一键打包（含 exe --selftest 冒烟）
+│   ├── PiModelManager.spec     # 打包配置（onefile / 无控制台）
+│   └── fix_shortcut.ps1        # PowerShell 快捷方式目标与图标重定向工装
 ├── tests/
-│   └── verify_order_patch.py   # 🧩 顺序补丁全流程自检（沙箱运行，Pi 升级后可复验）
-├── README.md           # 中英双语权威使用文档
-└── .gitignore          # 运行态文件过滤配置
+│   ├── verify_order_patch.py   # 🧩 顺序补丁全流程自检（沙箱运行，Pi 升级后可复验）
+│   ├── test_infer_specs.py     # 🧠 模型能力推断回归（56 项断言）
+│   ├── test_ui_helpers.py      # 🧪 内嵌 JS 静态门禁（幽灵函数调用 / 转义 / 语法）
+│   └── test_dsh_save.py        # 🪐 DSH 写盘门禁（空值致命字段 / 内置路由 / 注释保留）
+├── launch.vbs              # Windows 静默无黑框后台启动脚本
+├── PiModelManager.bat      # 智能探测路径启动批处理
+├── Fix-Shortcut.bat        # 快捷方式一键修复引导入口
+├── README.md               # 中英双语权威使用文档
+└── .gitignore              # 运行态 / 构建产物过滤配置
 ```
 
 > 运行期文件（均在 `~/.pi/agent/`，不污染 Pi 配置）：`model-manager-settings.json`（工具开关）、
 > `pi-provider-order.json`（补丁读取的厂商顺序）、`pi-order-patch-state.json`（补丁状态）、
 > `pi-order-patch-backup/`（Pi 原文件字节级备份）。
+> DSH 侧仅读写 `~/.dsh/profiles/web/cordis.patch.yml` 与 `~/.dsh/.credentials.yaml`。
 
 ---
 
@@ -271,6 +296,23 @@ By default Pi groups providers **alphabetically** by provider ID and ignores the
 
 ---
 
+#### 10. 🪐 DeepSeek Harness (DSH) Dual-Target Management
+When `~/.dsh` exists, a **🪐 DSH** target tab appears in the header. It reads and writes DSH's real configuration files, sharing the same workbench with Pi:
+
+| Item | Detail |
+| --- | --- |
+| Targets | `~/.dsh/profiles/web/cordis.patch.yml` (the `llm-pi-ai` plugin node) + `~/.dsh/.credentials.yaml` (`refs`) |
+| Import from Pi | **📥 Import from Pi** opens a checklist: import **a single provider** or any subset. Each row shows display name, route id, model count and a `new / exists / same id as x` badge |
+| Conflict handling | The overwrite/skip prompt only appears when a selected route already exists (including case-only clashes such as Pi's `Xiaomi` vs DSH's `xiaomi`): `Overwrite` / `Skip` / cancel, reported as «added N / overwritten M / skipped K» |
+| Key-pool fan-out | Pi's per-model key bindings are fanned out into one DSH route per key (`cpamp`, `cpamp-<keyId>`) with matching `CPAMP_API_KEY` / `CPAMP_<KEYID>_API_KEY` credential refs |
+| Built-in routes | DSH's base-layer `deepseek-official` (API key) and `deepseek-account` (OAuth login) are listed too, badged `DSH内置`, with plugin entry / credential ref / state shown in the panel |
+| Disabling built-ins | Those routes are not part of `llm-pi-ai.providers` and DSH cannot delete them; the tool offers **⏸️ Disable / ▶️ Restore**, writing a `- id: llm-deepseek` + `disabled: true` patch that takes effect after a **DSH restart** |
+| Empty-value guard | DSH's `llm-pi-ai` rejects empty strings outright (`provider "x" has an empty baseURL` kills the whole adapter, taking every route down). The tool **omits empty fields** (`baseURL` / `displayName` / `api` / empty `input`) and drops headers Fetch cannot send, letting DSH fall back to catalog defaults |
+| Lossless writes | Keeps the header comment block, user keys inside the `llm-pi-ai` node other than `providers`, and every other patch entry |
+| When it applies | DSH composes patch layers only at boot, so **restart DSH** after changes (the tool never restarts it for you) |
+
+---
+
 ### 🚀 Quick Start
 
 #### 1. Requirements
@@ -280,14 +322,14 @@ pip install pywebview
 ```
 
 #### 2. Launch
-* **Recommended (Silent Launch)**: Double-click `launch.vbs` or run `Fix-Shortcut.bat` to create a clean desktop shortcut.
+* **Recommended (Silent Launch)**: Double-click `launch.vbs` or run `Fix-Shortcut.bat` to create a clean desktop shortcut (it prefers `dist/PiModelManager.exe` and falls back to source mode).
 * **Via Command Line**:
   ```bash
-  pythonw desktop_app.py
+  pythonw src\desktop_app.py
   # Or with console logging:
-  python desktop_app.py
+  python src\desktop_app.py
   ```
-* **Self-check notice**: if a «Pi Model Manager 自检警告» popup appears at launch, the tool's embedded JS has a syntax problem (see the self-check gate in sections 7 / 8). The popup reports the offending line; launching with `python desktop_app.py` mirrors it on stderr.
+* **Self-check notice**: if a «Pi Model Manager 自检警告» popup appears at launch, the tool's embedded JS has a syntax problem (see the self-check gate in sections 7 / 8). The popup reports the offending line; launching with `python src\desktop_app.py` mirrors it on stderr.
 
 ---
 
@@ -306,21 +348,29 @@ To enable instant hot-reloading in running Pi sessions:
 
 ```text
 pi-model-manager/
-├── desktop_app.py      # Main Desktop Application (Pywebview + UI)
-├── models-sync.ts      # Hot-reload extension for Pi Coding Agent
-├── launch.vbs          # Silent background launcher (no CMD window)
-├── PiModelManager.bat  # Smart environment detection launcher
-├── Fix-Shortcut.bat    # Shortcut repair helper entrypoint
-├── fix_shortcut.ps1    # PowerShell shortcut target & icon fixer
+├── src/
+│   ├── desktop_app.py      # Main desktop application (Pywebview + UI + embedded-JS gate)
+│   └── models-sync.ts      # Hot-reload extension for Pi Coding Agent
+├── scripts/
+│   ├── build.ps1               # One-shot PyInstaller build (includes exe --selftest smoke)
+│   ├── PiModelManager.spec     # Build spec (onefile / windowed)
+│   └── fix_shortcut.ps1        # PowerShell shortcut target & icon fixer
 ├── tests/
-│   └── verify_order_patch.py   # 🧩 Order-patch end-to-end self-test (sandboxed, re-run after Pi upgrades)
-├── README.md           # Bilingual documentation
-└── .gitignore          # Git ignore rules
+│   ├── verify_order_patch.py   # 🧩 Order-patch end-to-end self-test (sandboxed, re-run after Pi upgrades)
+│   ├── test_infer_specs.py     # 🧠 Capability-inference regression (56 assertions)
+│   ├── test_ui_helpers.py      # 🧪 Embedded-JS static gate (phantom helpers / escapes / syntax)
+│   └── test_dsh_save.py        # 🪐 DSH write gate (fatal empty fields / built-in routes / comments)
+├── launch.vbs              # Silent background launcher (no CMD window)
+├── PiModelManager.bat      # Smart environment detection launcher
+├── Fix-Shortcut.bat        # Shortcut repair helper entrypoint
+├── README.md               # Bilingual documentation
+└── .gitignore              # Runtime / build artifacts ignore rules
 ```
 
 > Runtime files (all under `~/.pi/agent/`, never polluting Pi config): `model-manager-settings.json`
 > (tool toggles), `pi-provider-order.json` (provider order read by the patch),
 > `pi-order-patch-state.json` (patch state), `pi-order-patch-backup/` (byte-level backups of Pi originals).
+> On the DSH side only `~/.dsh/profiles/web/cordis.patch.yml` and `~/.dsh/.credentials.yaml` are touched.
 
 ---
 

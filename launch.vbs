@@ -1,10 +1,17 @@
-Dim fso, shell, scriptDir, appPy, pythonw, cmd
+Dim fso, shell, scriptDir, appPy, exePath, pythonw, cmd
 
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set shell = CreateObject("WScript.Shell")
 
 scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
-appPy = scriptDir & "\desktop_app.py"
+exePath = scriptDir & "\dist\PiModelManager.exe"
+appPy = scriptDir & "\src\desktop_app.py"
+
+' 优先使用打包后的独立 exe（目标机无需安装 Python）
+If fso.FileExists(exePath) Then
+    shell.Run """" & exePath & """", 0, False
+    WScript.Quit 0
+End If
 
 Function FindPythonw()
     On Error Resume Next

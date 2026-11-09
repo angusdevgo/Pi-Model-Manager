@@ -5,8 +5,11 @@
 
 $projectDir = $PSScriptRoot
 if (-not $projectDir) { $projectDir = (Get-Location).Path }
+# 本脚本位于 <项目>\scripts，项目根目录取上一级
+if ((Split-Path $projectDir -Leaf) -eq 'scripts') { $projectDir = Split-Path $projectDir -Parent }
 $vbsPath = Join-Path $projectDir 'launch.vbs'
-$appPy = Join-Path $projectDir 'desktop_app.py'
+$exePath = Join-Path $projectDir 'dist\PiModelManager.exe'
+$appPy = Join-Path $projectDir 'src\desktop_app.py'
 
 Write-Host "Project dir : $projectDir"
 Write-Host "VBS Target  : $vbsPath"
@@ -61,7 +64,12 @@ foreach ($dir in $desktops) {
 function Configure-Shortcut($lnkPath) {
     try {
         $lnk = $shell.CreateShortcut($lnkPath)
-        if ($pythonw -and (Test-Path -LiteralPath $pythonw)) {
+        if (Test-Path -LiteralPath $exePath) {
+            # 已打包：直接指向独立 exe（免 Python 环境）
+            $lnk.TargetPath = $exePath
+            $lnk.Arguments = ""
+            $lnk.IconLocation = "$exePath,0"
+        } elseif ($pythonw -and (Test-Path -LiteralPath $pythonw)) {
             $lnk.TargetPath = $pythonw
             $lnk.Arguments = "`"$appPy`""
             $lnk.IconLocation = "$pythonw,0"

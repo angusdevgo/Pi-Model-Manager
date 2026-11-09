@@ -9,6 +9,7 @@ if sys.stderr is None:
 
 import fnmatch
 import html as _html
+import inspect
 import json
 import os
 import re
@@ -16,16 +17,97 @@ import shutil
 import subprocess
 import threading
 import time
+import traceback
+import functools
 from datetime import datetime
 import urllib.error
 import urllib.request
 import webview
 from pathlib import Path
+import dsh_config
+
+def is_dsh_path(path_val) -> bool:
+    if not path_val:
+        return False
+    p = str(path_val).replace("\\", "/").lower()
+    return "cordis.patch.yml" in p or "/.dsh/" in p
 
 DEFAULT_AGENT_DIR = Path(os.environ.get("PI_CODING_AGENT_DIR", Path.home() / ".pi" / "agent"))
 DEFAULT_MODELS_PATH = DEFAULT_AGENT_DIR / "models.json"
 CURRENT_CONFIG_PATH = DEFAULT_MODELS_PATH
 PI_SETTINGS_PATH = DEFAULT_AGENT_DIR / "settings.json"
+
+
+# ==========================================================
+# 错误日志 / 诊断（pythonw 无终端也能完整回溯报错）
+# ==========================================================
+LOG_PATH = DEFAULT_AGENT_DIR / "pi-model-manager.log"
+LOG_MAX_BYTES = 1_500_000
+LOG_DETAIL_LIMIT = 12000
+_LOG_LOCK = threading.Lock()
+
+
+def clip_text(value, limit=LOG_DETAIL_LIMIT):
+    """错误详情不做粗暴截断：仅在超长时收口，并显式标注原始长度。"""
+    text = "" if value is None else str(value)
+    if not limit or len(text) <= limit:
+        return text
+    return text[:limit] + "\n…〔已截断显示，原始内容共 %d 字符；完整内容见日志文件〕" % len(text)
+
+
+def write_log(level, source, message, detail=""):
+    """追加一条日志到 ~/.pi/agent/pi-model-manager.log（自动轮转，异常静默）。"""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    block = "[%s] [%s] [%s] %s\n" % (ts, str(level).upper(), source, message)
+    if detail:
+        block += str(detail).rstrip() + "\n"
+    try:
+        with _LOG_LOCK:
+            LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            if LOG_PATH.exists() and LOG_PATH.stat().st_size > LOG_MAX_BYTES:
+                try:
+                    backup = LOG_PATH.with_suffix(".log.1")
+                    if backup.exists():
+                        backup.unlink()
+                    LOG_PATH.replace(backup)
+                except Exception:
+                    pass
+            with LOG_PATH.open("a", encoding="utf-8") as fp:
+                fp.write(block)
+    except Exception:
+        pass
+    return block
+
+
+def log_exception(source, exc=None, extra=""):
+    """记录异常（含完整 traceback）并落盘。"""
+    exc = exc if exc is not None else sys.exc_info()[1]
+    tb = traceback.format_exc()
+    if not tb or tb.strip() == "NoneType: None":
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)) if exc else ""
+    return write_log("ERROR", source, "%s: %s" % (type(exc).__name__, exc),
+                     "\n".join(x for x in [extra, tb] if x))
+
+
+def install_exception_hooks():
+    """兜底捕获：主线程 / 子线程未处理异常全部落盘，避免 pythonw 下静默消失。"""
+    def _hook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        write_log("ERROR", "uncaught", "%s: %s" % (exc_type.__name__, exc_value),
+                  "".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+
+    def _thread_hook(args):
+        if args.exc_type is SystemExit:
+            return
+        write_log("ERROR", "thread:%s" % getattr(args.thread, "name", "?"),
+                  "%s: %s" % (args.exc_type.__name__, args.exc_value),
+                  "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)))
+
+    sys.excepthook = _hook
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = _thread_hook
 
 # 始终在侧栏中展示的内置厂商（其余内置厂商仅在检测到凭据时展示）
 CORE_BUILTIN_PROVIDERS = ["deepseek", "xiaomi", "openai", "anthropic", "google"]
@@ -372,7 +454,7 @@ def build_order_compare(path_value=None, alpha=False):
         "verdict": {"cls": verdict_cls, "text": verdict},
         "disabledCount": len(disabled_rows),
         "selfCheckOk": self_ok,
-        "selfCheckMsg": "" if self_ok else str(_self_msg)[:300],
+        "selfCheckMsg": "" if self_ok else clip_text(_self_msg, 3000),
         "configPath": str(sn["path"]),
         "orderFilePath": str(pst.get("orderFilePath") or PI_PROVIDER_ORDER_PATH),
         "title": "顺序自检 · 工具 ↔ Pi" + ("（🧩 补丁生效）" if patch_on else ""),
@@ -575,7 +657,7 @@ def build_order_report(path_value=None):
         lines.append("  · 内嵌 JS 语法 node --check: ✅ 通过")
     else:
         lines.append("  · 内嵌 JS 语法 node --check: ❌ 失败 —— 界面会停在静态初始态（状态栏仍是初始文字）")
-        lines.append("       " + str(_msg).replace("\n", " ")[:300])
+        lines.append("       " + clip_text(str(_msg).replace("\n", " "), 3000))
     lines.append("")
 
     lines.append("── 结论 ──")
@@ -835,7 +917,7 @@ def verify_js_syntax(path):
         return True, f"语法校验异常（已跳过）: {e}"
     if proc.returncode == 0:
         return True, ""
-    return False, (proc.stderr or proc.stdout or "").strip()[:400]
+    return False, clip_text((proc.stderr or proc.stdout or "").strip(), 8000)
 
 
 def write_pi_provider_order(path_value=None, order_list=None):
@@ -1527,17 +1609,8 @@ def clean_pi_config(cfg):
                 model.pop("_failStreak", None)
                 model.pop("_lastError", None)
 
-                # 自动推断并静默补齐能力元数据 (contextWindow / maxTokens / input / reasoning)
-                if not model.get("contextWindow") or not model.get("input") or not model.get("maxTokens"):
-                    specs = infer_model_specs(model_id, model, catalog)
-                    if not model.get("contextWindow"):
-                        model["contextWindow"] = specs["contextWindow"]
-                    if not model.get("maxTokens"):
-                        model["maxTokens"] = specs["maxTokens"]
-                    if not model.get("input"):
-                        model["input"] = specs["input"]
-                    if "reasoning" not in model and specs.get("reasoning"):
-                        model["reasoning"] = specs["reasoning"]
+                # 官方参数对齐：缺失补齐；历史默认痕迹按官方推断值刷新
+                refresh_official_specs(model, catalog)
 
                 cleaned.append(model)
             provider["models"] = cleaned
@@ -1606,6 +1679,14 @@ def build_pi_disk_config(cfg):
             if provider.get(key) not in (None, "", {}):
                 out[key] = provider[key]
 
+        # 自定义 OpenAI 兼容服务商如果未配置 compat，自动补全安全兼容垫片（屏蔽 developer role、统一使用 max_tokens、关闭 store）
+        if not is_builtin and provider.get("api") == "openai-completions" and not out.get("compat"):
+            out["compat"] = {
+                "supportsDeveloperRole": False,
+                "maxTokensField": "max_tokens",
+                "supportsStore": False,
+            }
+
         if provider.get("apiKeys"):
             out["apiKeys"] = provider["apiKeys"]
 
@@ -1638,17 +1719,8 @@ def build_pi_disk_config(cfg):
                 if not entry_out.get("baseUrl") and provider_base and "baseUrl" not in out:
                     entry_out["baseUrl"] = provider_base
 
-                # 确保自建模型写盘时具备完整的上下文与多模态定义
-                if not entry_out.get("contextWindow") or not entry_out.get("input") or not entry_out.get("maxTokens"):
-                    specs = infer_model_specs(mid, entry_out, catalog)
-                    if not entry_out.get("contextWindow"):
-                        entry_out["contextWindow"] = specs["contextWindow"]
-                    if not entry_out.get("maxTokens"):
-                        entry_out["maxTokens"] = specs["maxTokens"]
-                    if not entry_out.get("input"):
-                        entry_out["input"] = specs["input"]
-                    if "reasoning" not in entry_out and specs.get("reasoning"):
-                        entry_out["reasoning"] = specs["reasoning"]
+                # 确保自建模型写盘时具备完整的上下文与多模态定义（含官方参数刷新）
+                refresh_official_specs(entry_out, catalog)
 
                 out_models.append(entry_out)
                 continue
@@ -1663,13 +1735,8 @@ def build_pi_disk_config(cfg):
                 if key in model and model.get(key) is not None:
                     base[key] = model[key]
 
-            # 内置模型若在 catalog 中缺少必要字段，同样兜底补齐
-            if not base.get("contextWindow") or not base.get("input") or not base.get("maxTokens"):
-                specs = infer_model_specs(mid, base, catalog)
-                if not base.get("contextWindow"): base["contextWindow"] = specs["contextWindow"]
-                if not base.get("maxTokens"): base["maxTokens"] = specs["maxTokens"]
-                if not base.get("input"): base["input"] = specs["input"]
-                if "reasoning" not in base and specs.get("reasoning"): base["reasoning"] = specs["reasoning"]
+            # 内置模型若在 catalog 中缺少必要字段，同样兜底补齐（含官方参数刷新）
+            refresh_official_specs(base, catalog)
 
             out_models.append(base)
 
@@ -1980,8 +2047,242 @@ def export_all_providers_txt(config, config_path):
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 
+_CATALOG_PREFIX_RE = re.compile(r'^(chat|image|classifier|embed|embedding|rerank|audio|video):')
+
+# 常见 vendor 别名归一（聚合站命名 -> pi-ai 目录命名）
+_VENDOR_ALIAS = {
+    "zai-org": "zai", "zhipuai": "zai", "z-ai": "zai", "zai": "zai",
+    "alibaba": "qwen", "qwen": "qwen",
+    "deepseek-ai": "deepseek", "deepseek": "deepseek",
+    "x-ai": "xai", "spacexai": "xai", "xai": "xai",
+    "moonshot": "moonshotai", "moonshotai": "moonshotai",
+    "minimax-ai": "minimax", "minimaxai": "minimax", "minimax": "minimax",
+    "bytedance-seed": "bytedance", "bytedance": "bytedance",
+    "tencent": "tencent",
+}
+
+
+def _catalog_match_keys(mid):
+    """把模型 ID 规范化为一组候选匹配键，用于和 pi-ai 目录（chat:vendor/name 格式）对齐。
+
+    例：
+      "chat:qwen/qwen3.7-max"      -> ["qwen/qwen3.7-max", "qwen3.7-max"]
+      "openrouter:zai-org/glm-5.3" -> ["zai-org/glm-5.3", "glm-5.3", "zai/glm-5.3"]
+      "deepseek-v3.2"              -> ["deepseek-v3.2"]
+    """
+    s = str(mid or "").lower().strip()
+    prev = None
+    while prev != s:
+        prev = s
+        s = _CATALOG_PREFIX_RE.sub("", s, count=1)
+    if not s:
+        return []
+    keys = [s]
+    if "/" in s:
+        vendor, rest = s.split("/", 1)
+        keys.append(rest)
+        canon = _VENDOR_ALIAS.get(vendor)
+        if canon and rest:
+            keys.append(f"{canon}/{rest}")
+    return [k for k in dict.fromkeys(keys) if k]
+
+
+def _is_vision_id(target, raw_item=None):
+    """根据 ID 关键词与上游原始数据判断是否多模态视觉模型。"""
+    raw_item = raw_item if isinstance(raw_item, dict) else {}
+    if any(k in target for k in ["gemini", "claude", "gpt-4o", "chatgpt-4o", "gpt-4.1",
+                                  "o1", "o3", "o4", "vl", "vision", "omni", "4v", "visual", "mimo"]):
+        return True
+    inp = raw_item.get("input")
+    if isinstance(inp, list) and "image" in inp:
+        return True
+    if any(raw_item.get(k) for k in ["multimodal", "is_multimodal"]):
+        return True
+    return False
+
+
+def _is_reasoning_id(target, raw_item=None):
+    """根据 ID 关键词与上游原始数据判断是否推理思考模型。"""
+    raw_item = raw_item if isinstance(raw_item, dict) else {}
+    if any(k in target for k in ["r1", "reasoner", "thinking", "thought", "qwq", "zero", "deepseek-v4", "mimo"]):
+        return True
+    if "claude-3-7" in target or "claude-3.7" in target:
+        return True
+    if re.search(r'\bo[134](-mini|-preview)?\b', target):
+        return True
+    if "flash-thinking" in target or "gemini-2.5" in target or "gemini-3" in target:
+        return True
+    if "gpt-5" in target or "gpt-6" in target:
+        return True
+    if raw_item.get("reasoning") is not None:
+        return bool(raw_item["reasoning"])
+    return False
+
+
+# 目录索引缓存（catalog 是全局缓存的同一对象，用 id() 识别失效）
+_CATALOG_INDEX_CACHE = {"ref": None, "entry_map": {}, "entry_list": []}
+
+
+def _build_catalog_index(catalog):
+    if _CATALOG_INDEX_CACHE["ref"] is catalog:
+        return _CATALOG_INDEX_CACHE
+    entry_keys = []  # [(key, model_def)]
+    for _pid, pdata in catalog.items():
+        for m in pdata.get("models", []):
+            m_id = str(m.get("id") or "").lower().strip()
+            if not m_id:
+                continue
+            for k in _catalog_match_keys(m_id):
+                entry_keys.append((k, m))
+    _CATALOG_INDEX_CACHE["ref"] = catalog
+    _CATALOG_INDEX_CACHE["entry_map"] = dict(entry_keys)
+    _CATALOG_INDEX_CACHE["entry_list"] = entry_keys
+    return _CATALOG_INDEX_CACHE
+
+
+# 日期后缀模式："claude-sonnet-4-5-20250929" -> 基座 "claude-sonnet-4-5"
+_DATE_SUFFIX_RE = re.compile(r'[-_.]?[0-9]{4,8}([-_.][0-9a-z]+)*')
+
+
+def _catalog_model_lookup(catalog, mid, raw_item=None):
+    """在 pi-ai 内置目录中查找模型，返回 specs dict 或 None。
+
+    匹配策略（按优先级）：
+    1. raw_item 里自带的数值参数（上游 /v1/models 直报，最可信）
+    2. 精确匹配（剥前缀 / vendor 别名归一后与目录条目全等）
+    3. 后缀 / 日期快照匹配（自定义聚合站的长 ID）
+    """
+    if not catalog:
+        return None
+    raw_item = raw_item if isinstance(raw_item, dict) else {}
+
+    def _specs_from(m):
+        specs = {}
+        if m.get("contextWindow"):
+            specs["contextWindow"] = int(m["contextWindow"])
+        if m.get("maxTokens"):
+            specs["maxTokens"] = int(m["maxTokens"])
+        if m.get("input"):
+            specs["input"] = list(m["input"])
+        if "reasoning" in m:
+            specs["reasoning"] = bool(m["reasoning"])
+        return specs if len(specs) >= 2 else None
+
+    # 1. 上游直报的原始数值最优先
+    raw_specs = {}
+    cw = raw_item.get("context_length") or raw_item.get("context_window") or raw_item.get("max_context_tokens") or raw_item.get("contextWindow")
+    mt = raw_item.get("max_tokens") or raw_item.get("max_output_tokens") or raw_item.get("maxTokens")
+    if isinstance(cw, (int, float)) and cw >= 4096:
+        raw_specs["contextWindow"] = int(cw)
+    if isinstance(mt, (int, float)) and mt >= 512:
+        raw_specs["maxTokens"] = int(mt)
+    if isinstance(raw_item.get("input"), list) and "image" in raw_item["input"]:
+        raw_specs["input"] = ["text", "image"]
+    if raw_item.get("reasoning") is not None:
+        raw_specs["reasoning"] = bool(raw_item["reasoning"])
+    if "contextWindow" in raw_specs or "maxTokens" in raw_specs:
+        return raw_specs
+
+    target_keys = _catalog_match_keys(mid)
+    if not target_keys:
+        return None
+    idx = _build_catalog_index(catalog)
+    entry_map = idx["entry_map"]
+    entry_keys = idx["entry_list"]
+
+    # 2. 精确匹配
+    for tk in target_keys:
+        hit = entry_map.get(tk)
+        if hit:
+            specs = _specs_from(hit)
+            if specs:
+                return specs
+
+    # 3. 后缀 / 日期快照匹配（要求键足够长，避免误命中）
+    for tk in target_keys:
+        if len(tk) < 6:
+            continue
+        for k, m in entry_keys:
+            if len(k) < 6:
+                continue
+            if tk.endswith(k) or k.endswith(tk):
+                specs = _specs_from(m)
+                if specs:
+                    return specs
+            elif tk.startswith(k) and _DATE_SUFFIX_RE.fullmatch(tk[len(k):] or ""):
+                specs = _specs_from(m)
+                if specs:
+                    return specs
+
+    return None
+
+
+def _catalog_override_for(t):
+    """目录勘误：内置 pi-ai 目录滞后于官方真实物理参数的模型，以下列实测值为准。
+
+    gpt-6/6.1 全系与 gpt-5.4 基座：官方真实物理容量 1.05M（输入上限 922K），
+    内置目录仍标 272K，会导致 Agent 在 272K 提前截断/压缩。
+    """
+    t = str(t or "").lower()
+    if ("gpt-6" in t or "gpt-5.4" in t or "gpt-5-4" in t) and "mini" not in t and "nano" not in t:
+        return {"contextWindow": 1050000, "maxTokens": 128000}
+    return None
+
+
+# 历史默认填充痕迹 / 已知滞后的目录值——这些值不应视为用户自定义，允许被官方推断值刷新
+_LEGACY_DEFAULT_CW = {128000, 245760, 272000}
+_LEGACY_DEFAULT_MT = {8192, 16384}
+
+
+def refresh_official_specs(model, catalog=None, force=False):
+    """官方参数对齐（在位刷新 model dict）。
+
+    原则：模型参数一律以官方为准。
+    - 字段缺失 → 补齐官方推断值（原有行为）；
+    - 字段值是历史默认填充痕迹（128000/8192 等旧默认）或已知的滞后目录值
+      （如 gpt-6 系 272000）→ 按官方推断值刷新，纠正“1M 被识别成 128K”类的存量错误；
+    - 其它值视为用户自定义，不覆盖；除非 force=True（用户显式要求重置）。
+
+    注意：推断时不把 model 自身作为 raw_item 传入——否则旧值会被当成
+    “上游直报数值”原样返回，刷新永远不生效。
+    """
+    mid = model.get("id")
+    if not mid:
+        return model
+    # 仅保留能力标志（不携带数值），避免旧数值干扰推断
+    raw_hint = {}
+    if isinstance(model.get("input"), list):
+        raw_hint["input"] = model["input"]
+    if model.get("reasoning") is not None:
+        raw_hint["reasoning"] = bool(model["reasoning"])
+    try:
+        specs = infer_model_specs(mid, raw_hint, catalog)
+    except Exception:
+        return model
+    cw = model.get("contextWindow")
+    mt = model.get("maxTokens")
+    if force or not cw or (isinstance(cw, int) and cw in _LEGACY_DEFAULT_CW):
+        if specs.get("contextWindow") and specs["contextWindow"] != cw:
+            model["contextWindow"] = specs["contextWindow"]
+    if force or not mt or (isinstance(mt, int) and mt in _LEGACY_DEFAULT_MT):
+        if specs.get("maxTokens") and specs["maxTokens"] != mt:
+            model["maxTokens"] = specs["maxTokens"]
+    if not model.get("input") and specs.get("input"):
+        model["input"] = specs["input"]
+    if "reasoning" not in model and specs.get("reasoning"):
+        model["reasoning"] = specs["reasoning"]
+    return model
+
+
 def infer_model_specs(mid, raw_item=None, catalog=None):
-    """根据模型 ID、上游原始数据与内置目录智能推断 contextWindow, maxTokens, input, reasoning。"""
+    """根据模型 ID、上游原始数据与内置目录智能推断 contextWindow, maxTokens, input, reasoning。
+
+    优先级：
+    1. raw_item 上游直报数值（context_length / max_tokens 等）
+    2. pi-ai 内置目录匹配（chat:vendor/name 前缀已剥离对齐）
+    3. 关键词显式长度（1m / 256k / ...）
+    4. 家族规格表（按当前真实参数维护）
+    """
     raw_item = raw_item if isinstance(raw_item, dict) else {}
     if catalog is None:
         try:
@@ -1989,133 +2290,243 @@ def infer_model_specs(mid, raw_item=None, catalog=None):
         except Exception:
             catalog = {}
 
-    clean_id = re.sub(r'^(cn:|global:|[a-zA-Z0-9_\-\.]+/)', '', str(mid or '')).lower().strip()
-    full_id = str(mid or '').lower().strip()
-
-    # 1. 尝试从 Pi 内置 catalog 匹配继承
+    # 1+2. 上游数值 / 目录匹配继承
     if catalog:
-        for pid, pdata in catalog.items():
-            for m in pdata.get("models", []):
-                m_id = str(m.get("id") or "").lower().strip()
-                if m_id and (m_id == clean_id or m_id == full_id or clean_id.endswith(m_id)):
-                    specs = {}
-                    if m.get("contextWindow"): specs["contextWindow"] = int(m["contextWindow"])
-                    if m.get("maxTokens"): specs["maxTokens"] = int(m["maxTokens"])
-                    if m.get("input"): specs["input"] = list(m["input"])
-                    if "reasoning" in m: specs["reasoning"] = bool(m["reasoning"])
-                    if len(specs) >= 3:
-                        return {
-                            "contextWindow": specs.get("contextWindow", 128000),
-                            "maxTokens": specs.get("maxTokens", 16384),
-                            "input": specs.get("input", ["text", "image"]),
-                            "reasoning": specs.get("reasoning", False)
-                        }
+        specs = _catalog_model_lookup(catalog, mid, raw_item)
+        if specs:
+            keys = _catalog_match_keys(mid)
+            t = keys[0] if keys else str(mid or "").lower().strip()
+            # 目录勘误：实测参数覆盖滞后的目录值
+            override = _catalog_override_for(t)
+            if override:
+                specs = {**specs, **override}
+            return {
+                "contextWindow": int(specs.get("contextWindow") or 128000),
+                "maxTokens": int(specs.get("maxTokens") or 16384),
+                "input": list(specs.get("input") or (["text", "image"] if _is_vision_id(t, raw_item) else ["text"])),
+                "reasoning": bool(specs.get("reasoning", _is_reasoning_id(t, raw_item))),
+            }
 
-    # 2. 从 raw_item 尝试提取上游真实参数
+    keys = _catalog_match_keys(mid)
+    t = keys[0] if keys else str(mid or "").lower().strip()
+
     cw = raw_item.get("context_length") or raw_item.get("context_window") or raw_item.get("max_context_tokens") or raw_item.get("contextWindow")
     mt = raw_item.get("max_tokens") or raw_item.get("max_output_tokens") or raw_item.get("maxTokens")
-    inp = raw_item.get("input")
-    reasoning = raw_item.get("reasoning")
 
-    target = clean_id or full_id
+    # 视觉多模态 / 推理思考判断
+    is_vision = _is_vision_id(t, raw_item)
+    is_reasoning = _is_reasoning_id(t, raw_item)
 
-    # 视觉多模态判断
-    is_vision = False
-    if any(k in target for k in ["gemini", "claude", "gpt-4o", "chatgpt-4o", "o1", "o3", "vl", "vision", "omni", "4v", "visual", "mimo"]):
-        is_vision = True
-    elif inp and "image" in inp:
-        is_vision = True
-    elif any(raw_item.get(k) for k in ["multimodal", "is_multimodal"]):
-        is_vision = True
-
-    # 推理思考判断
-    is_reasoning = False
-    if any(k in target for k in ["r1", "reasoner", "thinking", "thought", "qwq", "zero", "deepseek-v4", "mimo"]):
-        is_reasoning = True
-    elif "claude-3-7" in target or "claude-3.7" in target:
-        is_reasoning = True
-    elif re.search(r'\bo[13](-mini|-preview)?\b', target):
-        is_reasoning = True
-    elif "flash-thinking" in target or "gemini-2.5" in target or "gemini-3" in target:
-        is_reasoning = True
-    elif reasoning is not None:
-        is_reasoning = bool(reasoning)
-
-    # 上下文窗口与最大输出推断
+    # 上下文窗口与最大输出推断（家族规格表，参数对齐 pi-ai 目录 2026-02 数据）
     context_window = None
     max_tokens = None
 
-    if "gemini" in target:
-        context_window = 2000000 if ("pro" in target and any(v in target for v in ["1.5", "2.0", "2.5"])) else 1048576
+    if "gemini" in t:
+        # 2.5-pro=2M；flash / 3.x 全系=1M
+        context_window = 2000000 if ("pro" in t and any(v in t for v in ["1.5", "2.0", "2.5"])) else 1048576
         max_tokens = 65536
         is_vision = True
-    elif "claude" in target:
+    elif "claude" in t:
         context_window = 200000
-        max_tokens = 64000 if any(k in target for k in ["3-7", "3.7", "3-5-sonnet", "3.5-sonnet", "sonnet-4"]) else 8192
+        max_tokens = 64000 if any(k in t for k in ["3-7", "3.7", "3-5-sonnet", "3.5-sonnet", "sonnet-4",
+                                                    "4-5", "4.5", "4-6", "4.6", "4-7", "4.7", "4-8", "4.8",
+                                                    "sonnet-5", "opus-5", "haiku-4", "haiku-5", "fable"]) else 8192
         is_vision = True
-    elif "mimo" in target:
+    elif "mimo" in t:
         context_window = 1048576
         max_tokens = 131072
         is_vision = True
         is_reasoning = True
-    elif "deepseek" in target:
-        if "v4" in target:
+    elif "deepseek" in t:
+        if "v4" in t:
             context_window = 1000000
             max_tokens = 384000
             is_reasoning = True
             is_vision = True
-        elif any(k in target for k in ["r1", "reasoner"]):
+        elif "v3.2" in t or "v3-2" in t:
+            context_window = 131072
+            max_tokens = 65536
+        elif "v3.1" in t or "v3-1" in t:
+            context_window = 163840
+            max_tokens = 128000
+        elif any(k in t for k in ["r1", "reasoner"]):
             context_window = 128000
             max_tokens = 65536
             is_reasoning = True
         else:
             context_window = 128000
             max_tokens = 8192
-    elif re.search(r'\bo[13]\b', target):
+    elif "gpt-oss" in t:
+        context_window = 131072
+        max_tokens = 131072 if "120" in t else 8192
+    elif re.search(r'gpt-?6', t) or "gpt-5.4" in t or "gpt-5-4" in t:
+        # gpt-6/6.1 与 gpt-5.4 全系=1.05M（官方真实物理容量，输入上限 922K），5.4-mini/nano=400K
+        if "mini" in t or "nano" in t:
+            context_window = 400000
+        else:
+            context_window = 1050000
+        max_tokens = 128000
+        is_reasoning = True
+        is_vision = True
+    elif "gpt-5" in t:
+        # gpt-5 / 5.1 / 5.2 / 5.3 全系=400K，codex-spark=128K
+        if "codex" in t and "spark" in t:
+            context_window = 128000
+            max_tokens = 32000
+        else:
+            context_window = 400000
+            max_tokens = 128000
+        is_reasoning = True
+        is_vision = True
+    elif re.search(r'\bo[134]\b', t):
         context_window = 200000
         max_tokens = 100000
         is_reasoning = True
         is_vision = True
-    elif "gpt-4o" in target or "chatgpt-4o" in target or "gpt-4.5" in target:
+    elif "gpt-4.1" in t or "gpt-4-1" in t:
+        context_window = 1047576
+        max_tokens = 32768
+        is_vision = True
+    elif "gpt-4o" in t or "chatgpt-4o" in t or "gpt-4.5" in t:
         context_window = 128000
         max_tokens = 16384
         is_vision = True
-    elif "qwen" in target:
-        context_window = 1000000 if any(k in target for k in ["plus", "max", "1m"]) else 128000
-        max_tokens = 8192
-        if any(k in target for k in ["vl", "omni", "audio"]):
+    elif "grok" in t:
+        # grok-4.20=2M；4.1/4.2/4.3=1M；4.5~4.7=500K；grok-build=256K
+        if "4.20" in t or "4-20" in t or "multi-agent" in t:
+            context_window = 2000000
+            max_tokens = 1800000
+        elif re.search(r'grok-?4[.\-]?3\b', t):
+            context_window = 1000000
+            max_tokens = 30000
+        elif re.search(r'grok-?4[.\-]?[12]\b', t):
+            context_window = 1000000
+            max_tokens = 131072
+        elif re.search(r'grok-?4[.\-]?[4-9]\b', t):
+            context_window = 500000
+            max_tokens = 450000
+        elif "build" in t:
+            context_window = 256000
+            max_tokens = 230400
+        else:
+            context_window = 256000
+            max_tokens = 32768
+        is_reasoning = "non-reasoning" not in t
+    elif "qwen" in t:
+        # qwen3.5+/3.6/3.7/3.8 标准线=262K，plus/max/flash 高端线=1M，coder=262K，qwen2.5=32K
+        if any(k in t for k in ["plus", "max", "1m"]):
+            context_window = 1000000
+            max_tokens = 131072 if "max" in t else 65536
+        elif "flash" in t:
+            context_window = 1000000
+            max_tokens = 65536
+        elif "coder" in t:
+            context_window = 262144
+            max_tokens = 65536
+        elif re.search(r'qwen-?2[.\-]?5', t):
+            context_window = 32768
+            max_tokens = 16384
+        elif re.search(r'qwen-?3-\d+b', t):
+            context_window = 40960
+            max_tokens = 16384
+        else:
+            context_window = 262144
+            max_tokens = 65536
+        if any(k in t for k in ["vl", "omni", "audio"]):
             is_vision = True
-    elif "glm" in target:
-        context_window = 128000
-        max_tokens = 8192
-        if any(k in target for k in ["4v", "v", "vl"]):
+    elif "glm" in t:
+        # glm-5.2+/5.3=1M；glm-4.6/4.7/5/5.1=200K；glm-4.5=128K；4.5v/4.6v=视觉小窗
+        if re.search(r'glm-?5[.\-]?[2-9]', t):
+            context_window = 1000000
+            max_tokens = 131072
+        elif re.search(r'glm-?5', t):
+            context_window = 200000
+            max_tokens = 131072
+        elif re.search(r'glm-?4[.\-]?[67]v', t):
+            context_window = 128000
+            max_tokens = 32768
             is_vision = True
-    elif "kimi" in target or "moonshot" in target:
-        context_window = 128000
-        max_tokens = 8192
-        if any(k in target for k in ["vl", "vision"]):
+        elif re.search(r'glm-?4[.\-]?[67]', t):
+            context_window = 200000
+            max_tokens = 96000
+        elif re.search(r'glm-?4[.\-]?5v', t):
+            context_window = 66000
+            max_tokens = 16000
             is_vision = True
-    elif "minimax" in target or "abab" in target:
-        context_window = 245760
-        max_tokens = 8192
-    elif "hy4" in target or "hunyuan" in target:
+        elif re.search(r'glm-?4[.\-]?5', t):
+            context_window = 128000
+            max_tokens = 96000
+        else:
+            context_window = 128000
+            max_tokens = 8192
+        if any(k in t for k in ["4v", "vl"]) or re.search(r'glm-?[45][.\-]?\d*v', t):
+            is_vision = True
+    elif "kimi" in t or "moonshot" in t:
+        # kimi-k3=1M；k2.6/k2.7=262K；k2.5=262K；k2=131K
+        if re.search(r'kimi-?k3', t):
+            context_window = 1000000
+            max_tokens = 131072
+        elif re.search(r'kimi-?k2[.\-]?[67]', t):
+            context_window = 262144
+            max_tokens = 262144 if re.search(r'k2[.\-]?6', t) else 32768
+        elif re.search(r'kimi-?k2[.\-]?5', t):
+            context_window = 262144
+            max_tokens = 98304
+        elif re.search(r'kimi-?k2\b', t):
+            context_window = 131072
+            max_tokens = 131072
+        else:
+            context_window = 131072
+            max_tokens = 131072
+        if any(k in t for k in ["vl", "vision"]):
+            is_vision = True
+    elif "minimax" in t or "abab" in t:
+        # M3.1=1M；M3=512K；M2.x=204800
+        if re.search(r'm3[.\-]?1', t):
+            context_window = 1000000
+            max_tokens = 524288
+        elif re.search(r'\bm3\b', t):
+            context_window = 512000
+            max_tokens = 512000
+        else:
+            context_window = 204800
+            max_tokens = 131072
+    elif "hy4" in t or "hunyuan" in t:
+        # hy4-preview=1M；hy3=262K
+        if "hy3" in t:
+            context_window = 262144
+            max_tokens = 128000
+        else:
+            context_window = 1048576
+            max_tokens = 64000
+    elif re.search(r'step-?5', t):
+        context_window = 1000000
+        max_tokens = 64000
+    elif re.search(r'step-?3', t):
         context_window = 256000
-        max_tokens = 16384
+        max_tokens = 64000
+    elif "nemotron" in t:
+        if "3.5" in t or "ultra" in t:
+            context_window = 1000000
+            max_tokens = 1048576 if "super-vl" in t else 65000
+        else:
+            context_window = 262144
+            max_tokens = 262144
 
-    # 关键词显式长度匹配
-    if "1m" in target or "1000k" in target or "1024k" in target:
+    # 关键词显式长度匹配（覆盖家族表，可纠正如 128k 后缀模型）
+    if re.search(r'(?<![0-9a-z.])1m(?![0-9a-z])', t) or "1000k" in t or "1024k" in t:
         context_window = 1048576
-    elif "2m" in target or "2000k" in target:
+    elif re.search(r'(?<![0-9a-z.])2m(?![0-9a-z])', t) or "2000k" in t:
         context_window = 2000000
-    elif "256k" in target:
+    elif re.search(r'(?<![0-9a-z.])256k(?![0-9a-z])', t):
         context_window = 256000
-    elif "200k" in target:
+    elif re.search(r'(?<![0-9a-z.])200k(?![0-9a-z])', t):
         context_window = 200000
-    elif "128k" in target:
+    elif re.search(r'(?<![0-9a-z.])128k(?![0-9a-z])', t):
         context_window = 128000
-    elif "64k" in target:
+    elif re.search(r'(?<![0-9a-z.])64k(?![0-9a-z])', t):
         context_window = 64000
-    elif "32k" in target:
+    elif re.search(r'(?<![0-9a-z.])32k(?![0-9a-z])', t):
         context_window = 32000
 
     # 优先采用 raw_item 提供的合法数值
@@ -2204,6 +2615,7 @@ def test_model(base_url, api_key, api_type, model_id, custom_headers=None):
         api_key_clean = str(api_key).strip() if api_key else ""
         auth_bearer = (api_key_clean if api_key_clean.lower().startswith("bearer ") else f"Bearer {api_key_clean}") if api_key_clean else ""
 
+        # === 阶段 1：基础连通性探针 (Ping) ===
         if api_type == "anthropic-messages":
             endpoint = base + "/messages" if base.endswith("/v1") else base + "/v1/messages"
             headers["anthropic-version"] = "2023-06-01"
@@ -2243,10 +2655,97 @@ def test_model(base_url, api_key, api_type, model_id, custom_headers=None):
 
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(endpoint, data=data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             resp.read()
-        latency_ms = int((time.time() - start) * 1000)
-        return {"success": True, "latency_ms": latency_ms, "model": model_id}
+        ping_latency_ms = int((time.time() - start) * 1000)
+
+        # === 阶段 2：Agent 真实负载探针（流式 + 系统提示词 + 工具调用测试） ===
+        agent_ready = True
+        warning = None
+        if api_type in ("openai-completions", "", None):
+            agent_body = {
+                "model": model_id,
+                "messages": [
+                    {"role": "system", "content": "You are a test assistant."},
+                    {"role": "user", "content": "hi"}
+                ],
+                "max_tokens": 10,
+                "stream": True,
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "test_ping",
+                        "description": "health check",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"q": {"type": "string"}}
+                        }
+                    }
+                }]
+            }
+            try:
+                agent_req = urllib.request.Request(endpoint, data=json.dumps(agent_body).encode("utf-8"), headers=headers, method="POST")
+                with urllib.request.urlopen(agent_req, timeout=15) as a_resp:
+                    a_resp.read(512)
+            except urllib.error.HTTPError as ae:
+                ae_detail = ""
+                try:
+                    ae_body = ae.read().decode("utf-8", errors="replace")
+                    ae_detail = clip_text(ae_body, 8000)
+                except Exception:
+                    pass
+                low = ae_detail.lower()
+                if any(w in low for w in ("tool", "function", "unsupported parameter", "not supported")):
+                    agent_ready = False
+                    warning = "不支持工具调用(仅可纯对话)"
+                else:
+                    return {"success": False, "status": ae.code, "error": f"Agent探针报错: {ae_detail}", "latency_ms": ping_latency_ms, "model": model_id}
+            except Exception as ae:
+                agent_ready = False
+                warning = "流式/工具探针异常: " + clip_text(ae, 600)
+        elif api_type == "anthropic-messages":
+            agent_body = {
+                "model": model_id,
+                "max_tokens": 10,
+                "stream": True,
+                "system": "You are a test assistant.",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{
+                    "name": "test_ping",
+                    "description": "health check",
+                    "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}
+                }]
+            }
+            try:
+                agent_req = urllib.request.Request(endpoint, data=json.dumps(agent_body).encode("utf-8"), headers=headers, method="POST")
+                with urllib.request.urlopen(agent_req, timeout=15) as a_resp:
+                    a_resp.read(512)
+            except urllib.error.HTTPError as ae:
+                ae_detail = ""
+                try:
+                    ae_detail = clip_text(ae.read().decode("utf-8", errors="replace"), 8000)
+                except Exception:
+                    pass
+                if any(w in ae_detail.lower() for w in ("tool", "function")):
+                    agent_ready = False
+                    warning = "不支持工具调用(仅可纯对话)"
+                else:
+                    return {"success": False, "status": ae.code, "error": f"Agent探针报错: {ae_detail}", "latency_ms": ping_latency_ms, "model": model_id}
+            except Exception as ae:
+                agent_ready = False
+                warning = "流式/工具探针异常: " + clip_text(ae, 600)
+
+        total_latency_ms = int((time.time() - start) * 1000)
+        res = {
+            "success": True,
+            "latency_ms": total_latency_ms,
+            "ping_latency_ms": ping_latency_ms,
+            "agent_ready": agent_ready,
+            "model": model_id,
+        }
+        if warning:
+            res["warning"] = warning
+        return res
     except urllib.error.HTTPError as e:
         latency_ms = int((time.time() - start) * 1000)
         detail = ""
@@ -2254,15 +2753,23 @@ def test_model(base_url, api_key, api_type, model_id, custom_headers=None):
             err_body = e.read().decode("utf-8", errors="replace")
             try:
                 parsed = json.loads(err_body)
-                detail = str(parsed.get("error", parsed))[:220]
+                detail = str(parsed.get("error", parsed))
             except Exception:
-                detail = err_body[:220]
+                detail = err_body
+            detail = clip_text(detail, 8000)
+            write_log("WARN", "test_model", "HTTP %s %s" % (e.code, model_id), clip_text(err_body, 8000))
         except Exception:
             pass
-        return {"success": False, "status": e.code, "error": f"HTTP {e.code}: {detail}", "latency_ms": latency_ms}
+        return {"success": False, "status": e.code, "error": f"HTTP {e.code}: {detail}",
+                "endpoint": endpoint, "model": model_id, "latency_ms": latency_ms,
+                "logPath": str(LOG_PATH)}
     except Exception as e:
         latency_ms = int((time.time() - start) * 1000)
-        return {"success": False, "error": str(e)[:220], "latency_ms": latency_ms}
+        log_exception("test_model", e, "endpoint=%s model=%s" % (locals().get("endpoint", ""), model_id))
+        return {"success": False, "error": clip_text(e, 4000),
+                "traceback": clip_text(traceback.format_exc(), 8000),
+                "endpoint": locals().get("endpoint", ""), "model": model_id,
+                "latency_ms": latency_ms, "logPath": str(LOG_PATH)}
 
 class ApiBridge:
     def __init__(self):
@@ -2272,22 +2779,90 @@ class ApiBridge:
     def set_window(self, win):
         self._window = win
 
+    # ---------- 日志 / 诊断接口（前端可读、可复制、可打开） ----------
+    def log_error(self, source, message, detail=""):
+        """前端 JS 报错回写日志文件，避免界面报错一闪而过。"""
+        write_log("ERROR", "ui:%s" % source, str(message), clip_text(detail, 8000))
+        return {"success": True, "path": str(LOG_PATH)}
+
+    def get_error_log(self, max_lines=400):
+        try:
+            if not LOG_PATH.exists():
+                return {"success": True, "text": "", "path": str(LOG_PATH), "totalLines": 0}
+            with LOG_PATH.open("r", encoding="utf-8", errors="replace") as fp:
+                lines = fp.readlines()
+            try:
+                tail_n = max(1, int(max_lines or 400))
+            except Exception:
+                tail_n = 400
+            return {"success": True, "text": "".join(lines[-tail_n:]),
+                    "path": str(LOG_PATH), "totalLines": len(lines)}
+        except Exception as e:
+            return {"success": False, "error": clip_text(e, 2000), "path": str(LOG_PATH)}
+
+    def clear_error_log(self):
+        try:
+            LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            LOG_PATH.write_text("", encoding="utf-8")
+            return {"success": True, "path": str(LOG_PATH)}
+        except Exception as e:
+            return {"success": False, "error": clip_text(e, 2000), "path": str(LOG_PATH)}
+
+    def open_log_file(self):
+        try:
+            LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            if not LOG_PATH.exists():
+                LOG_PATH.write_text("", encoding="utf-8")
+            os.startfile(str(LOG_PATH))
+            return {"success": True, "path": str(LOG_PATH)}
+        except Exception as e:
+            return {"success": False, "error": clip_text(e, 2000), "path": str(LOG_PATH)}
+
     def discover_configs(self):
         path = DEFAULT_MODELS_PATH.resolve()
         config = load_config(path)
-        return {
-            "targets": [{
-                "label": "Pi",
-                "path": str(path),
-                "providerCount": len(config.get("providers", {})),
-                "exists": path.exists(),
-                "schema": "pi-providers",
+        targets = [{
+            "id": "pi",
+            "label": "⚡ Pi",
+            "title": "Pi Coding Agent (models.json)",
+            "path": str(path),
+            "providerCount": len(config.get("providers", {})),
+            "exists": path.exists(),
+            "schema": "pi-providers",
+            "editable": True,
+        }]
+
+        if dsh_config.is_dsh_installed():
+            cordis_path, creds_path = dsh_config.get_dsh_paths()
+            dsh_cfg = dsh_config.load_dsh_config(cordis_path, creds_path)
+            targets.append({
+                "id": "dsh",
+                "label": "🪐 DSH",
+                "title": "DeepSeek Harness (cordis.patch.yml)",
+                "path": str(cordis_path),
+                "providerCount": len(dsh_cfg.get("providers", {})),
+                "exists": cordis_path.exists(),
+                "schema": "dsh-providers",
                 "editable": True,
-            }],
+            })
+
+        return {
+            "targets": targets,
             "defaultPath": str(DEFAULT_MODELS_PATH)
         }
 
     def get_config(self, path=None):
+        if path and is_dsh_path(path):
+            cordis_path, creds_path = dsh_config.get_dsh_paths()
+            cfg = dsh_config.load_dsh_config(cordis_path, creds_path)
+            return {
+                "config": cfg,
+                "path": str(cordis_path),
+                "schema": "dsh-providers",
+                "editable": True,
+                "selectedProviderId": self._last_selected_provider
+            }
+
         config_path = normalize_config_path(path)
         cfg = load_config(config_path, merge_builtins=True)
         return {
@@ -2300,8 +2875,24 @@ class ApiBridge:
 
     def save_config(self, config_json_str, path=None):
         try:
-            config_path = normalize_config_path(path)
             data = json.loads(config_json_str) if isinstance(config_json_str, str) else config_json_str
+            if path and is_dsh_path(path):
+                cordis_path, creds_path = dsh_config.get_dsh_paths()
+                ok = dsh_config.save_dsh_config(data, cordis_path, creds_path)
+                if not ok:
+                    return {"success": False, "error": "写入 DSH 配置文件失败"}
+                saved = dsh_config.load_dsh_config(cordis_path, creds_path)
+                model_count = sum(len(p.get("models", [])) for p in saved.get("providers", {}).values() if isinstance(p, dict))
+                return {
+                    "success": True,
+                    "target": "dsh",
+                    "providerCount": len(saved.get("providers", {})),
+                    "modelCount": model_count,
+                    "disabledCount": 0,
+                    "orderPatch": {"action": "dsh-saved"}
+                }
+
+            config_path = normalize_config_path(path)
             disabled_count = 0
             for p in (data.get("providers") or {}).values():
                 if not isinstance(p, dict):
@@ -2331,8 +2922,40 @@ class ApiBridge:
                     order_patch = {"action": "disabled", "error": ""}
             except Exception as e:
                 order_patch = {"action": "error", "error": str(e)}
-            return {"success": True, "providerCount": len(saved.get("providers", {})), "modelCount": model_count,
+            return {"success": True, "target": "pi", "providerCount": len(saved.get("providers", {})), "modelCount": model_count,
                     "disabledCount": disabled_count, "orderPatch": order_patch}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def import_from_counterpart(self, current_path):
+        """支持一键从对端（Pi <-> DSH）导入配置到当前编辑区"""
+        try:
+            if current_path and is_dsh_path(current_path):
+                # 当前是 DSH，从 Pi 导入
+                pi_path = DEFAULT_MODELS_PATH.resolve()
+                cfg = load_config(pi_path, merge_builtins=False)
+                return {"success": True, "source": "Pi", "config": cfg}
+            else:
+                # 当前是 Pi，从 DSH 导入
+                cordis_path, creds_path = dsh_config.get_dsh_paths()
+                cfg = dsh_config.load_dsh_config(cordis_path, creds_path)
+                # DSH base 层内置路由（DeepSeek 官方/账号）不归属 pi-ai，
+                # 写进 Pi 的 models.json 毫无意义，导入时直接排除
+                cfg["providers"] = {
+                    pid: p for pid, p in (cfg.get("providers") or {}).items()
+                    if not (isinstance(p, dict) and p.get("_dshBuiltin"))
+                }
+                return {"success": True, "source": "DSH", "config": cfg}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def set_dsh_builtin_disabled(self, entry_id, disabled):
+        """禁用/恢复 DSH base 层内置路由（写 disabled 补丁，需重启 DSH）。"""
+        try:
+            ok, msg = dsh_config.set_dsh_builtin_disabled(entry_id, bool(disabled))
+            if not ok:
+                return {"success": False, "error": msg or "写入 cordis.patch.yml 失败"}
+            return {"success": True, "entryId": entry_id, "disabled": bool(disabled), "restartRequired": True}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -2356,8 +2979,12 @@ class ApiBridge:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def get_default_model(self):
+    def get_default_model(self, path=None):
         try:
+            if path and is_dsh_path(path):
+                cordis_path, _ = dsh_config.get_dsh_paths()
+                dp, dm = dsh_config.get_dsh_default_model(cordis_path)
+                return {"success": True, "defaultProvider": dp, "defaultModel": dm}
             s = load_pi_settings()
             return {
                 "success": True,
@@ -2452,8 +3079,14 @@ class ApiBridge:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def set_default_model(self, provider_id, model_id):
+    def set_default_model(self, provider_id, model_id, path=None):
         try:
+            if path and is_dsh_path(path):
+                cordis_path, _ = dsh_config.get_dsh_paths()
+                ok = dsh_config.set_dsh_default_model(provider_id, model_id, cordis_path)
+                if ok:
+                    return {"success": True, "defaultProvider": provider_id, "defaultModel": model_id}
+                return {"success": False, "error": "写入 cordis.patch.yml 失败"}
             s = load_pi_settings()
             s["defaultProvider"] = str(provider_id or "").strip()
             s["defaultModel"] = str(model_id or "").strip()
@@ -2532,6 +3165,83 @@ class ApiBridge:
     def close_window(self):
         if self._window:
             self._window.destroy()
+
+    def start_window_resize(self, direction="se"):
+        if not self._window:
+            return {"success": False}
+        try:
+            native = getattr(self._window, "native", None)
+            hwnd = int(native.Handle.ToInt32()) if (native and hasattr(native, "Handle")) else int(ctypes.windll.user32.GetForegroundWindow())
+            dir_map = {
+                "w": 1, "left": 1,
+                "e": 2, "right": 2,
+                "n": 3, "top": 3,
+                "nw": 4, "top-left": 4,
+                "ne": 5, "top-right": 5,
+                "s": 6, "bottom": 6,
+                "sw": 7, "bottom-left": 7,
+                "se": 8, "bottom-right": 8,
+            }
+            code = dir_map.get(str(direction).lower(), 8)
+            ctypes.windll.user32.ReleaseCapture()
+            ctypes.windll.user32.SendMessageW(hwnd, 0x0112, 0xF000 | code, 0)
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def resize_window(self, width, height):
+        if self._window:
+            try:
+                w = max(960, int(width))
+                h = max(580, int(height))
+                self._window.resize(w, h)
+                return {"success": True, "width": w, "height": h}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+        return {"success": False}
+
+    def save_window_size(self, width, height):
+        try:
+            w = max(960, int(width))
+            h = max(580, int(height))
+            stored = load_tool_settings()
+            stored["windowWidth"] = w
+            stored["windowHeight"] = h
+            save_tool_settings(stored)
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+
+def _api_guard(func):
+    """任何 js_api 方法抛异常：完整 traceback 落盘 + 返回结构化错误给前端。"""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            write_log("ERROR", "api:%s" % func.__name__, "%s: %s" % (type(exc).__name__, exc), tb)
+            return {
+                "success": False,
+                "error": "%s: %s" % (type(exc).__name__, exc),
+                "traceback": clip_text(tb, 8000),
+                "logPath": str(LOG_PATH),
+            }
+
+    # pywebview 用 inspect.getfullargspec 取参数名生成 JS 代理，
+    # wrapper 的参数被 *args/**kwargs 吞掉后必须手动固定签名，否则前端会丢参。
+    try:
+        wrapper.__signature__ = inspect.signature(func)
+    except (TypeError, ValueError):
+        pass
+    return wrapper
+
+
+for _api_name, _api_member in list(vars(ApiBridge).items()):
+    if not _api_name.startswith("_") and inspect.isfunction(_api_member):
+        setattr(ApiBridge, _api_name, _api_guard(_api_member))
+del _api_name, _api_member
 
 
 HTML_CONTENT = """<!DOCTYPE html>
@@ -2658,6 +3368,58 @@ HTML_CONTENT = """<!DOCTYPE html>
     box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
   }
   .header-left, .header-right { display: flex; align-items: center; gap: 10px; }
+  .target-tabs {
+    display: inline-flex;
+    align-items: center;
+    background: rgba(15, 23, 42, 0.7);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    padding: 3px;
+    gap: 4px;
+    margin-left: 14px;
+    height: 32px;
+    box-sizing: border-box;
+    flex-shrink: 0;
+  }
+  .target-tab-btn {
+    height: 26px;
+    padding: 0 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    user-select: none;
+    white-space: nowrap;
+    line-height: 1;
+  }
+  .target-tab-btn:hover {
+    color: var(--text-main);
+    background: rgba(255, 255, 255, 0.08);
+  }
+  .target-tab-btn.active {
+    background: var(--primary-gradient);
+    color: #fff;
+    box-shadow: 0 2px 10px rgba(99, 102, 241, 0.4);
+  }
+  .target-tab-btn .badge-count {
+    background: rgba(0, 0, 0, 0.35);
+    border-radius: 10px;
+    padding: 1px 6px;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1.2;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0.95;
+  }
   .logo-title {
     display: flex;
     align-items: center;
@@ -2682,11 +3444,25 @@ HTML_CONTENT = """<!DOCTYPE html>
     flex-shrink: 0;
   }
   .sub-en {
-    font-size: 9px;
-    color: var(--text-muted);
+    font-size: 8.5px;
+    font-weight: 600;
+    color: #64748B;
     font-family: var(--mono-family);
-    letter-spacing: 0.9px;
+    letter-spacing: 1.4px;
     text-transform: uppercase;
+    margin-top: 1px;
+  }
+  .brand-text {
+    display: flex;
+    flex-direction: column;
+    line-height: 1.15;
+    justify-content: center;
+  }
+  .brand-title {
+    font-size: 13.5px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    color: #F8FAFC;
   }
 
   /* ==================== 拟态视网膜按钮体系 ==================== */
@@ -2694,31 +3470,31 @@ HTML_CONTENT = """<!DOCTYPE html>
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 6px;
-    padding: 5px 12px;
+    gap: 5px;
+    height: 28px;
+    padding: 0 10px;
     border-radius: 6px;
     border: 1px solid transparent;
     cursor: pointer;
-    font-size: 12px;
+    font-size: 11.5px;
     font-weight: 500;
-    line-height: 1.4;
-    transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+    line-height: 1;
+    transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease;
     white-space: nowrap;
     position: relative;
-    overflow: hidden;
+    box-sizing: border-box;
+    user-select: none;
   }
-  .btn:active { transform: scale(0.97); }
+  .btn:active { opacity: 0.85; }
 
   .btn-primary {
     background: var(--primary-gradient);
     color: #FFF;
     border-color: rgba(255, 255, 255, 0.18);
-    box-shadow: 0 2px 10px var(--primary-glow);
+    box-shadow: 0 2px 8px var(--primary-glow);
   }
   .btn-primary:hover {
-    background: linear-gradient(135deg, #7174f7 0%, #986df8 50%, #e05bf2 100%);
-    box-shadow: 0 4px 16px rgba(99, 102, 241, 0.45);
-    transform: translateY(-1px);
+    filter: brightness(1.1);
   }
 
   .btn-secondary {
@@ -2739,33 +3515,31 @@ HTML_CONTENT = """<!DOCTYPE html>
     border-color: var(--card-border);
   }
   .btn-ghost:hover {
-    background: rgba(255, 255, 255, 0.05);
+    background: rgba(255, 255, 255, 0.06);
     color: var(--text-primary);
     border-color: rgba(255, 255, 255, 0.18);
   }
 
   .btn-emerald {
-    background: rgba(16, 185, 129, 0.15);
+    background: rgba(16, 185, 129, 0.12);
     color: #34d399;
-    border-color: rgba(16, 185, 129, 0.35);
+    border: 1px solid rgba(16, 185, 129, 0.35);
   }
   .btn-emerald:hover {
-    background: rgba(16, 185, 129, 0.26);
-    border-color: #34d399;
-    box-shadow: 0 2px 12px var(--accent-green-glow);
-    transform: translateY(-1px);
+    background: rgba(16, 185, 129, 0.22);
+    border-color: rgba(16, 185, 129, 0.6);
+    color: #6ee7b7;
   }
 
   .btn-indigo {
-    background: rgba(59, 130, 246, 0.15);
-    color: #93c5fd;
-    border-color: rgba(59, 130, 246, 0.35);
+    background: rgba(99, 102, 241, 0.12);
+    color: #a5b4fc;
+    border: 1px solid rgba(99, 102, 241, 0.35);
   }
   .btn-indigo:hover {
-    background: rgba(59, 130, 246, 0.26);
-    border-color: #93c5fd;
-    box-shadow: 0 2px 12px rgba(59, 130, 246, 0.25);
-    transform: translateY(-1px);
+    background: rgba(99, 102, 241, 0.22);
+    border-color: rgba(99, 102, 241, 0.6);
+    color: #c7d2fe;
   }
 
   .btn-rose {
@@ -3039,9 +3813,10 @@ HTML_CONTENT = """<!DOCTYPE html>
   }
 
   .model-work-tabs {
-    height: 44px;
+    height: 42px;
+    min-height: 42px;
     padding: 0 14px;
-    background: rgba(14, 20, 32, 0.6);
+    background: rgba(14, 20, 32, 0.75);
     backdrop-filter: blur(16px);
     -webkit-backdrop-filter: blur(16px);
     border-bottom: 1px solid var(--card-border);
@@ -3050,42 +3825,58 @@ HTML_CONTENT = """<!DOCTYPE html>
     justify-content: space-between;
     gap: 10px;
     flex-shrink: 0;
+    box-sizing: border-box;
   }
-  .model-tab-buttons { display: flex; align-items: center; gap: 6px; }
+  .model-tab-buttons { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+  /* 操作栏自适应：空间不足时内部横向滚动，绝不把按钮截断在窗口外 */
+  #modelsBarActions, #fetchBarActions {
+    min-width: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  #modelsBarActions::-webkit-scrollbar, #fetchBarActions::-webkit-scrollbar { display: none; }
+  #modelsBarActions > *, #fetchBarActions > * { flex-shrink: 0; }
   .model-tab-btn {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    padding: 5px 12px;
+    height: 28px;
+    padding: 0 10px;
     border-radius: 6px;
     cursor: pointer;
     font-size: 12px;
     color: var(--text-muted);
     border: 1px solid transparent;
     transition: all 0.16s ease;
+    white-space: nowrap;
+    user-select: none;
+    box-sizing: border-box;
+    flex-shrink: 0;
   }
-  .model-tab-btn:hover { color: var(--text-primary); background: rgba(255, 255, 255, 0.05); }
+  .model-tab-btn:hover {
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.05);
+  }
   .model-tab-btn.active {
     color: #FFF;
     background: var(--subcard);
-    border-color: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.12);
     font-weight: 600;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
   }
   .model-tab-badge {
     font-size: 10px;
     font-family: var(--mono-family);
     padding: 1px 5px;
-    border-radius: 10px;
+    border-radius: 8px;
     background: rgba(255, 255, 255, 0.08);
     color: var(--text-muted);
     border: 1px solid var(--card-border);
+    line-height: 1.2;
   }
   .model-tab-btn.active .model-tab-badge {
     background: var(--primary);
     color: #FFF;
     border-color: var(--primary);
-    box-shadow: 0 0 6px var(--primary-glow);
   }
 
   .model-view-pane {
@@ -3093,7 +3884,8 @@ HTML_CONTENT = """<!DOCTYPE html>
     display: none;
     flex-direction: column;
     overflow: hidden;
-    padding: 12px 14px;
+    padding: 10px 14px 12px 14px;
+    box-sizing: border-box;
   }
   .model-view-pane.active { display: flex; }
 
@@ -3375,6 +4167,12 @@ HTML_CONTENT = """<!DOCTYPE html>
     border-color: rgba(239, 68, 68, 0.45);
     box-shadow: 0 0 8px var(--accent-rose-glow);
   }
+  .model-row-btn.test-btn.warn {
+    color: #fde68a;
+    background: rgba(245, 158, 11, 0.16);
+    border-color: rgba(245, 158, 11, 0.45);
+    box-shadow: 0 0 8px rgba(245, 158, 11, 0.3);
+  }
   .model-row-btn.default-btn {
     color: var(--accent-amber);
     border-color: rgba(245, 158, 11, 0.3);
@@ -3394,16 +4192,13 @@ HTML_CONTENT = """<!DOCTYPE html>
 
   /* ==================== 侧滑抽屉面板 (Retina Drawer) ==================== */
   .provider-drawer {
-    position: fixed;
-    top: 48px;
-    right: 0;
-    bottom: 28px;
-    width: 380px;
-    max-width: calc(100vw - 260px);
+    position: absolute;
+    inset: 0;
     z-index: 50;
     pointer-events: none;
     visibility: hidden;
     transition: visibility 0s 0.24s;
+    overflow: hidden;
   }
   .provider-drawer.open {
     pointer-events: auto;
@@ -3411,11 +4206,8 @@ HTML_CONTENT = """<!DOCTYPE html>
     transition: visibility 0s 0s;
   }
   .drawer-backdrop {
-    position: fixed;
-    top: 48px;
-    left: 0;
-    right: 0;
-    bottom: 28px;
+    position: absolute;
+    inset: 0;
     background: rgba(0, 0, 0, 0.55);
     backdrop-filter: blur(8px);
     -webkit-backdrop-filter: blur(8px);
@@ -3432,8 +4224,9 @@ HTML_CONTENT = """<!DOCTYPE html>
     top: 0;
     right: 0;
     bottom: 0;
-    width: 100%;
-    background: rgba(14, 20, 32, 0.94);
+    width: 380px;
+    max-width: calc(100vw - 260px);
+    background: rgba(14, 20, 32, 0.96);
     backdrop-filter: blur(28px) saturate(190%);
     -webkit-backdrop-filter: blur(28px) saturate(190%);
     border-left: 1px solid var(--card-border);
@@ -3456,7 +4249,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     font-size: 13.5px;
     font-weight: 600;
     flex-shrink: 0;
-    background: rgba(18, 24, 38, 0.8);
+    background: rgba(18, 24, 38, 0.85);
   }
   .drawer-close {
     width: 28px;
@@ -3481,6 +4274,17 @@ HTML_CONTENT = """<!DOCTYPE html>
     display: flex;
     flex-direction: column;
     gap: 14px;
+    min-height: 0;
+  }
+
+  .drawer-footer {
+    flex-shrink: 0;
+    padding: 12px 16px;
+    background: rgba(12, 17, 28, 0.98);
+    border-top: 1px solid var(--card-border);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
   }
 
   .view-panel {
@@ -3521,22 +4325,124 @@ HTML_CONTENT = """<!DOCTYPE html>
   }
   .toggle-pwd:hover { color: var(--text-primary); }
 
-  /* Fetch Preview Container */
-  .fetch-preview-container {
-    height: 100%;
+  /* ==================== 底部状态栏 (Footer) ==================== */
+  /* ==================== 底部运行日志面板 ==================== */
+  .log-panel {
+    flex-shrink: 0;
+    background: rgba(10, 15, 26, 0.96);
+    border-top: 1px solid var(--card-border);
     display: flex;
     flex-direction: column;
-    overflow: hidden;
+    position: relative;
+    z-index: 35;
+    transition: box-shadow 0.2s ease;
   }
-  .fetch-preview-header {
+  .log-panel.open {
+    box-shadow: 0 -12px 32px rgba(0, 0, 0, 0.45);
+  }
+  .log-panel-head {
+    height: 30px;
+    flex-shrink: 0;
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    margin-bottom: 10px;
+    gap: 10px;
+    padding: 0 12px;
+    cursor: pointer;
+    user-select: none;
+    background: rgba(255, 255, 255, 0.025);
+    border-bottom: 1px solid transparent;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  .log-panel.open .log-panel-head {
+    border-bottom-color: var(--card-border);
+    background: rgba(255, 255, 255, 0.045);
+  }
+  .log-panel-head:hover { background: rgba(255, 255, 255, 0.07); }
+  .log-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    white-space: nowrap;
     flex-shrink: 0;
   }
+  .log-badge {
+    min-width: 16px;
+    height: 16px;
+    padding: 0 5px;
+    border-radius: 8px;
+    background: rgba(148, 163, 184, 0.18);
+    color: #cbd5e1;
+    font-size: 10px;
+    line-height: 16px;
+    text-align: center;
+    font-family: var(--mono-family);
+  }
+  .log-badge.err {
+    background: rgba(239, 68, 68, 0.22);
+    color: #fca5a5;
+  }
+  .log-last {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--mono-family);
+    font-size: 10.5px;
+    color: var(--text-muted);
+    opacity: 0.9;
+  }
+  .log-actions { display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0; }
+  .log-btn {
+    background: transparent;
+    border: 1px solid var(--card-border);
+    color: var(--text-secondary);
+    font-size: 10.5px;
+    padding: 2px 7px;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.14s ease;
+    font-family: var(--font-family);
+  }
+  .log-btn:hover {
+    background: rgba(99, 102, 241, 0.18);
+    border-color: rgba(99, 102, 241, 0.5);
+    color: #e2e8f0;
+  }
+  .log-panel-body {
+    display: none;
+    height: 180px;
+    max-height: 32vh;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 8px 12px 10px 12px;
+    font-family: var(--mono-family);
+    font-size: 11px;
+    line-height: 1.55;
+    color: #cbd5e1;
+    user-select: text;
+    background: #060910;
+  }
+  .log-panel.open .log-panel-body { display: block; }
+  .log-line {
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    padding: 1px 0;
+    border-left: 2px solid transparent;
+    padding-left: 7px;
+  }
+  .log-line .log-ts { color: #64748b; margin-right: 6px; }
+  .log-line.err { color: #fca5a5; border-left-color: #ef4444; background: rgba(239, 68, 68, 0.07); }
+  .log-line.warn { color: #fcd34d; border-left-color: #f59e0b; background: rgba(245, 158, 11, 0.06); }
+  .log-line.ok { color: #86efac; border-left-color: #10b981; }
+  .log-line.info { color: #cbd5e1; }
+  .log-line.sys { color: #a5b4fc; border-left-color: #6366f1; }
+  .log-empty { color: #64748b; font-style: italic; padding: 6px 4px; }
 
-  /* ==================== 底部状态栏 (Footer) ==================== */
   footer {
     height: 28px;
     background: rgba(14, 20, 32, 0.9);
@@ -3554,6 +4460,37 @@ HTML_CONTENT = """<!DOCTYPE html>
     z-index: 30;
   }
   .footer-left, .footer-right { display: flex; align-items: center; gap: 14px; }
+  .footer-left { min-width: 0; flex: 1 1 auto; overflow: hidden; }
+  #statusMsg {
+    display: inline-block;
+    max-width: 46vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: middle;
+  }
+  #statusMsg.has-detail {
+    cursor: pointer;
+    text-decoration: underline dotted rgba(148, 163, 184, 0.45);
+    text-underline-offset: 3px;
+  }
+  #statusMsg.has-detail:hover { filter: brightness(1.35); }
+  .footer-log-btn {
+    background: transparent;
+    border: 1px solid var(--card-border);
+    color: var(--text-secondary);
+    font-size: 10.5px;
+    padding: 2px 7px;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.14s ease;
+  }
+  .footer-log-btn:hover {
+    background: rgba(99, 102, 241, 0.2);
+    border-color: rgba(99, 102, 241, 0.5);
+    color: #e2e8f0;
+  }
+  .footer-log-btn.has-err { border-color: rgba(239, 68, 68, 0.55); color: #fca5a5; }
   kbd {
     font-family: var(--mono-family);
     font-size: 10px;
@@ -3655,10 +4592,13 @@ HTML_CONTENT = """<!DOCTYPE html>
     font-size: 11.5px;
     line-height: 1.65;
     color: #cbd5e1;
-    white-space: pre;
-    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    overflow-x: hidden;
     overflow-y: auto;
-    max-height: 56vh;
+    max-height: 64vh;
+    user-select: text;
     padding: 14px 16px;
     background: #060910;
     border: 1px solid var(--card-border);
@@ -3681,6 +4621,56 @@ HTML_CONTENT = """<!DOCTYPE html>
     overflow-y: auto;
     overflow-x: hidden;
   }
+  /* 从对端导入：服务商勾选器 */
+  .ip-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+  }
+  .ip-toolbar .ip-tip { flex: 1; opacity: .8; }
+  .ip-mini {
+    flex: none;
+    background: rgba(148, 163, 184, .12);
+    color: var(--text-secondary);
+    border: 1px solid var(--card-border);
+    border-radius: 5px;
+    padding: 3px 9px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: background .15s ease;
+  }
+  .ip-mini:hover { background: rgba(148, 163, 184, .24); }
+  .ip-list { display: flex; flex-direction: column; gap: 4px; }
+  .ip-row {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 7px 10px;
+    border-radius: 6px;
+    background: rgba(148, 163, 184, .06);
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: background .15s ease, border-color .15s ease;
+  }
+  .ip-row:hover { background: rgba(148, 163, 184, .13); border-color: var(--card-border); }
+  .ip-row input { accent-color: #10B981; flex: none; margin: 0; }
+  .ip-name {
+    flex: 1;
+    min-width: 0;
+    font-weight: 600;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ip-id { flex: none; font-family: var(--mono-family); font-size: 10.5px; opacity: .6; }
+  .ip-count { flex: none; font-size: 10.5px; opacity: .7; }
+  .ip-badge { flex: none; font-size: 10px; padding: 1px 6px; border-radius: 4px; }
+  .ip-badge-new { background: rgba(16, 185, 129, .15); color: #6EE7B7; border: 1px solid rgba(16, 185, 129, .35); }
+  .ip-badge-warn { background: rgba(245, 158, 11, .15); color: #FCD34D; border: 1px solid rgba(245, 158, 11, .35); }
   .oc { min-width: 0; }
   .oc-verdict {
     padding: 10px 14px;
@@ -3830,17 +4820,65 @@ HTML_CONTENT = """<!DOCTYPE html>
   /* Keepcompat stubs */
   .model-tag { display: none; }
   .column-provider { display: none; }
+
+  /* 8 方向无边框缩放把手 */
+  .resize-handle {
+    position: fixed;
+    z-index: 9999;
+    background: transparent;
+  }
+  .rh-top { top: 0; left: 12px; right: 12px; height: 8px; cursor: ns-resize; }
+  .rh-bottom { bottom: 0; left: 12px; right: 12px; height: 8px; cursor: ns-resize; }
+  .rh-left { top: 12px; bottom: 12px; left: 0; width: 8px; cursor: ew-resize; }
+  .rh-right { top: 12px; bottom: 12px; right: 0; width: 8px; cursor: ew-resize; }
+  .rh-top-left { top: 0; left: 0; width: 14px; height: 14px; cursor: nwse-resize; }
+  .rh-top-right { top: 0; right: 0; width: 14px; height: 14px; cursor: nesw-resize; }
+  .rh-bottom-left { bottom: 0; left: 0; width: 14px; height: 14px; cursor: nesw-resize; }
+  .rh-bottom-right { bottom: 0; right: 0; width: 22px; height: 22px; cursor: nwse-resize; }
+
+  .window-resize-grip {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    cursor: nwse-resize;
+    color: var(--text-muted);
+    opacity: 0.7;
+    margin-left: 6px;
+    border-radius: 4px;
+    transition: all 0.16s ease;
+  }
+  .window-resize-grip:hover {
+    opacity: 1;
+    color: #a5b4fc;
+    background: rgba(99, 102, 241, 0.15);
+  }
+
+  .summary-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 7px;
+    border-radius: 8px;
+    background: rgba(99, 102, 241, 0.14);
+    border: 1px solid rgba(99, 102, 241, 0.28);
+    color: #a5b4fc;
+    font-size: 11px;
+    font-family: var(--mono-family);
+    white-space: nowrap;
+    cursor: help;
+  }
 </style>
 </head>
 <body>
 
-<header class="pywebview-drag-region">
+<header class="pywebview-drag-region" ondblclick="handleHeaderDblClick(event)">
   <div class="header-left pywebview-no-drag-region">
-    <div class="logo-title pywebview-drag-region" title="按住拖动窗口">
+    <div class="logo-title pywebview-drag-region" title="按住拖动窗口 · 双击最大化/还原">
       <div class="brand-mark" style="font-size: 15px; font-weight: 800; font-family: var(--b-sans);">π</div>
-      <div style="display: flex; flex-direction: column; line-height: 1.1;">
-        <span>模型配置</span>
-        <span class="sub-en">MODEL CONFIG MANAGER</span>
+      <div class="brand-text">
+        <span class="brand-title">模型管理工作台</span>
+        <span class="sub-en">UNIFIED MODEL STUDIO</span>
       </div>
     </div>
     <div class="target-tabs pywebview-no-drag-region" id="targetTabs" style="display:none;"></div>
@@ -3848,23 +4886,29 @@ HTML_CONTENT = """<!DOCTYPE html>
 
   <div class="header-right pywebview-no-drag-region">
     <div class="header-actions pywebview-no-drag-region" style="display: flex; gap: 6px;">
-      <button class="btn btn-purple" onclick="rescanBuiltins()" title="重新扫描 auth.json / models-store.json / 环境变量中的内置服务商">
-        <span>🔄 扫描内置</span>
+      <button class="btn btn-purple" id="rescanBuiltinsBtn" onclick="rescanBuiltins()" title="重新扫描 auth.json / models-store.json / 环境变量中的内置服务商">
+        <span>🔄 扫描</span>
       </button>
       <button class="btn btn-primary" id="saveBtn" onclick="saveAll()" title="保存配置 (Ctrl+S)">
         <span>💾 保存</span>
       </button>
-      <button class="btn btn-secondary" onclick="exportAllProviders()" title="导出全部服务商为 TXT">
-        <span>📦 导出全部</span>
+      <button class="btn btn-indigo" id="importCounterpartBtn" onclick="importFromCounterpart()" style="display:none;" title="从对端导入模型配置">
+        <span>📥 导入配置</span>
       </button>
-      <button class="btn btn-emerald" onclick="restartPi()" title="重启 Pi 交互终端">
+      <button class="btn btn-secondary" id="exportBtn" onclick="exportAllProviders()" title="导出全部服务商为 TXT">
+        <span>📦 导出</span>
+      </button>
+      <button class="btn btn-emerald" id="restartPiBtn" onclick="restartPi()" title="重启 Pi 交互终端">
         <span>🔄 重启</span>
       </button>
       <button class="btn btn-indigo" id="orderReportBtn" onclick="showOrderReport()" title="左右两栏对照：工具窗口顺序 ↔ Pi 实际顺序（逐行给出✅/⚠️结果）">
-        <span>🔍 顺序自检</span>
+        <span>🔍 自检</span>
+      </button>
+      <button class="btn btn-secondary" id="logBtn" onclick="showErrorLog()" title="查看完整错误日志（可复制 / 直接打开日志文件）">
+        <span>📜 日志</span>
       </button>
       <button class="btn btn-purple" id="orderPatchBtn" onclick="showPiOrderPatchDialog()" title="让 Pi 的厂商分组顺序跟随工具（可一键还原原版）">
-        <span>🧩 顺序补丁</span>
+        <span>🧩 补丁</span>
       </button>
     </div>
     
@@ -3899,6 +4943,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 
   <!-- 栏目2: 全宽模型管理工作区 -->
   <section class="column-models">
+    <!-- 顶部统一工作栏：无论切换到哪个 Tab，都共享同一顶栏背景与边框，绝无突兀错位 -->
     <div class="model-work-tabs">
       <div class="model-tab-buttons">
         <div class="model-tab-btn active" id="tabBtnModels" onclick="switchModelWorkTab('models')">
@@ -3911,12 +4956,24 @@ HTML_CONTENT = """<!DOCTYPE html>
         </div>
       </div>
 
-      <div style="display: flex; gap: 6px; align-items: center;">
-        <input class="search-input" id="modelSearch" style="width: 140px;" placeholder="🔍 过滤模型/别名..." oninput="renderModels()">
-        <button class="btn btn-secondary" id="pinDefaultToggle" style="padding: 3px 9px; font-size: 11px;"
-                onclick="toggleUiPref('pinDefaultModel')" title="把 Pi 默认模型置顶显示（仅显示，不改动保存顺序）">⭐ 默认置顶</button>
+      <!-- Tab 1 专属操作按钮组 -->
+      <div id="modelsBarActions" style="display: flex; gap: 5px; align-items: center; flex: 1;">
+        <input class="search-input" id="modelSearch" style="width: 110px; height: 28px; font-size: 11.5px; padding: 0 8px;" placeholder="🔍 过滤模型/别名..." oninput="renderModels()">
+        <button class="btn btn-secondary" id="pinDefaultToggle" onclick="toggleUiPref('pinDefaultModel')" title="把 Pi 默认模型置顶显示（仅显示，不改动保存顺序）">⭐ 默认置顶</button>
         <button class="btn btn-indigo" id="testAllBtn" onclick="testAllModels()" title="依次测活当前服务商的所有模型">⚡ 全部测活</button>
         <button class="btn btn-secondary" id="openDrawerBtn" onclick="openDrawer(selectedPid)" title="查看或编辑服务商连接参数与密钥">⚙️ 厂商设置</button>
+      </div>
+
+      <!-- Tab 2 专属操作按钮组：与 Tab 1 严格等高同级，紧凑排布，自适应防溢出 -->
+      <div id="fetchBarActions" style="display: none; gap: 5px; align-items: center; flex: 1;">
+        <span id="fetchSummary" style="margin-right: 2px; flex-shrink: 0;"></span>
+        <button class="btn btn-emerald" onclick="fetchRemoteModelsFromTab()" title="从当前 Base URL 重新拉取可用模型">🔄 拉取</button>
+        <input class="search-input" id="previewSearch" style="width: 90px; height: 28px; font-size: 11.5px; padding: 0 8px;" placeholder="🔍 过滤..." oninput="renderFetchPreview()">
+        <button class="btn btn-emerald" onclick="commitFetchedModels()" title="将勾选的模型批量添加到当前服务商">✅ 导入选中</button>
+        <button class="btn btn-indigo" onclick="testAllFetched()" title="依次测活所有拉取到的模型">⚡ 测活</button>
+        <button class="btn btn-ghost" onclick="toggleAllFetched(true)" title="选中全部模型">☑ 全选</button>
+        <button class="btn btn-ghost" onclick="toggleAllFetched(false)" title="取消所有勾选">☐ 清空</button>
+        <button class="btn btn-ghost" onclick="switchModelWorkTab('models')" title="返回已配置模型列表">✕ 返回</button>
       </div>
     </div>
 
@@ -3943,39 +5000,19 @@ HTML_CONTENT = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Tab 2: 远程拉取结果预览 -->
+    <!-- Tab 2: 远程拉取结果预览（直接顶齐表头，浑然一体） -->
     <div class="model-view-pane" id="paneFetch">
-      <div class="fetch-preview-container">
-        <div class="fetch-preview-header">
-          <div style="display: flex; align-items: center; gap: 8px;">
-            <span style="font-size: 12.5px; font-weight: 600;">📥 远程拉取结果</span>
-            <button class="btn btn-emerald" style="padding: 2px 8px; font-size: 11px;" onclick="fetchRemoteModelsFromTab()" title="从当前厂商的 Base URL 获取可用模型列表">🔄 拉取模型</button>
-          </div>
-          <div style="display: flex; gap: 6px;">
-            <button class="btn btn-emerald" onclick="commitFetchedModels()">✅ 添加选中</button>
-            <button class="btn btn-indigo" onclick="testAllFetched()">⚡ 全部测活</button>
-            <button class="btn btn-ghost" onclick="toggleAllFetched(true)">☑ 全选</button>
-            <button class="btn btn-ghost" onclick="toggleAllFetched(false)">☐ 全不选</button>
-            <button class="btn btn-ghost" onclick="switchModelWorkTab('models')">✕ 返回列表</button>
-          </div>
-        </div>
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; gap: 6px; flex-shrink: 0;">
-          <div id="fetchSummary" style="font-size: 11.5px; color: var(--b-text-2);"></div>
-          <input class="search-input" id="previewSearch" style="width: 140px; flex-shrink: 0;" placeholder="🔍 过滤拉取模型..." oninput="renderFetchPreview()">
-        </div>
-
-        <!-- 不滚动的拉取表头 -->
-        <div class="model-table-header" id="fetchTableHeader">
-          <span class="th-handle" style="width: 20px; text-align: center;">☑</span>
-          <span class="th-alias" style="width: 200px;">别名 (可直接编辑)</span>
-          <span class="th-id">模型 ID</span>
-          <span class="th-status" style="width: 70px;">状态</span>
-          <span class="th-actions" style="width: 100px;">操作</span>
-        </div>
-
-        <!-- 滚动的单行拉取结果列表 -->
-        <div class="models-container" id="fetchPreviewList"></div>
+      <!-- 不滚动的拉取表头 -->
+      <div class="model-table-header" id="fetchTableHeader">
+        <span class="th-handle" style="width: 20px; text-align: center;">☑</span>
+        <span class="th-alias" style="width: 200px;">别名 (可直接编辑)</span>
+        <span class="th-id">模型 ID</span>
+        <span class="th-status" style="width: 70px;">状态</span>
+        <span class="th-actions" style="width: 100px;">操作</span>
       </div>
+
+      <!-- 滚动的单行拉取结果列表 -->
+      <div class="models-container" id="fetchPreviewList"></div>
     </div>
   </section>
 
@@ -4070,13 +5107,13 @@ HTML_CONTENT = """<!DOCTYPE html>
             </div>
           </div>
         </div>
+      </div>
 
-        <div style="margin-top: auto; padding-top: 10px; border-top: 1px solid var(--b-line); display: flex; flex-direction: column; gap: 6px;">
-          <button class="btn btn-emerald" style="width: 100%;" onclick="fetchRemoteModels()">🔄 自动拉取远程模型</button>
-          <button class="btn btn-secondary" style="width: 100%;" onclick="exportCurrentProvider()" title="导出当前服务商为 TXT">📤 导出当前服务商</button>
-          <button class="btn btn-rose" id="deleteProviderBtn" style="width: 100%;" onclick="deleteCurrentProvider()" title="删除此服务商">🗑️ 删除服务商</button>
-
-        </div>
+      <!-- 固定抽屉底部操作栏：永不被外部截断，永不随表单滚动走样 -->
+      <div class="drawer-footer">
+        <button class="btn btn-emerald" style="width: 100%;" onclick="fetchRemoteModels()">🔄 自动拉取远程模型</button>
+        <button class="btn btn-secondary" style="width: 100%;" onclick="exportCurrentProvider()" title="导出当前服务商为 TXT">📤 导出当前服务商</button>
+        <button class="btn btn-rose" id="deleteProviderBtn" style="width: 100%;" onclick="deleteCurrentProvider()" title="删除此服务商">🗑️ 删除服务商</button>
       </div>
     </div>
   </div>
@@ -4184,16 +5221,47 @@ HTML_CONTENT = """<!DOCTYPE html>
   </div>
 </div>
 
+<!-- 底部运行日志面板（可展开，完整显示报错） -->
+<div class="log-panel" id="logPanel">
+  <div class="log-panel-head" onclick="toggleLogPanel()" title="点击展开/收起完整日志">
+    <span class="log-title">📜 运行日志 <span class="log-badge" id="logBadge">0</span></span>
+    <span class="log-last" id="logLast">暂无日志</span>
+    <span class="log-actions">
+      <button class="log-btn" onclick="event.stopPropagation();copyLogPanel()" title="复制面板内全部日志">📋 复制</button>
+      <button class="log-btn" onclick="event.stopPropagation();clearLogPanel()" title="清空面板与日志文件">🗑 清空</button>
+      <button class="log-btn" onclick="event.stopPropagation();openLogFile()" title="用系统编辑器打开日志文件">📂 文件</button>
+      <button class="log-btn" id="logToggleBtn" onclick="event.stopPropagation();toggleLogPanel()" title="展开/收起">▲ 展开</button>
+    </span>
+  </div>
+  <div class="log-panel-body" id="logPanelBody"></div>
+</div>
+
 <footer>
   <div class="footer-left">
     <span id="statusMsg">● 就绪</span>
   </div>
   <div class="footer-right">
+    <button class="footer-log-btn" id="footerLogBtn" onclick="toggleLogPanel()" title="展开底部完整日志（报错不再被截断）">📜 日志</button>
     <span id="defaultModelStatus" style="color: var(--b-amber);">★ 默认: 正在获取...</span>
     <span id="pathDisplay">📁 正在加载...</span>
     <span><kbd>Ctrl+S</kbd> 保存</span>
+    <div class="window-resize-grip" onmousedown="initWindowResize(event, 'se')" title="按住拖拽调整窗口大小">
+      <svg width="10" height="10" viewBox="0 0 10 10">
+        <path d="M8 2L2 8M8 5L5 8M8 8L8 8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+      </svg>
+    </div>
   </div>
 </footer>
+
+<!-- 8 方向全屏无边框拖拽缩放把手 -->
+<div class="resize-handle rh-top" onmousedown="initWindowResize(event, 'n')"></div>
+<div class="resize-handle rh-bottom" onmousedown="initWindowResize(event, 's')"></div>
+<div class="resize-handle rh-left" onmousedown="initWindowResize(event, 'w')"></div>
+<div class="resize-handle rh-right" onmousedown="initWindowResize(event, 'e')"></div>
+<div class="resize-handle rh-top-left" onmousedown="initWindowResize(event, 'nw')"></div>
+<div class="resize-handle rh-top-right" onmousedown="initWindowResize(event, 'ne')"></div>
+<div class="resize-handle rh-bottom-left" onmousedown="initWindowResize(event, 'sw')"></div>
+<div class="resize-handle rh-bottom-right" onmousedown="initWindowResize(event, 'se')"></div>
 
 <script>
 let currentConfig = { providers: {} };
@@ -4220,9 +5288,20 @@ let globalDialogAltHandler = null;
 // 长文本弹窗支持：等宽字体 / 独立滚动区 / 一键复制全文
 let globalDialogCopyText = '';
 
+// 错误信息一旦偏长（>160 字或带换行），自动升级为「等宽 + 宽版 + 可复制」日志视图，
+// 避免关键报错被窄弹窗挤成看不全的碎片。
+function wantsLogView(opts) {
+  if (!opts || opts.html) return false;
+  if (opts.mono) return true;
+  const text = String(opts.message || opts.text || '');
+  const isError = opts.type === 'error';
+  return isError && (text.length > 160 || text.indexOf(String.fromCharCode(10)) >= 0);
+}
+
 function applyDialogBody(opts, msgEl) {
   const text = opts.message || opts.text || '';
   const copyText = opts.copyText || text;
+  const monoView = !opts.html && wantsLogView(opts);
   if (!msgEl) return;
   if (opts.html) {
     msgEl.className = 'modal-html';
@@ -4231,7 +5310,7 @@ function applyDialogBody(opts, msgEl) {
     msgEl.style.lineHeight = '';
     msgEl.style.whiteSpace = '';
     msgEl.style.wordBreak = '';
-  } else if (opts.mono) {
+  } else if (monoView) {
     msgEl.innerText = text;
     msgEl.className = 'modal-report';
     msgEl.style.fontSize = '';
@@ -4250,7 +5329,7 @@ function applyDialogBody(opts, msgEl) {
   const hintEl = $id('globalDialogHint');
   if (hintEl) {
     const lines = copyText ? copyText.split(String.fromCharCode(10)).length : 0;
-    const auto = (!opts.html && opts.mono && lines > 22)
+    const auto = (monoView && lines > 12)
       ? ('共 ' + lines + ' 行，内容较长：可在框内上下滚动查看，或点左下角「📋 复制全文」整段复制。')
       : '';
     const hint = [auto, opts.hint].filter(Boolean).join('  ·  ');
@@ -4261,7 +5340,7 @@ function applyDialogBody(opts, msgEl) {
   globalDialogCopyText = copyText;
   const copyBtn = $id('globalDialogCopyBtn');
   if (copyBtn) {
-    if (opts.allowCopy && copyText) {
+    if ((opts.allowCopy || monoView) && copyText) {
       copyBtn.style.display = 'inline-flex';
       copyBtn.innerText = '📋 复制全文';
     } else {
@@ -4325,7 +5404,7 @@ function showConfirm(options) {
     if (titleEl) titleEl.innerText = opts.title || '确认提示';
     applyDialogBody(opts, msgEl);
     const box = $id('globalDialogBox');
-    if (box) box.style.width = opts.wide ? '860px' : '440px';
+    if (box) box.style.width = (opts.wide || wantsLogView(opts)) ? '860px' : '440px';
 
     if (cancelBtn) {
       cancelBtn.style.display = 'inline-flex';
@@ -4372,7 +5451,7 @@ function showAlert(options) {
     if (iconEl) iconEl.innerText = opts.icon || (opts.type === 'error' ? '❌' : opts.type === 'success' ? '✅' : 'ℹ️');
     if (titleEl) titleEl.innerText = opts.title || (opts.type === 'error' ? '错误' : opts.type === 'success' ? '成功' : '提示');
     const box = $id('globalDialogBox');
-    if (box) box.style.width = opts.wide ? '860px' : '440px';
+    if (box) box.style.width = (opts.wide || wantsLogView(opts)) ? '860px' : '440px';
     applyDialogBody(opts, msgEl);
 
     if (cancelBtn) cancelBtn.style.display = 'none';
@@ -4483,7 +5562,7 @@ function closeDrawer() {
 // Default Model Sync
 async function refreshDefaultModel() {
   try {
-    const res = await window.pywebview.api.get_default_model();
+    const res = await window.pywebview.api.get_default_model(currentConfigPath);
     if (res && res.success) {
       currentDefaultProvider = res.defaultProvider || '';
       currentDefaultModel = res.defaultModel || '';
@@ -4499,14 +5578,16 @@ async function refreshDefaultModel() {
 
 async function setDefaultModel(providerId, modelId) {
   try {
-    setStatus(`正在将 [${modelId}] 设为 Pi 默认模型...`, '#F59E0B');
-    const res = await window.pywebview.api.set_default_model(providerId, modelId);
+    const isDsh = currentConfigPath && (currentConfigPath.includes('cordis.patch.yml') || currentConfigPath.includes('.dsh'));
+    const targetLabel = isDsh ? 'DSH' : 'Pi';
+    setStatus(`正在将 [${modelId}] 设为 ${targetLabel} 默认模型...`, '#F59E0B');
+    const res = await window.pywebview.api.set_default_model(providerId, modelId, currentConfigPath);
     if (res && res.success) {
       currentDefaultProvider = providerId;
       currentDefaultModel = modelId;
       const statusEl = $id('defaultModelStatus');
       if (statusEl) statusEl.textContent = `★ 默认: ${providerId}/${modelId}`;
-      setStatus(`★ 已成功将 [${modelId}] 设为默认模型 (写入 settings.json)`, '#10B981');
+      setStatus(`★ 已成功将 [${modelId}] 设为 ${targetLabel} 默认模型`, '#10B981');
       const p = (currentConfig.providers || {})[providerId];
       if (p) renderModels(p.models || []);
     } else {
@@ -4707,8 +5788,35 @@ async function refreshOrderFileIfPatched() {
   } catch (e) { /* 忽略 */ }
 }
 
-async function showOrderReport() {
-  setStatus('正在核对「工具顺序 ↔ Pi 顺序」...', '#F59E0B');
+async function showErrorLog() {
+  let res = null;
+  try {
+    res = await window.pywebview.api.get_error_log(600);
+  } catch (e) {
+    res = { success: false, error: String(e) };
+  }
+  const NL = String.fromCharCode(10);
+  const path = (res && res.path) || '';
+  const text = (res && res.text) || '';
+  const body = (res && res.success === false)
+    ? ('读取日志失败: ' + (res.error || '未知错误') + (path ? NL + path : ''))
+    : (text || '（日志为空：目前没有记录到错误）');
+  await showConfirm({
+    title: '运行日志 / 错误回溯',
+    icon: '📜',
+    message: body,
+    mono: true,
+    wide: true,
+    allowCopy: true,
+    okText: '关闭',
+    altText: '📂 打开日志文件',
+    onAlt: () => { try { window.pywebview.api.open_log_file(); } catch (e) {} },
+    hint: (path ? '日志文件: ' + path + '  ·  ' : '')
+      + '最新记录在最后 · 共 ' + ((res && res.totalLines) || 0) + ' 行 · 上限 1.5MB 自动轮转'
+  });
+}
+
+async function showOrderReport() {  setStatus('正在核对「工具顺序 ↔ Pi 顺序」...', '#F59E0B');
   try {
     const alpha = !!(uiPrefs && uiPrefs.alignProviderOrder);
     const res = await window.pywebview.api.get_order_compare(alpha);
@@ -4868,9 +5976,17 @@ function renderSidebar() {
 
     const badges = el('span', 'p-row-badges');
     if (p._isBuiltin) {
-      const bBadge = el('span', 'p-proto proto-builtin', '内置');
-      bBadge.title = 'Pi 原生内置服务商';
+      const bBadge = el('span', 'p-proto proto-builtin', p._dshBuiltin ? 'DSH内置' : '内置');
+      bBadge.title = p._dshBuiltin
+        ? 'DSH base 层自带路由（' + (p._dshEntryId || '') + '），不在 pi-ai 配置里：只能禁用，不能删除'
+        : 'Pi 原生内置服务商';
       badges.appendChild(bBadge);
+      if (p._dshDisabled) {
+        const dBadge = el('span', 'p-proto', '已禁用');
+        dBadge.style.cssText = 'background:rgba(239,68,68,.15); color:#FCA5A5; border:1px solid rgba(239,68,68,.35);';
+        dBadge.title = '已在 cordis.patch.yml 写 disabled: true，重启 DSH 后从模型列表消失';
+        badges.appendChild(dBadge);
+      }
     }
     badges.appendChild(el('span', 'p-count', String(count)));
 
@@ -4914,6 +6030,11 @@ async function deleteProvider(pid) {
   const p = currentConfig.providers[pid];
   if (!p) return;
 
+  if (p._dshBuiltin) {
+    await toggleDshBuiltin(pid);
+    return;
+  }
+
   if (p._isBuiltin) {
     // 内置厂商的模型目录由 Pi 自身提供，工具无法删除或隐藏它
     showAlert('无法删除', `[${pid}] 是 Pi 原生内置服务商，其模型目录由 Pi 自身提供，无法从工具中删除或隐藏。\\n\\n如需调整连接参数，请在右侧抽屉中编辑。`);
@@ -4937,6 +6058,54 @@ async function deleteProvider(pid) {
   renderSidebar();
   saveAll();
   setStatus(`🗑️ 已删除服务商 [${pid}]`, '#EF4444');
+}
+
+
+/**
+ * DSH 内置路由（deepseek-official / deepseek-account）既不在 pi-ai providers 里，
+ * 也没有可删的配置节点；能做的只有给对应 base 插件条目写 disabled 补丁。
+ */
+async function toggleDshBuiltin(pid) {
+  const p = (currentConfig.providers || {})[pid];
+  if (!p || !p._dshBuiltin) return;
+  const entryId = p._dshEntryId || '';
+  const label = p.name || pid;
+  const disabling = !p._dshDisabled;
+
+  const isDefaultProv = (currentDefaultProvider || '') === pid;
+  const extra = [];
+  if (entryId === 'llm-deepseek-account') {
+    extra.push('⚠️ 这是「DeepSeek 账号」登录路由，禁用后已登录账号的模型会一并消失。');
+  }
+  if (isDefaultProv) {
+    extra.push(`⚠️ 当前默认模型就指向 ${pid}，禁用后需先把默认模型改到其他服务商。`);
+  }
+  extra.push('改动写入 cordis.patch.yml 的 disabled 补丁，**重启 DSH 后生效**（本工具不会替你重启）。');
+
+  const ok = await showConfirm({
+    icon: disabling ? '⏸️' : '▶️',
+    title: (disabling ? '禁用' : '恢复') + ' DSH 内置服务商',
+    message: `[${label}] (${pid}) 是 DSH base 层自带路由，不在 pi-ai 配置里，无法从配置中删除。\\n\\n`
+      + (disabling
+          ? `可以给插件条目 [${entryId}] 打上 disabled: true，DSH 下次启动就不再挂载它。`
+          : `将移除 [${entryId}] 上的 disabled 补丁，DSH 下次启动恢复该路由。`)
+      + '\\n\\n' + extra.join('\\n'),
+    confirmText: disabling ? '禁用' : '恢复',
+    confirmClass: disabling ? 'btn-rose' : 'btn-emerald'
+  });
+  if (!ok) return;
+
+  const res = await window.pywebview.api.set_dsh_builtin_disabled(entryId, disabling);
+  if (!res || !res.success) {
+    setStatus(`操作失败: ${(res && res.error) || '未知错误'}`, '#EF4444');
+    return;
+  }
+  p._dshDisabled = disabling;
+  renderSidebar();
+  updateProviderViewPanel(pid);
+  setStatus(disabling
+    ? `⏸️ 已禁用内置路由 [${label}]（${entryId}）。重启 DSH 后生效。`
+    : `▶️ 已恢复内置路由 [${label}]（${entryId}）。重启 DSH 后生效。`, disabling ? '#F59E0B' : '#10B981');
 }
 
 
@@ -5024,15 +6193,26 @@ function updateProviderViewPanel(pid) {
   }
 
   if (vKeyPoolSummary) {
-    const pool = p.apiKeys || [];
-    if (!pool || pool.length === 0) {
-      vKeyPoolSummary.innerHTML = '<span style="color:var(--b-text-4); font-style:italic;">未配置密钥池</span>';
+    if (p._dshBuiltin) {
+      const stateBadge = p._dshDisabled
+        ? '<span style="color:#FCA5A5;">已禁用（待重启生效）</span>'
+        : '<span style="color:#6EE7B7;">启用中</span>';
+      vKeyPoolSummary.innerHTML = `DSH 内置路由：<b>${escapeHtml(p._dshEntryId || '')}</b>`
+        + `<br>插件：${escapeHtml(p._dshPlugin || '')}`
+        + `<br>凭据引用：${escapeHtml(p._dshKeyRef || '（无，走账号登录）')}`
+        + `<br>状态：${stateBadge}`
+        + `<br><span style="opacity:.7;">${escapeHtml(p._dshNote || '')}</span>`;
     } else {
-      const badges = pool.map(k => {
-        const kname = k.name || k.id;
-        return `<span style="display:inline-block; font-family:var(--b-mono); font-size:10px; padding:1px 5px; margin:2px 3px 2px 0; border-radius:2px; background:rgba(59,130,246,0.15); color:#93C5FD; border:1px solid rgba(59,130,246,0.3);">${escapeHtml(kname)}</span>`;
-      }).join('');
-      vKeyPoolSummary.innerHTML = `已维护 <b>${pool.length}</b> 组密钥:<br>${badges}`;
+      const pool = p.apiKeys || [];
+      if (!pool || pool.length === 0) {
+        vKeyPoolSummary.innerHTML = '<span style="color:var(--b-text-4); font-style:italic;">未配置密钥池</span>';
+      } else {
+        const badges = pool.map(k => {
+          const kname = k.name || k.id;
+          return `<span style="display:inline-block; font-family:var(--b-mono); font-size:10px; padding:1px 5px; margin:2px 3px 2px 0; border-radius:2px; background:rgba(59,130,246,0.15); color:#93C5FD; border:1px solid rgba(59,130,246,0.3);">${escapeHtml(kname)}</span>`;
+        }).join('');
+        vKeyPoolSummary.innerHTML = `已维护 <b>${pool.length}</b> 组密钥:<br>${badges}`;
+      }
     }
   }
 
@@ -5043,8 +6223,16 @@ function updateProviderViewPanel(pid) {
 
   const delBtn = $id('deleteProviderBtn');
   if (delBtn) {
-    if (p._isBuiltin) {
-      // 内置厂商由 Pi 原生目录提供，不可删除也不可隐藏
+    if (p._dshBuiltin) {
+      // DSH 内置路由：不能删，只能打 disabled 补丁
+      delBtn.style.display = 'block';
+      delBtn.innerText = p._dshDisabled ? '▶️ 恢复内置路由' : '⏸️ 禁用内置路由';
+      delBtn.className = p._dshDisabled ? 'btn btn-emerald' : 'btn btn-rose';
+      delBtn.title = p._dshDisabled
+        ? '移除 disabled 补丁，重启 DSH 后恢复该路由'
+        : '写入 disabled 补丁，重启 DSH 后从模型列表消失';
+    } else if (p._isBuiltin) {
+      // Pi 内置厂商由原生目录提供，不可删除也不可隐藏
       delBtn.style.display = 'none';
     } else {
       delBtn.style.display = 'block';
@@ -5074,6 +6262,16 @@ function toggleProviderEditMode(editing) {
   const cancelBtn = $id('cancelProviderBtn');
 
   if (editing) {
+    const cur = (currentConfig.providers || {})[selectedPid] || {};
+    if (cur._dshBuiltin) {
+      // DSH 内置路由由 base 层插件提供，不在 pi-ai 配置里
+      showAlert({
+        title: 'DSH 内置服务商',
+        icon: '🔒',
+        message: `[${selectedPid}] 由 DSH base 层插件（${cur._dshPlugin || ''}）提供，不在 pi-ai 配置里，工具无法编辑或删除。\\n\\n右侧面板底部可以禁用/恢复它（写 disabled 补丁，重启 DSH 生效）。`
+      });
+      return;
+    }
     if (viewPanel) viewPanel.style.display = 'none';
     if (editPanel) editPanel.style.display = 'flex';
     if (editBtn) editBtn.style.display = 'none';
@@ -5190,7 +6388,8 @@ function syncCurrentFormToMemory() {
         p.apiKey = directApiKey;
       } else {
         p.apiKey = nextPool[0].key;
-        if (apiKeyInput) apiKeyInput.value = nextPool[0].key;
+        // 只在输入框不在编辑焦点时回显（避免打字/删除过程中被整段回填覆盖）
+        if (apiKeyInput && document.activeElement !== apiKeyInput) apiKeyInput.value = nextPool[0].key;
       }
     } else {
       delete p.apiKeys;
@@ -5565,6 +6764,20 @@ async function addModelManual() {
   const pid = syncCurrentFormToMemory();
   if (!pid) return showAlert({ title: '校验失败', icon: '⚠️', message: '请先选择或新建服务商', type: 'error' });
   const p = currentConfig.providers[pid];
+  if (p && p._dshBuiltin) {
+    return showAlert({
+      title: 'DSH 内置服务商',
+      icon: '🔒',
+      message: `[${pid}] 的模型目录由 DSH base 层插件（${p._dshPlugin || ''}）自行提供，模型列表不可编辑，也无法写入 pi-ai 配置。\\n\\n如要自定义 DeepSeek 官方端点，请新建一个 openai-completions / anthropic-messages 服务商。`
+    });
+  }
+  if (p && p._isBuiltin) {
+    return showAlert({
+      title: '内置服务商',
+      icon: '🔒',
+      message: `[${pid}] 的模型目录由 Pi 原生提供，不支持手动添加模型。`
+    });
+  }
   if (!p.models) p.models = [];
   const list = p.models.filter(x => x.id !== mid);
   const nextModel = { id: mid };
@@ -5635,17 +6848,23 @@ function switchModelWorkTab(tab) {
   const btnFetch = $id('tabBtnFetch');
   const paneModels = $id('paneModels');
   const paneFetch = $id('paneFetch');
+  const modelsActions = $id('modelsBarActions');
+  const fetchActions = $id('fetchBarActions');
   
   if (tab === 'fetch') {
     if (btnModels) btnModels.classList.remove('active');
     if (btnFetch) btnFetch.classList.add('active');
     if (paneModels) paneModels.classList.remove('active');
     if (paneFetch) paneFetch.classList.add('active');
+    if (modelsActions) modelsActions.style.display = 'none';
+    if (fetchActions) fetchActions.style.display = 'flex';
   } else {
     if (btnModels) btnModels.classList.add('active');
     if (btnFetch) btnFetch.classList.remove('active');
     if (paneModels) paneModels.classList.add('active');
     if (paneFetch) paneFetch.classList.remove('active');
+    if (modelsActions) modelsActions.style.display = 'flex';
+    if (fetchActions) fetchActions.style.display = 'none';
   }
 }
 
@@ -5871,6 +7090,29 @@ function currentTestContext() {
   };
 }
 
+function formatModelError(res, baseUrl, mid, sourceName) {
+  const NL = String.fromCharCode(10);
+  const lines = [];
+  lines.push('模型: ' + mid);
+  if (baseUrl) lines.push('端点: ' + baseUrl);
+  if (sourceName) lines.push('凭据: ' + sourceName);
+  if (res && res.endpoint) lines.push('请求地址: ' + res.endpoint);
+  if (res && res.status) lines.push('HTTP 状态: ' + res.status);
+  lines.push('');
+  lines.push('错误详情:');
+  lines.push((res && res.error) ? res.error : '未知错误');
+  if (res && res.traceback) {
+    lines.push('');
+    lines.push('Python Traceback:');
+    lines.push(res.traceback);
+  }
+  if (res && res.logPath) {
+    lines.push('');
+    lines.push('完整日志: ' + res.logPath);
+  }
+  return lines.join(NL);
+}
+
 async function testModel(btn, mid) {
   const ctx = currentTestContext();
   if (!ctx.baseUrl) return showAlert({ title: '配置校验', icon: '⚠️', message: '请先填写 Base URL 端点' });
@@ -5881,26 +7123,38 @@ async function testModel(btn, mid) {
   const auth = getEffectiveModelAuth(pid, model);
 
   btn.classList.add('testing');
-  btn.classList.remove('ok', 'fail');
+  btn.classList.remove('ok', 'fail', 'warn');
   btn.innerHTML = '⏳ 测活中';
-  btn.title = `正在检测 API 连通性 (Key: ${auth.sourceName})...`;
+  btn.title = `正在深度检测 API 连通性与 Agent 工具支持 (Key: ${auth.sourceName})...`;
   try {
     const res = await window.pywebview.api.test_model(ctx.baseUrl, auth.apiKey, ctx.api, mid, auth.headers);
     if (res.success) {
-      btn.classList.add('ok');
-      btn.innerHTML = `✓ ${res.latency_ms}ms`;
-      btn.title = `测活成功 · 延迟 ${res.latency_ms}ms [${auth.sourceName}]`;
-      setStatus(`✅ [${mid}] 测活成功 · ${res.latency_ms}ms (${auth.sourceName})`, '#10B981');
+      if (res.agent_ready === false) {
+        btn.classList.add('warn');
+        btn.innerHTML = `⚠ ${res.latency_ms}ms`;
+        btn.title = `基础可用，但${res.warning || '不支持工具调用'} [${auth.sourceName}]`;
+        setStatus(`⚠️ [${mid}] 仅支持纯聊 · ${res.warning || '不支持 Agent 工具'} (${auth.sourceName})`, '#F59E0B');
+      } else {
+        btn.classList.add('ok');
+        btn.innerHTML = `✓ ${res.latency_ms}ms`;
+        btn.title = `测活成功 · 全功能就绪(流式+工具已通过) · 延迟 ${res.latency_ms}ms [${auth.sourceName}]`;
+        setStatus(`✅ [${mid}] 测活成功(全功能可用) · ${res.latency_ms}ms (${auth.sourceName})`, '#10B981');
+      }
     } else {
       btn.classList.add('fail');
       btn.innerHTML = '✗ 失败';
-      btn.title = `失败: ${res.error || '未知错误'} [${auth.sourceName}]`;
+      const errText = formatModelError(res, ctx.baseUrl, mid, auth.sourceName);
+      btn.title = errText;
       setStatus(`❌ [${mid}] 测活失败: ${res.error || '未知错误'} (${auth.sourceName})`, '#EF4444');
+      appendLog('err', `测活失败 · ${mid}`, errText);
+      toggleLogPanel(true);
     }
   } catch (e) {
     btn.classList.add('fail');
     btn.innerHTML = '✗ 异常';
-    setStatus(`❌ [${mid}] 测活异常`, '#EF4444');
+    setStatus(`❌ [${mid}] 测活异常: ${e}`, '#EF4444');
+    appendLog('err', `测活异常 · ${mid}`, String(e && e.stack ? e.stack : e));
+    toggleLogPanel(true);
   }
   setTimeout(() => btn.classList.remove('testing'), 400);
 }
@@ -5922,6 +7176,7 @@ async function testAllModels() {
 
   const rows = document.querySelectorAll('#modelsContainer .model-row');
   let okCount = 0, failCount = 0;
+  const failures = [];
   for (let i = 0; i < models.length; i++) {
     const m = models[i];
     const row = rows[i];
@@ -5939,12 +7194,24 @@ async function testAllModels() {
       res = { success: false, error: String(e) };
     }
     if (res.success) {
-      if (btn) { btn.classList.add('ok'); btn.innerHTML = `✓ ${res.latency_ms}ms`; btn.title = `测活成功 · 延迟 ${res.latency_ms}ms [${auth.sourceName}]`; }
+      if (btn) {
+        if (res.agent_ready === false) {
+          btn.classList.add('warn');
+          btn.innerHTML = `⚠ ${res.latency_ms}ms`;
+          btn.title = `基础可用，但${res.warning || '不支持工具调用'} [${auth.sourceName}]`;
+        } else {
+          btn.classList.add('ok');
+          btn.innerHTML = `✓ ${res.latency_ms}ms`;
+          btn.title = `测活成功 · 全功能就绪 [${auth.sourceName}]`;
+        }
+      }
       okCount++;
       m._failStreak = 0;
     } else {
-      if (btn) { btn.classList.add('fail'); btn.innerHTML = '✗ 失败'; btn.title = `失败: ${res.error || '未知错误'} [${auth.sourceName}]`; }
+      const errText = formatModelError(res, ctx.baseUrl, m.id, auth.sourceName);
+      if (btn) { btn.classList.add('fail'); btn.innerHTML = '✗ 失败'; btn.title = errText; }
       failCount++;
+      failures.push({ id: m.id, status: res.status || 0, error: res.error || '未知错误', detail: errText });
       m._failStreak = (m._failStreak || 0) + 1;
     }
     if (btn) btn.classList.remove('testing');
@@ -5952,6 +7219,17 @@ async function testAllModels() {
   testAllInProgress = false;
   renderModels(p.models);
   setStatus(`✅ 全部测活完成：${okCount} 可用 / ${failCount} 失败`, failCount > 0 ? '#F59E0B' : '#10B981');
+  if (failCount > 0) {
+    const NL = String.fromCharCode(10);
+    const body = [`全部测活结果: 可用 ${okCount} / 失败 ${failCount} / 共 ${models.length}`, ''];
+    failures.forEach((f, i) => {
+      body.push(`【${i + 1}】${f.id}` + (f.status ? `  (HTTP ${f.status})` : ''));
+      body.push(f.detail);
+      body.push('');
+    });
+    appendLog('err', `全部测活完成：${failCount} 个失败`, body.join(NL));
+    toggleLogPanel(true);
+  }
 }
 
 // Remote Fetch
@@ -6124,6 +7402,10 @@ async function confirmFetchRemoteModels() {
     fetchedPreview = res.models.map(m => ({
       id: m.id,
       name: m.name || m.id,
+      contextWindow: m.contextWindow,
+      maxTokens: m.maxTokens,
+      input: m.input,
+      reasoning: m.reasoning,
       selected: !existingIds.has(m.id),
       added: existingIds.has(m.id),
       sourceRefId: refId,
@@ -6156,7 +7438,7 @@ function renderFetchPreview() {
   const selectedCount = fetchedPreview.filter(m => m.selected && !m.added).length;
   const addedCount = fetchedPreview.filter(m => m.added).length;
   if (summary) {
-    summary.innerHTML = `共拉取 <b style="color:#fff;">${fetchedPreview.length}</b> 个 · 已选 <b style="color:var(--b-accent);">${selectedCount}</b> 个 · 已在列表中 <b style="color:var(--b-green);">${addedCount}</b> 个`;
+    summary.innerHTML = `<span class="summary-pill" title="共拉取 ${fetchedPreview.length} 个模型 · 已在列表 ${addedCount} 个">已选 ${selectedCount}/${fetchedPreview.length}</span>`;
   }
 
   const searchInput = $id('previewSearch');
@@ -6267,16 +7549,23 @@ async function testSingleFetched(btn, mid) {
   }
 
   btn.classList.add('testing');
-  btn.classList.remove('ok', 'fail');
+  btn.classList.remove('ok', 'fail', 'warn');
   btn.innerHTML = '⏳ 测活中';
-  btn.title = '正在检测 API 连通性...';
+  btn.title = '正在深度检测 API 连通性与 Agent 工具支持...';
   try {
     const res = await window.pywebview.api.test_model(ctx.baseUrl, testKey, ctx.api, mid, customHeaders);
     if (res.success) {
-      btn.classList.add('ok');
-      btn.innerHTML = `✓ ${res.latency_ms}ms`;
-      btn.title = `测活成功 · 延迟 ${res.latency_ms}ms`;
-      setStatus(`✅ [${mid}] 测活成功 · ${res.latency_ms}ms`, '#10B981');
+      if (res.agent_ready === false) {
+        btn.classList.add('warn');
+        btn.innerHTML = `⚠ ${res.latency_ms}ms`;
+        btn.title = `基础可用，但${res.warning || '不支持工具调用'}`;
+        setStatus(`⚠️ [${mid}] 仅支持纯聊 · ${res.warning || '不支持 Agent 工具'}`, '#F59E0B');
+      } else {
+        btn.classList.add('ok');
+        btn.innerHTML = `✓ ${res.latency_ms}ms`;
+        btn.title = `测活成功 · 全功能就绪(流式+工具已通过) · 延迟 ${res.latency_ms}ms`;
+        setStatus(`✅ [${mid}] 测活成功(全功能可用) · ${res.latency_ms}ms`, '#10B981');
+      }
     } else {
       btn.classList.add('fail');
       btn.innerHTML = '✗ 失败';
@@ -6296,7 +7585,7 @@ function updateFetchSummary() {
   if (!summary || fetchedPreview.length === 0) return;
   const selectedCount = fetchedPreview.filter(m => m.selected && !m.added).length;
   const addedCount = fetchedPreview.filter(m => m.added).length;
-  summary.innerHTML = `共拉取 <b style="color:#fff;">${fetchedPreview.length}</b> 个 · 已选 <b style="color:var(--b-accent);">${selectedCount}</b> 个 · 已在列表中 <b style="color:var(--b-green);">${addedCount}</b> 个`;
+  summary.innerHTML = `<span class="summary-pill" title="共拉取 ${fetchedPreview.length} 个模型 · 已在列表 ${addedCount} 个">已选 ${selectedCount}/${fetchedPreview.length}</span>`;
 }
 
 function toggleAllFetched(val) {
@@ -6320,7 +7609,7 @@ async function testAllFetched() {
     const btn = row.querySelector('.test-btn');
     if (btn) {
       btn.classList.add('testing');
-      btn.classList.remove('ok', 'fail');
+      btn.classList.remove('ok', 'fail', 'warn');
       btn.innerHTML = '⏳ 测活中';
     }
 
@@ -6341,9 +7630,15 @@ async function testAllFetched() {
       if (res.success) {
         okCount++;
         if (btn) {
-          btn.classList.add('ok');
-          btn.innerHTML = `✓ ${res.latency_ms}ms`;
-          btn.title = `测活成功 · 延迟 ${res.latency_ms}ms`;
+          if (res.agent_ready === false) {
+            btn.classList.add('warn');
+            btn.innerHTML = `⚠ ${res.latency_ms}ms`;
+            btn.title = `基础可用，但${res.warning || '不支持工具调用'}`;
+          } else {
+            btn.classList.add('ok');
+            btn.innerHTML = `✓ ${res.latency_ms}ms`;
+            btn.title = `测活成功 · 全功能就绪`;
+          }
         }
       } else {
         failCount++;
@@ -6409,35 +7704,352 @@ function commitFetchedModels() {
   }
 }
 
+let currentTargets = [];
+const targetStates = {};
+
+function updateTopActionButtons(isDsh) {
+  const rescanBtn = $id('rescanBuiltinsBtn');
+  const orderReportBtn = $id('orderReportBtn');
+  const orderPatchBtn = $id('orderPatchBtn');
+  const restartPiBtn = $id('restartPiBtn');
+  const importCounterpartBtn = $id('importCounterpartBtn');
+  // DSH 的 llm-pi-ai 会把空字符串的 baseURL 当作致命错误，但“留空”本身是合法的
+  // （目录路由用内置端点），所以用 placeholder 把这条语义写在输入框上。
+  const baseUrlInp = $id('pBaseUrl');
+  if (baseUrlInp) {
+    baseUrlInp.placeholder = isDsh
+      ? '留空 = 使用 DSH 内置目录默认端点'
+      : '例如: https://api.deepseek.com/v1';
+  }
+
+  if (isDsh) {
+    if (rescanBtn) rescanBtn.style.display = 'none';
+    if (orderReportBtn) orderReportBtn.style.display = 'none';
+    if (orderPatchBtn) orderPatchBtn.style.display = 'none';
+    if (restartPiBtn) restartPiBtn.style.display = 'none';
+    if (importCounterpartBtn) {
+      importCounterpartBtn.style.display = 'inline-flex';
+      importCounterpartBtn.innerHTML = '<span>📥 从 Pi 导入</span>';
+      importCounterpartBtn.title = '从 Pi (models.json) 选择服务商导入到当前 DSH 编辑区（可单个/多选）';
+    }
+  } else {
+    if (rescanBtn) rescanBtn.style.display = 'inline-flex';
+    if (orderReportBtn) orderReportBtn.style.display = 'inline-flex';
+    if (orderPatchBtn) orderPatchBtn.style.display = 'inline-flex';
+    if (restartPiBtn) restartPiBtn.style.display = 'inline-flex';
+    if (importCounterpartBtn) {
+      importCounterpartBtn.style.display = 'none';
+    }
+  }
+}
+
+function captureCurrentTargetState() {
+  if (!currentConfigPath) return;
+  try {
+    syncCurrentFormToMemory();
+  } catch (e) {}
+
+  const isCreating = (selectedPid === null || !currentConfig.providers || !currentConfig.providers[selectedPid]);
+  const draft = {
+    pId: $id('pId') ? $id('pId').value : '',
+    pName: $id('pName') ? $id('pName').value : '',
+    pBaseUrl: $id('pBaseUrl') ? $id('pBaseUrl').value : '',
+    pApiKey: $id('pApiKey') ? $id('pApiKey').value : '',
+    pApi: $id('pApi') ? $id('pApi').value : 'openai-completions',
+  };
+
+  targetStates[currentConfigPath] = {
+    config: JSON.parse(JSON.stringify(currentConfig || { providers: {} })),
+    selectedPid: selectedPid,
+    isProviderEditing: isProviderEditing,
+    isCreatingNew: isCreating,
+    formDraft: draft
+  };
+}
+
+async function restoreTargetState(targetPath) {
+  const savedState = targetStates[targetPath];
+  if (!savedState || !savedState.config) {
+    return false;
+  }
+
+  currentConfig = savedState.config;
+  currentConfigPath = targetPath;
+  selectedPid = savedState.selectedPid;
+
+  const isDsh = currentConfigPath && (currentConfigPath.includes('cordis.patch.yml') || currentConfigPath.includes('.dsh'));
+  if ($id('pathDisplay')) {
+    $id('pathDisplay').innerText = isDsh ? `🪐 [DSH] ${targetPath}` : `⚡ [Pi] ${targetPath}`;
+  }
+  updateTopActionButtons(isDsh);
+
+  renderSidebar();
+  await refreshDefaultModel();
+  await initTargets();
+
+  if (savedState.isCreatingNew) {
+    newProvider();
+    if (savedState.formDraft) {
+      if ($id('pId')) $id('pId').value = savedState.formDraft.pId || '';
+      if ($id('pName')) $id('pName').value = savedState.formDraft.pName || '';
+      if ($id('pBaseUrl')) $id('pBaseUrl').value = savedState.formDraft.pBaseUrl || '';
+      if ($id('pApiKey')) $id('pApiKey').value = savedState.formDraft.pApiKey || '';
+      if ($id('pApi')) $id('pApi').value = savedState.formDraft.pApi || 'openai-completions';
+    }
+  } else if (selectedPid && currentConfig.providers && currentConfig.providers[selectedPid]) {
+    selectProvider(selectedPid);
+    if (savedState.isProviderEditing) {
+      toggleProviderEditMode(true);
+      if (savedState.formDraft) {
+        if ($id('pId') && savedState.formDraft.pId) $id('pId').value = savedState.formDraft.pId;
+        if ($id('pName')) $id('pName').value = savedState.formDraft.pName || '';
+        if ($id('pBaseUrl')) $id('pBaseUrl').value = savedState.formDraft.pBaseUrl || '';
+        if ($id('pApiKey')) $id('pApiKey').value = savedState.formDraft.pApiKey || '';
+        if ($id('pApi')) $id('pApi').value = savedState.formDraft.pApi || 'openai-completions';
+      }
+    }
+  } else {
+    const pids = Object.keys(currentConfig.providers || {});
+    if (pids.length > 0) selectProvider(pids[0]);
+    else newProvider();
+  }
+
+  setStatus('已恢复工作区草稿', '#10B981');
+  return true;
+}
+
+async function initTargets() {
+  try {
+    const res = await window.pywebview.api.discover_configs();
+    currentTargets = (res && res.targets) || [];
+    const container = $id('targetTabs');
+    if (!container) return;
+    if (currentTargets.length <= 1) {
+      container.style.display = 'none';
+      return;
+    }
+    container.innerHTML = currentTargets.map(t => {
+      const isActive = (t.path === currentConfigPath) || (!currentConfigPath && t.id === 'pi');
+      return `<button class="target-tab-btn ${isActive ? 'active' : ''}" title="${t.title || t.label}" onclick="switchTarget('${t.id}')">
+        <span>${t.label}</span>
+        <span class="badge-count">${t.providerCount || 0}</span>
+      </button>`;
+    }).join('');
+    container.style.display = 'inline-flex';
+  } catch (e) {
+    console.error('Init targets failed:', e);
+  }
+}
+
+async function switchTarget(targetId) {
+  const target = currentTargets.find(t => t.id === targetId);
+  if (!target || target.path === currentConfigPath) return;
+
+  // 1. 暂存当前目标未保存的草稿状态
+  captureCurrentTargetState();
+
+  // 2. 尝试从草稿箱恢复，若没有草稿则首次从磁盘读取
+  const restored = await restoreTargetState(target.path);
+  if (!restored) {
+    await loadData(target.path);
+  }
+}
+
+// DSH 落盘时路由 id 统一小写，Pi 侧 id 区分大小写；比较前先归一化
+function routeIdOf(pid) {
+  return String(pid || '').trim().toLowerCase();
+}
+
+// 从对端导入：服务商勾选器（返回选中的 pid 数组；取消返回 null）
+async function pickImportProviders(sourceName, targetName, importedProvs, existingByRoute) {
+  const pids = Object.keys(importedProvs);
+  const selection = {};
+  pids.forEach(pid => { selection[pid] = true; });
+
+  const rows = pids.map(pid => {
+    const p = importedProvs[pid] || {};
+    const modelCount = Array.isArray(p.models) ? p.models.length : 0;
+    const clashPid = existingByRoute[routeIdOf(pid)];
+    let badge = '<span class="ip-badge ip-badge-new">新增</span>';
+    if (clashPid) {
+      badge = clashPid === pid
+        ? '<span class="ip-badge ip-badge-warn">已存在</span>'
+        : `<span class="ip-badge ip-badge-warn">与 ${escapeHtml(clashPid)} 同 ID</span>`;
+    }
+    return `<label class="ip-row">
+        <input type="checkbox" data-import-pid="${escapeHtml(pid)}" checked>
+        <span class="ip-name">${escapeHtml(p.name || pid)}</span>
+        <span class="ip-id">${escapeHtml(pid)}</span>
+        <span class="ip-count">${modelCount} 模型</span>
+        ${badge}
+      </label>`;
+  }).join('');
+
+  const html = `<div class="ip-toolbar">
+      <span class="ip-tip">${escapeHtml(sourceName)} → ${escapeHtml(targetName)}：勾选要导入的服务商（共 ${pids.length} 个）</span>
+      <button type="button" class="ip-mini" data-pick="all">全选</button>
+      <button type="button" class="ip-mini" data-pick="none">全不选</button>
+    </div>
+    <div class="ip-list">${rows}</div>`;
+
+  const dlg = showConfirm({
+    icon: '📥',
+    title: `从 ${sourceName} 导入服务商`,
+    html,
+    confirmText: '导入选中',
+    confirmClass: 'btn-emerald',
+    wide: true
+  });
+
+  // 弹窗已同步渲染完成，此处挂监听（不依赖内联 onclick，避免 pid 特殊字符注入）
+  const box = $id('globalDialogMessage');
+  if (box) {
+    box.querySelectorAll('input[data-import-pid]').forEach(cb => {
+      cb.addEventListener('change', () => {
+        selection[cb.getAttribute('data-import-pid')] = cb.checked;
+      });
+    });
+    box.querySelectorAll('[data-pick]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const want = btn.getAttribute('data-pick') === 'all';
+        box.querySelectorAll('input[data-import-pid]').forEach(cb => {
+          cb.checked = want;
+          selection[cb.getAttribute('data-import-pid')] = want;
+        });
+      });
+    });
+  }
+
+  const ok = await dlg;
+  if (!ok) return null;
+  return pids.filter(pid => selection[pid]);
+}
+
+async function importFromCounterpart() {
+  const isDsh = currentConfigPath && (currentConfigPath.includes('cordis.patch.yml') || currentConfigPath.includes('.dsh'));
+  const targetName = isDsh ? "DSH" : "Pi";
+  const sourceName = isDsh ? "Pi" : "DSH";
+
+  setStatus(`正在从 ${sourceName} 读取配置...`, '#F59E0B');
+  const res = await window.pywebview.api.import_from_counterpart(currentConfigPath);
+  if (!res || !res.success || !res.config || !res.config.providers) {
+    setStatus(`导入失败: ${(res && res.error) || '未读取到数据'}`, '#EF4444');
+    return;
+  }
+
+  const importedProvs = res.config.providers;
+  const importedKeys = Object.keys(importedProvs);
+  if (importedKeys.length === 0) {
+    setStatus(`⚠️ ${sourceName} 中没有可导入的服务商`, '#F59E0B');
+    return;
+  }
+
+  const currentProvs = currentConfig.providers || {};
+  const existingByRoute = {};
+  Object.keys(currentProvs).forEach(pid => { existingByRoute[routeIdOf(pid)] = pid; });
+
+  // 1. 选择要导入的服务商（默认全选；可只勾单个厂商）
+  const picked = await pickImportProviders(sourceName, targetName, importedProvs, existingByRoute);
+  if (picked === null) {
+    setStatus('已取消导入', '#94A3B8');
+    return;
+  }
+  if (picked.length === 0) {
+    setStatus('未勾选任何服务商，已取消导入', '#F59E0B');
+    return;
+  }
+
+  // 2. 仅有冲突时才追问覆盖策略（三态：覆盖 / 跳过冲突项 / 取消）
+  const conflicts = picked.filter(pid => existingByRoute[routeIdOf(pid)]);
+  let choice = conflicts.length === 0 ? 'overwrite' : 'cancel';
+  if (conflicts.length > 0) {
+    const shown = conflicts.slice(0, 10).join('、') + (conflicts.length > 10 ? ` 等 ${conflicts.length} 个` : '');
+    const overwriteAll = await showConfirm({
+      icon: '⚠️',
+      title: '服务商 ID 冲突',
+      message: `以下服务商在 ${targetName} 中已存在：${shown}\\n\\n覆盖：用 ${sourceName} 的配置替换 ${targetName} 同名服务商（原配置将被覆盖）。\\n跳过：保留 ${targetName} 现有配置，只导入新增服务商。`,
+      confirmText: '覆盖冲突项',
+      confirmClass: 'btn-rose',
+      altText: '跳过冲突项',
+      onAlt: () => { choice = 'skip'; }
+    });
+    if (overwriteAll) choice = 'overwrite';
+    if (choice === 'cancel') {
+      setStatus('已取消导入', '#94A3B8');
+      return;
+    }
+  }
+
+  // 3. 合并（只处理勾选项）
+  let addCount = 0;
+  let overwriteCount = 0;
+  let skipCount = 0;
+  for (const pid of picked) {
+    const route = routeIdOf(pid);
+    const existingPid = existingByRoute[route];
+    if (existingPid) {
+      if (choice !== 'overwrite') { skipCount++; continue; }
+      // 覆盖时清掉大小写不同的旧键，避免 Pi 的 CPAMP 与 DSH 的 cpamp 并存
+      if (existingPid !== pid) delete currentProvs[existingPid];
+      currentProvs[pid] = JSON.parse(JSON.stringify(importedProvs[pid]));
+      overwriteCount++;
+      continue;
+    }
+    existingByRoute[route] = pid;
+    currentProvs[pid] = JSON.parse(JSON.stringify(importedProvs[pid]));
+    addCount++;
+  }
+
+  currentConfig.providers = currentProvs;
+  renderSidebar();
+  const firstPicked = picked[0];
+  if (currentProvs[firstPicked]) {
+    selectedPid = firstPicked;
+    updateProviderViewPanel(firstPicked);
+  }
+  const parts = [];
+  if (addCount) parts.push(`新增 ${addCount} 个`);
+  if (overwriteCount) parts.push(`覆盖 ${overwriteCount} 个`);
+  if (skipCount) parts.push(`跳过 ${skipCount} 个`);
+  if (parts.length === 0) {
+    setStatus('没有可导入的服务商（全部被跳过）', '#F59E0B');
+  } else {
+    setStatus(`✅ 已从 ${sourceName} 导入：${parts.join('，')}。请点击「💾 保存」写入 ${targetName}。`, '#10B981');
+  }
+  await initTargets();
+}
+
 // Config Load & Save
-async function loadData() {
+async function loadData(targetPath = null) {
   setStatus('正在加载配置...', '#F59E0B');
-  const data = await window.pywebview.api.get_config();
+  const data = await window.pywebview.api.get_config(targetPath);
   currentConfig = data.config || { providers: {} };
   currentConfigPath = data.path;
-  if ($id('pathDisplay')) $id('pathDisplay').innerText = `📁 ${data.path}`;
+  const isDsh = currentConfigPath && (currentConfigPath.includes('cordis.patch.yml') || currentConfigPath.includes('.dsh'));
+  if ($id('pathDisplay')) {
+    $id('pathDisplay').innerText = isDsh ? `🪐 [DSH] ${data.path}` : `⚡ [Pi] ${data.path}`;
+  }
+
+  updateTopActionButtons(isDsh);
+
   await loadUiPrefs();
   renderSidebar();
   await refreshDefaultModel();
+  await initTargets();
 
-  // 启动时自动维护 Pi 排序补丁（Pi 升级会覆盖 dist → 后端按偏好自动重打；未开启则不动作）
-  // 只发一次请求：返回值就是最新状态，直接复用，避免连续多次扫描导致启动卡顿。
-  try {
-    const p = await window.pywebview.api.ensure_order_patch();
-    const st = (p && p.status) || {};
-    updateOrderPatchBtn(st);
-    if (p && p.status && p.status.action === 'patched') {
-      setStatus('🧩 Pi 顺序补丁已自动重打（Pi 版本变化或补丁缺失）', '#10B981');
-      await showAlert({ title: 'Pi 顺序补丁已自动重打', icon: '🧩', type: 'success', wide: true,
-        mono: true, allowCopy: true,
-        message: '检测到需要重打补丁，已自动完成：\\n\\n' +
-          '· Pi 版本: ' + (st.piVersion || '未知') + '\\n' +
-          '· 补丁文件: ' + (st.patchedCount || 0) + '/' + (st.targetCount || 0) + '\\n' +
-          '· 厂商顺序: ' + (((st.order) || []).join(' → ') || '（空）') });
-    } else if (p && p.status && p.status.action === 'patch-failed') {
-      setStatus('⚠️ Pi 顺序补丁自动重打失败: ' + (st.error || '未知错误') + '（点 🧩 顺序补丁 查看）', '#EF4444');
-    }
-  } catch (e) { /* 忽略 */ }
+  if (!isDsh) {
+    // 启动时自动维护 Pi 排序补丁（仅在 Pi 模式下执行）
+    try {
+      const p = await window.pywebview.api.ensure_order_patch();
+      const st = (p && p.status) || {};
+      updateOrderPatchBtn(st);
+      if (p && p.status && p.status.action === 'patched') {
+        setStatus('🧩 Pi 顺序补丁已自动重打（Pi 版本变化或补丁缺失）', '#10B981');
+      } else if (p && p.status && p.status.action === 'patch-failed') {
+        setStatus('⚠️ Pi 顺序补丁自动重打失败: ' + (st.error || '未知错误') + '（点 🧩 顺序补丁 查看）', '#EF4444');
+      }
+    } catch (e) { /* 忽略 */ }
+  }
 
   const keys = Object.keys(currentConfig.providers || {});
   const preferredPid = (data.selectedProviderId && currentConfig.providers[data.selectedProviderId])
@@ -6454,16 +8066,32 @@ async function saveAll() {
   setStatus('正在保存全局配置 (Ctrl+S)...', '#F59E0B');
   const res = await window.pywebview.api.save_config(currentConfig, currentConfigPath);
   if (res.success) {
+    const isDsh = res.target === 'dsh' || (currentConfigPath && (currentConfigPath.includes('cordis.patch.yml') || currentConfigPath.includes('.dsh')));
     const countText = `${res.providerCount || 0} providers / ${res.modelCount || 0} models`;
-    setStatus(`✅ 已保存配置 (${countText})`, '#10B981');
+    if (isDsh) {
+      setStatus(`✅ 已保存 DSH 配置 (${countText}) · cordis.patch.yml + .credentials.yaml`, '#10B981');
+    } else {
+      setStatus(`✅ 已保存配置 (${countText})`, '#10B981');
+    }
     renderSidebar();
     if (pid) {
       selectedPid = pid;
       updateProviderViewPanel(pid);
     }
+    if (currentConfigPath) {
+      targetStates[currentConfigPath] = {
+        config: JSON.parse(JSON.stringify(currentConfig || { providers: {} })),
+        selectedPid: selectedPid,
+        isProviderEditing: false,
+        isCreatingNew: false,
+        formDraft: null
+      };
+    }
+    await initTargets();
+
     // 保存后：同步 Pi 排序补丁（顺序文件 / 必要时自动重打）
     const op = res.orderPatch;
-    if (op) {
+    if (op && !isDsh) {
       uiPrefs.patchPiOrder = op.action !== 'disabled';
       if (op.action === 'patched' || op.action === 'order-refreshed') {
         setStatus(`✅ 已保存 (${countText}) · 🧩 Pi 顺序补丁已同步为当前厂商顺序`,
@@ -6505,12 +8133,204 @@ async function exportAllProviders() {
   else setStatus('导出失败: ' + res.error, '#EF4444');
 }
 
+// ==========================================================
+// 底部运行日志面板（完整保留报错，不再被页脚裁切）
+// ==========================================================
+const LOG_LIMIT = 800;
+let logEntries = [];
+let logErrCount = 0;
+let logUnread = 0;
+
+function logTimestamp() {
+  const d = new Date();
+  const p2 = (n) => String(n).padStart(2, '0');
+  return p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds());
+}
+
+function appendLog(level, message, detail) {
+  const NL = String.fromCharCode(10);
+  const lv = String(level || 'info').toLowerCase();
+  let text = String(message === null || message === undefined ? '' : message);
+  if (detail) {
+    const d = String(detail);
+    text += (text && text.slice(-1) !== NL ? NL : '') + d;
+  }
+  const entry = { ts: logTimestamp(), level: lv, text: text };
+  logEntries.push(entry);
+  if (logEntries.length > LOG_LIMIT) logEntries = logEntries.slice(-LOG_LIMIT);
+  if (lv === 'err') logErrCount++;
+  const panel = $id('logPanel');
+  const isOpen = panel && panel.classList.contains('open');
+  if (!isOpen) logUnread++;
+  renderLog(entry);
+  updateLogChrome();
+  if (lv === 'err' || lv === 'warn') {
+    safeLogError('ui:' + lv, message, detail);
+  }
+  return entry;
+}
+
+function logLineEl(entry) {
+  const div = document.createElement('div');
+  div.className = 'log-line ' + entry.level;
+  const ts = document.createElement('span');
+  ts.className = 'log-ts';
+  ts.textContent = entry.ts;
+  div.appendChild(ts);
+  div.appendChild(document.createTextNode(entry.text));
+  return div;
+}
+
+function renderLog(appendOnly) {
+  const body = $id('logPanelBody');
+  if (!body) return;
+  const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 60;
+  if (!appendOnly) {
+    body.textContent = '';
+    if (logEntries.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'log-empty';
+      empty.textContent = '暂无日志。测活/保存等操作的完整报错会实时出现在这里。';
+      body.appendChild(empty);
+      return;
+    }
+    logEntries.forEach((e) => body.appendChild(logLineEl(e)));
+  } else {
+    const empty = body.querySelector('.log-empty');
+    if (empty) empty.remove();
+    body.appendChild(logLineEl(appendOnly));
+  }
+  if (nearBottom || appendOnly) body.scrollTop = body.scrollHeight;
+}
+
+function updateLogChrome() {
+  const badge = $id('logBadge');
+  const last = $id('logLast');
+  const btn = $id('footerLogBtn');
+  const panel = $id('logPanel');
+  const isOpen = panel && panel.classList.contains('open');
+  if (badge) {
+    badge.textContent = String(logEntries.length);
+    badge.classList.toggle('err', logErrCount > 0);
+  }
+  if (last) {
+    const e = logEntries[logEntries.length - 1];
+    last.textContent = e ? (e.text.split(String.fromCharCode(10))[0] || '') : '暂无日志';
+    last.title = e ? e.text : '';
+  }
+  if (btn) {
+    btn.textContent = isOpen ? '▼ 日志' : '📜 日志' + (logUnread > 0 ? ' (' + logUnread + ')' : '');
+    btn.classList.toggle('has-err', logErrCount > 0);
+  }
+  const toggle = $id('logToggleBtn');
+  if (toggle) toggle.textContent = isOpen ? '▼ 收起' : '▲ 展开';
+}
+
+function toggleLogPanel(force) {
+  const panel = $id('logPanel');
+  if (!panel) return;
+  const wantOpen = (typeof force === 'boolean') ? force : !panel.classList.contains('open');
+  panel.classList.toggle('open', wantOpen);
+  // 同步全局标记：让抽屉/遮罩等 fixed 元素让位，避免日志面板遮住抽屉底部按钮
+  document.body.classList.toggle('log-open', wantOpen);
+  if (wantOpen) {
+    logUnread = 0;
+    renderLog();
+    const body = $id('logPanelBody');
+    if (body) body.scrollTop = body.scrollHeight;
+  }
+  updateLogChrome();
+}
+
+function logPanelText() {
+  return logEntries.map((e) => '[' + e.ts + '] [' + e.level.toUpperCase() + '] ' + e.text).join(String.fromCharCode(10));
+}
+
+function copyTextToClipboard(text, btn) {
+  let done = false;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text);
+      done = true;
+    }
+  } catch (e) { done = false; }
+  if (!done) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      done = true;
+    } catch (e) { done = false; }
+  }
+  if (btn) {
+    const old = btn.textContent;
+    btn.textContent = done ? '✅ 已复制' : '⚠️ 复制失败';
+    setTimeout(() => { btn.textContent = old || '📋 复制'; }, 1600);
+  }
+  return done;
+}
+
+function copyLogPanel() {
+  const text = logPanelText();
+  if (!text) { setStatus('日志为空，无可复制内容', '#F59E0B'); return; }
+  copyTextToClipboard(text, null);
+  setStatus('已复制 ' + logEntries.length + ' 条日志到剪贴板', '#10B981');
+}
+
+async function clearLogPanel() {
+  logEntries = [];
+  logErrCount = 0;
+  logUnread = 0;
+  renderLog();
+  updateLogChrome();
+  try { await window.pywebview.api.clear_error_log(); } catch (e) {}
+  setStatus('日志已清空', '#10B981');
+}
+
+async function openLogFile() {
+  try {
+    const r = await window.pywebview.api.open_log_file();
+    if (r && r.success === false) setStatus('打开日志失败: ' + (r.error || '未知错误'), '#EF4444');
+  } catch (e) {
+    setStatus('打开日志异常: ' + e, '#EF4444');
+  }
+}
+
+async function loadHistoryLog() {
+  try {
+    const r = await window.pywebview.api.get_error_log(80);
+    if (!r || !r.success || !r.text) return;
+    appendLog('sys', '历史日志（最近 ' + r.totalLines + ' 行，文件: ' + r.path + '）', r.text.trim());
+  } catch (e) {}
+}
+
 function setStatus(msg, color = '#10B981') {
   const el = $id('statusMsg');
+  const text = String(msg === null || msg === undefined ? '' : msg);
+  lastStatusText = text;
   if (el) {
-    el.innerText = '● ' + msg;
+    el.innerText = '● ' + text;
     el.style.color = color;
+    el.title = text.length > 32 ? (text + String.fromCharCode(10, 10) + '点击展开底部完整日志') : text;
+    el.classList.toggle('has-detail', text.length > 32);
   }
+  // 同步写入底部日志面板：长报错不再只活在被裁切的页脚里
+  const lv = (color === '#EF4444') ? 'err'
+    : (color === '#F59E0B') ? 'warn'
+    : (color === '#10B981') ? 'ok' : 'info';
+  appendLog(lv, text);
+}
+
+// 点状态栏 → 展开底部完整日志
+let lastStatusText = '';
+function showStatusDetail() {
+  toggleLogPanel(true);
 }
 
 // Resizer logic
@@ -6558,8 +8378,165 @@ window.addEventListener('keydown', (e) => {
   }
 });
 
+// 全局 JS 异常回写后端日志文件（避免弹窗一闪而过后无迹可寻）
+function safeLogError(source, message, detail) {
+  try {
+    const api = window.pywebview && window.pywebview.api;
+    if (api && api.log_error) {
+      api.log_error(String(source), String(message), String(detail || ''));
+    }
+  } catch (e) {}
+}
+
+window.addEventListener('error', (ev) => {
+  if (!ev) return;
+  const detail = (ev.error && ev.error.stack) ? ev.error.stack : (ev.message || '');
+  safeLogError('window.error', (ev.message || 'JS error') + ' @ ' + (ev.filename || '') + ':' + (ev.lineno || 0), detail);
+});
+
+window.addEventListener('unhandledrejection', (ev) => {
+  const r = ev ? ev.reason : null;
+  safeLogError('unhandledrejection', (r && r.message) ? r.message : String(r), (r && r.stack) ? r.stack : '');
+});
+
+// ==========================================
+// 全方位窗口拖拽缩放 (8-Way Fluid Resize Controller)
+// ==========================================
+let _resizeState = null;
+
+function initWindowResize(e, direction) {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  e.stopPropagation();
+
+  _resizeState = {
+    dir: direction || 'se',
+    startX: e.screenX,
+    startY: e.screenY,
+    startW: window.outerWidth || window.innerWidth,
+    startH: window.outerHeight || window.innerHeight,
+    busy: false,
+    nextW: null,
+    nextH: null
+  };
+
+  let mask = document.getElementById('resizeEventMask');
+  if (!mask) {
+    mask = document.createElement('div');
+    mask.id = 'resizeEventMask';
+    mask.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:999999;background:transparent;user-select:none;';
+    document.body.appendChild(mask);
+  }
+  const cursorMap = {
+    'e': 'ew-resize', 'w': 'ew-resize',
+    's': 'ns-resize', 'n': 'ns-resize',
+    'se': 'nwse-resize', 'nw': 'nwse-resize',
+    'sw': 'nesw-resize', 'ne': 'nesw-resize'
+  };
+  mask.style.cursor = cursorMap[direction] || 'nwse-resize';
+  mask.style.display = 'block';
+
+  window.addEventListener('mousemove', onWindowResizeDragging);
+  window.addEventListener('mouseup', onWindowResizeDragEnd);
+}
+
+function onWindowResizeDragging(e) {
+  if (!_resizeState) return;
+  const dx = e.screenX - _resizeState.startX;
+  const dy = e.screenY - _resizeState.startY;
+  const dir = _resizeState.dir;
+
+  let targetW = _resizeState.startW;
+  let targetH = _resizeState.startH;
+
+  if (dir.indexOf('e') !== -1) {
+    targetW = Math.max(960, _resizeState.startW + dx);
+  } else if (dir.indexOf('w') !== -1) {
+    targetW = Math.max(960, _resizeState.startW - dx);
+  }
+
+  if (dir.indexOf('s') !== -1) {
+    targetH = Math.max(580, _resizeState.startH + dy);
+  } else if (dir.indexOf('n') !== -1) {
+    targetH = Math.max(580, _resizeState.startH - dy);
+  }
+
+  _resizeState.nextW = targetW;
+  _resizeState.nextH = targetH;
+
+  if (!_resizeState.busy) {
+    _resizeState.busy = true;
+    requestAnimationFrame(doDispatchResize);
+  }
+}
+
+async function doDispatchResize() {
+  if (!_resizeState) return;
+  const w = _resizeState.nextW;
+  const h = _resizeState.nextH;
+  try {
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.resize_window) {
+      await window.pywebview.api.resize_window(w, h);
+    }
+  } catch (err) {}
+  if (_resizeState) {
+    _resizeState.busy = false;
+    if (_resizeState.nextW !== w || _resizeState.nextH !== h) {
+      _resizeState.busy = true;
+      requestAnimationFrame(doDispatchResize);
+    }
+  }
+}
+
+function onWindowResizeDragEnd() {
+  if (!_resizeState) return;
+  const mask = document.getElementById('resizeEventMask');
+  if (mask) mask.style.display = 'none';
+
+  window.removeEventListener('mousemove', onWindowResizeDragging);
+  window.removeEventListener('mouseup', onWindowResizeDragEnd);
+
+  try {
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.save_window_size) {
+      window.pywebview.api.save_window_size(window.innerWidth, window.innerHeight);
+    }
+  } catch (err) {}
+
+  _resizeState = null;
+}
+
+function handleHeaderDblClick(e) {
+  if (e.target && e.target.closest('.pywebview-no-drag-region')) return;
+  toggleWindowMaximize();
+}
+
+function toggleWindowMaximize() {
+  try {
+    if (window.pywebview && window.pywebview.api) {
+      window.pywebview.api.maximize_window();
+    }
+  } catch (e) {}
+}
+
+let _winResizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(_winResizeTimer);
+  _winResizeTimer = setTimeout(() => {
+    try {
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.save_window_size) {
+        window.pywebview.api.save_window_size(window.innerWidth, window.innerHeight);
+      }
+    } catch (e) {}
+  }, 500);
+});
+
 window.addEventListener('pywebviewready', () => {
   initResizers();
+  const statusEl = $id('statusMsg');
+  if (statusEl) statusEl.addEventListener('click', showStatusDetail);
+  renderLog();
+  updateLogChrome();
+  loadHistoryLog();
   loadData();
 });
 </script>
@@ -6597,6 +8574,30 @@ def scan_tool_js_escapes(src_path=None):
     return bad
 
 
+def scan_ui_missing_helpers():
+    """体检：内嵌 JS 里调用的界面助手（show*/open*）是否都有定义。
+
+    背景：``importFromCounterpart`` 曾调用从未定义的 ``showGlobalConfirm()``，
+    点击后只抛 ``ReferenceError``（被 unhandledrejection 钩子写进日志），
+    界面上表现为「导入按钮点了没反应」。语法门禁查不出这类幽灵调用，
+    所以这里单独做一次定义存在性核对。
+
+    返回未被定义就被调用的助手名列表。
+    """
+    try:
+        m = re.search(r"<script>(.*?)</script>", HTML_CONTENT, re.S)
+    except Exception:
+        return []
+    if not m:
+        return []
+    js = m.group(1)
+    defined = set(re.findall(r"function\s+([A-Za-z_$][\w$]*)\s*\(", js))
+    defined |= set(re.findall(r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=", js))
+    defined |= set(re.findall(r"window\.([A-Za-z_$][\w$]*)\s*=", js))
+    called = set(re.findall(r"\b((?:show|open)[A-Z][\w$]*)\s*\(", js))
+    return sorted(name for name in called if name not in defined)
+
+
 def verify_tool_html_js():
     """工具自身内嵌 JS 的语法门禁（node --check）。返回 (ok, msg)。
 
@@ -6631,21 +8632,68 @@ def verify_tool_html_js():
             pass
 
 
+def _run_selftest():
+    """打包后/无 GUI 自检入口（exe --selftest）：不弹窗、不建窗口，退出码 0=通过。"""
+    install_exception_hooks()
+    ok = True
+    lines = []
+    try:
+        bad = scan_tool_js_escapes()
+        missing = scan_ui_missing_helpers()
+        ok_js, msg_js = verify_tool_html_js()
+        if bad:
+            ok = False
+            lines.append("内嵌 JS 转义隐患 %d 处: %s" % (len(bad), bad[:3]))
+        if missing:
+            ok = False
+            lines.append("内嵌 JS 调用了未定义的函数: %s" % ", ".join(missing[:8]))
+        if not ok_js:
+            ok = False
+            lines.append("内嵌 JS 语法校验失败: %s" % clip_text(msg_js, 2000))
+        else:
+            lines.append("内嵌 JS 语法校验: ✅")
+        if not missing:
+            lines.append("界面助手定义: ✅")
+    except Exception as e:
+        ok = False
+        lines.append("自检异常: %r" % e)
+    try:
+        cfg = load_config(DEFAULT_MODELS_PATH)
+        lines.append("配置读取: %d 个服务商 @ %s" % (len(cfg.get("providers") or {}), DEFAULT_MODELS_PATH))
+    except Exception as e:
+        ok = False
+        lines.append("配置读取失败: %r" % e)
+    lines.append("日志文件: %s" % LOG_PATH)
+    write_log("INFO", "selftest", ("通过" if ok else "失败") + " | " + " | ".join(lines))
+    return 0 if ok else 1
+
+
 def main():
+    install_exception_hooks()
+    write_log("INFO", "app", "启动 Pi Model Manager (python %s)" % sys.version.split()[0])
+    if "--selftest" in sys.argv:
+        sys.exit(_run_selftest())
     # 启动前自检：内嵌 JS 一旦被 Python 提前转义（如 '\n' 变成真换行），
     # 整个脚本会解析失败 → 界面停在静态态。这里主动报错，不再静默失效。
     try:
         bad_esc = scan_tool_js_escapes()
+        missing_helpers = scan_ui_missing_helpers()
         ok_js, msg_js = verify_tool_html_js()
     except Exception:
-        bad_esc, ok_js, msg_js = [], True, ""
-    if bad_esc or not ok_js:
+        bad_esc, missing_helpers, ok_js, msg_js = [], [], True, ""
+    if bad_esc or missing_helpers or not ok_js:
         detail = ""
         if bad_esc:
             detail += "\n\n源码中有 %d 处会被 Python 提前解释的转义（应写成双反斜杠）：\n" % len(bad_esc)
             detail += "\n".join("  第 %d 行 %s | %s" % (ln, esc, txt) for ln, esc, txt in bad_esc[:8])
+        if missing_helpers:
+            detail += "\n\n以下函数被调用但从未定义（点击后会抛 ReferenceError，表现为“按钮没反应”）：\n"
+            detail += "\n".join("  " + name + "()" for name in missing_helpers[:8])
         if not ok_js:
             detail += "\n\nnode --check 结果：\n" + (msg_js or "")
+        for _line in detail.splitlines():
+            if _line.strip():
+                write_log("ERROR", "ui:selfcheck", _line.strip())
         msg = "⚠️ 工具内嵌 JS 自检失败，界面可能停在静态初始态。\n" + detail
         try:
             print(msg, file=sys.stderr, flush=True)
@@ -6657,20 +8705,52 @@ def main():
         except Exception:
             pass
 
+    # 读取上次持久化的窗口大小（默认 1280x760 宽屏，彻底消除按钮折行截断）
+    settings = load_tool_settings()
+    try:
+        init_w = int(settings.get("windowWidth", 1280))
+        init_h = int(settings.get("windowHeight", 760))
+    except Exception:
+        init_w, init_h = 1280, 760
+    init_w = max(960, min(2560, init_w))
+    init_h = max(580, min(1600, init_h))
+
     api = ApiBridge()
     window = webview.create_window(
         title="模型配置",
         html=HTML_CONTENT,
         js_api=api,
-        width=1120,
-        height=720,
-        min_size=(1020, 640),
+        width=init_w,
+        height=init_h,
+        min_size=(960, 580),
         frameless=True,
         easy_drag=False,
         background_color="#0F172A"
     )
     api.set_window(window)
-    webview.start()
+
+    def on_window_ready(win):
+        try:
+            time.sleep(0.4)
+            native = getattr(win, "native", None)
+            if native and hasattr(native, "Handle"):
+                hwnd = int(native.Handle.ToInt32())
+                GWL_STYLE = -16
+                WS_THICKFRAME = 0x00040000
+                style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+                if not (style & WS_THICKFRAME):
+                    style |= WS_THICKFRAME
+                    ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+                    SWP_FRAMECHANGED = 0x0020
+                    SWP_NOMOVE = 0x0002
+                    SWP_NOSIZE = 0x0001
+                    SWP_NOZORDER = 0x0004
+                    ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER)
+        except Exception:
+            pass
+
+    webview.start(on_window_ready, (window,))
 
 
 if __name__ == "__main__":

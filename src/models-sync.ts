@@ -74,20 +74,60 @@ function readModelsFile(): { providers: Record<string, ProviderConfig> } {
   return { providers };
 }
 
-function inferModelSpecs(mid: string, model: Record<string, unknown>): { contextWindow: number; maxTokens: number; input: string[]; reasoning: boolean } {
-  const target = mid.toLowerCase();
-  let isVision = false;
-  if (/gemini|claude|gpt-4o|chatgpt-4o|\bo[13]\b|vl|vision|omni|4v|visual|mimo/.test(target)) {
-    isVision = true;
+const CATALOG_PREFIX_RE = /^(chat|image|classifier|embed|embedding|rerank|audio|video):/;
+
+// 常见 vendor 别名归一（聚合站命名 -> pi-ai 目录命名）
+const VENDOR_ALIAS: Record<string, string> = {
+  "zai-org": "zai", zhipuai: "zai", "z-ai": "zai", zai: "zai",
+  alibaba: "qwen", qwen: "qwen",
+  "deepseek-ai": "deepseek", deepseek: "deepseek",
+  "x-ai": "xai", spacexai: "xai", xai: "xai",
+  moonshot: "moonshotai", moonshotai: "moonshotai",
+  "minimax-ai": "minimax", minimaxai: "minimax", minimax: "minimax",
+  "bytedance-seed": "bytedance", bytedance: "bytedance",
+  tencent: "tencent",
+};
+
+function catalogMatchKeys(mid: string): string[] {
+  let s = String(mid || "").toLowerCase().trim();
+  let prev: string | null = null;
+  while (prev !== s) {
+    prev = s;
+    s = s.replace(CATALOG_PREFIX_RE, "");
   }
+  if (!s) return [];
+  const keys = [s];
+  if (s.includes("/")) {
+    const idx = s.indexOf("/");
+    const vendor = s.slice(0, idx);
+    const rest = s.slice(idx + 1);
+    if (rest) {
+      keys.push(rest);
+      const canon = VENDOR_ALIAS[vendor];
+      if (canon) keys.push(`${canon}/${rest}`);
+    }
+  }
+  return [...new Set(keys.filter(Boolean))];
+}
+
+function inferModelSpecs(mid: string, model: Record<string, unknown>): { contextWindow: number; maxTokens: number; input: string[]; reasoning: boolean } {
+  // 用于匹配的规范化键：取剥前缀 / 去路由后的形式
+  const keys = catalogMatchKeys(mid);
+  const target = (keys[0] || mid).toLowerCase();
+
+  // 上游直报数值最优先（models.json 中手工填写或 /v1/models 返回）
+  const rawCw = model.context_length ?? model.context_window ?? model.max_context_tokens ?? model.contextWindow;
+  const rawMt = model.max_tokens ?? model.max_output_tokens ?? model.maxTokens;
+  const rawCtx = typeof rawCw === "number" && rawCw >= 4096 ? rawCw : null;
+  const rawMax = typeof rawMt === "number" && rawMt >= 512 ? rawMt : null;
+
+  let isVision = /gemini|claude|gpt-4o|chatgpt-4o|gpt-4\.1|\bo[134]\b|vl|vision|omni|4v|visual|mimo/.test(target);
   if (Array.isArray(model.input) && model.input.includes("image")) {
     isVision = true;
   }
 
-  let isReasoning = false;
-  if (/r1|reasoner|thinking|thought|qwq|zero|deepseek-v4|mimo/.test(target)) {
-    isReasoning = true;
-  } else if (/claude-3-7|claude-3\.7|\bo[13](-mini|-preview)?\b|flash-thinking|gemini-2\.5|gemini-3/.test(target)) {
+  let isReasoning = /r1|reasoner|thinking|thought|qwq|zero|deepseek-v4|mimo|gpt-5|gpt-6/.test(target);
+  if (/claude-3-7|claude-3\.7|\bo[134](-mini|-preview)?\b|flash-thinking|gemini-2\.5|gemini-3/.test(target)) {
     isReasoning = true;
   } else if (model.reasoning !== undefined) {
     isReasoning = Boolean(model.reasoning);
@@ -102,7 +142,7 @@ function inferModelSpecs(mid: string, model: Record<string, unknown>): { context
     isVision = true;
   } else if (target.includes("claude")) {
     contextWindow = 200000;
-    maxTokens = /3-7|3\.7|3-5-sonnet|3\.5-sonnet|sonnet-4/.test(target) ? 64000 : 8192;
+    maxTokens = /3-7|3\.7|3-5-sonnet|3\.5-sonnet|sonnet-4|4-5|4\.5|4-6|4\.6|4-7|4\.7|4-8|4\.8|sonnet-5|opus-5|haiku-4|haiku-5|fable/.test(target) ? 64000 : 8192;
     isVision = true;
   } else if (target.includes("mimo")) {
     contextWindow = 1048576;
@@ -115,6 +155,12 @@ function inferModelSpecs(mid: string, model: Record<string, unknown>): { context
       maxTokens = 384000;
       isVision = true;
       isReasoning = true;
+    } else if (/v3[.\-]?2/.test(target)) {
+      contextWindow = 131072;
+      maxTokens = 65536;
+    } else if (/v3[.\-]?1/.test(target)) {
+      contextWindow = 163840;
+      maxTokens = 128000;
     } else if (/r1|reasoner/.test(target)) {
       contextWindow = 128000;
       maxTokens = 65536;
@@ -123,35 +169,176 @@ function inferModelSpecs(mid: string, model: Record<string, unknown>): { context
       contextWindow = 128000;
       maxTokens = 8192;
     }
-  } else if (/\bo[13]\b/.test(target)) {
+  } else if (target.includes("gpt-oss")) {
+    contextWindow = 131072;
+    maxTokens = target.includes("120") ? 131072 : 8192;
+  } else if (/gpt-?6/.test(target) || target.includes("gpt-5.4") || target.includes("gpt-5-4")) {
+    // gpt-6/6.1 与 gpt-5.4 全系=1.05M（官方真实物理容量，输入上限 922K），5.4-mini/nano=400K
+    if (target.includes("mini") || target.includes("nano")) {
+      contextWindow = 400000;
+    } else {
+      contextWindow = 1050000;
+    }
+    maxTokens = 128000;
+    isVision = true;
+    isReasoning = true;
+  } else if (target.includes("gpt-5")) {
+    // gpt-5 / 5.1 / 5.2 / 5.3 全系=400K，codex-spark=128K
+    if (target.includes("codex") && target.includes("spark")) {
+      contextWindow = 128000;
+      maxTokens = 32000;
+    } else {
+      contextWindow = 400000;
+      maxTokens = 128000;
+    }
+    isVision = true;
+    isReasoning = true;
+  } else if (/\bo[134]\b/.test(target)) {
     contextWindow = 200000;
     maxTokens = 100000;
     isVision = true;
     isReasoning = true;
+  } else if (/gpt-4[.\-]1/.test(target)) {
+    contextWindow = 1047576;
+    maxTokens = 32768;
+    isVision = true;
   } else if (/gpt-4o|chatgpt-4o|gpt-4\.5/.test(target)) {
     contextWindow = 128000;
     maxTokens = 16384;
     isVision = true;
+  } else if (target.includes("grok")) {
+    if (target.includes("4.20") || target.includes("4-20") || target.includes("multi-agent")) {
+      contextWindow = 2000000;
+      maxTokens = 1800000;
+    } else if (/grok-?4[.\-]?3\b/.test(target)) {
+      contextWindow = 1000000;
+      maxTokens = 30000;
+    } else if (/grok-?4[.\-]?[12]\b/.test(target)) {
+      contextWindow = 1000000;
+      maxTokens = 131072;
+    } else if (/grok-?4[.\-]?[4-9]\b/.test(target)) {
+      contextWindow = 500000;
+      maxTokens = 450000;
+    } else if (target.includes("build")) {
+      contextWindow = 256000;
+      maxTokens = 230400;
+    } else {
+      contextWindow = 256000;
+      maxTokens = 32768;
+    }
+    isReasoning = !target.includes("non-reasoning");
   } else if (target.includes("qwen")) {
-    contextWindow = /plus|max|1m/.test(target) ? 1000000 : 128000;
-    maxTokens = 8192;
+    if (/plus|max|1m/.test(target)) {
+      contextWindow = 1000000;
+      maxTokens = target.includes("max") ? 131072 : 65536;
+    } else if (target.includes("flash")) {
+      contextWindow = 1000000;
+      maxTokens = 65536;
+    } else if (target.includes("coder")) {
+      contextWindow = 262144;
+      maxTokens = 65536;
+    } else if (/qwen-?2[.\-]?5/.test(target)) {
+      contextWindow = 32768;
+      maxTokens = 16384;
+    } else if (/qwen-?3-\d+b/.test(target)) {
+      contextWindow = 40960;
+      maxTokens = 16384;
+    } else {
+      contextWindow = 262144;
+      maxTokens = 65536;
+    }
     if (/vl|omni|audio/.test(target)) isVision = true;
+  } else if (target.includes("glm")) {
+    if (/glm-?5[.\-]?[2-9]/.test(target)) {
+      contextWindow = 1000000;
+      maxTokens = 131072;
+    } else if (/glm-?5/.test(target)) {
+      contextWindow = 200000;
+      maxTokens = 131072;
+    } else if (/glm-?4[.\-]?[67]v/.test(target)) {
+      contextWindow = 128000;
+      maxTokens = 32768;
+      isVision = true;
+    } else if (/glm-?4[.\-]?[67]/.test(target)) {
+      contextWindow = 200000;
+      maxTokens = 96000;
+    } else if (/glm-?4[.\-]?5v/.test(target)) {
+      contextWindow = 66000;
+      maxTokens = 16000;
+      isVision = true;
+    } else if (/glm-?4[.\-]?5/.test(target)) {
+      contextWindow = 128000;
+      maxTokens = 96000;
+    } else {
+      contextWindow = 128000;
+      maxTokens = 8192;
+    }
+    if (/4v|vl/.test(target) || /glm-?[45][.\-]?\d*v/.test(target)) isVision = true;
+  } else if (target.includes("kimi") || target.includes("moonshot")) {
+    if (/kimi-?k3/.test(target)) {
+      contextWindow = 1000000;
+      maxTokens = 131072;
+    } else if (/kimi-?k2[.\-]?[67]/.test(target)) {
+      contextWindow = 262144;
+      maxTokens = /k2[.\-]?6/.test(target) ? 262144 : 32768;
+    } else if (/kimi-?k2[.\-]?5/.test(target)) {
+      contextWindow = 262144;
+      maxTokens = 98304;
+    } else {
+      contextWindow = 131072;
+      maxTokens = 131072;
+    }
+    if (/vl|vision/.test(target)) isVision = true;
   } else if (target.includes("minimax") || target.includes("abab")) {
-    contextWindow = 245760;
-    maxTokens = 8192;
+    if (/m3[.\-]?1/.test(target)) {
+      contextWindow = 1000000;
+      maxTokens = 524288;
+    } else if (/\bm3\b/.test(target)) {
+      contextWindow = 512000;
+      maxTokens = 512000;
+    } else {
+      contextWindow = 204800;
+      maxTokens = 131072;
+    }
   } else if (target.includes("hy4") || target.includes("hunyuan")) {
+    if (target.includes("hy3")) {
+      contextWindow = 262144;
+      maxTokens = 128000;
+    } else {
+      contextWindow = 1048576;
+      maxTokens = 64000;
+    }
+  } else if (/step-?5/.test(target)) {
+    contextWindow = 1000000;
+    maxTokens = 64000;
+  } else if (/step-?3/.test(target)) {
     contextWindow = 256000;
-    maxTokens = 16384;
+    maxTokens = 64000;
+  } else if (target.includes("nemotron")) {
+    if (target.includes("3.5") || target.includes("ultra")) {
+      contextWindow = 1000000;
+      maxTokens = target.includes("super-vl") ? 1048576 : 65000;
+    } else {
+      contextWindow = 262144;
+      maxTokens = 262144;
+    }
   }
 
-  if (/1m|1000k|1024k/.test(target)) contextWindow = 1048576;
-  else if (/2m|2000k/.test(target)) contextWindow = 2000000;
-  else if (/256k/.test(target)) contextWindow = 256000;
-  else if (/200k/.test(target)) contextWindow = 200000;
-  else if (/128k/.test(target)) contextWindow = 128000;
+  // 关键词显式长度匹配（覆盖家族表，可纠正后缀标注）
+  if (/(?<![0-9a-z.])1m(?![0-9a-z])/.test(target) || target.includes("1000k") || target.includes("1024k")) {
+    contextWindow = 1048576;
+  } else if (/(?<![0-9a-z.])2m(?![0-9a-z])/.test(target) || target.includes("2000k")) {
+    contextWindow = 2000000;
+  } else if (/256k/.test(target)) {
+    contextWindow = 256000;
+  } else if (/200k/.test(target)) {
+    contextWindow = 200000;
+  } else if (/128k/.test(target)) {
+    contextWindow = 128000;
+  }
 
-  if (typeof model.contextWindow === "number" && model.contextWindow > 0) contextWindow = model.contextWindow;
-  if (typeof model.maxTokens === "number" && model.maxTokens > 0) maxTokens = model.maxTokens;
+  if (rawCtx !== null) contextWindow = rawCtx;
+  if (rawMax !== null) maxTokens = rawMax;
 
   return {
     contextWindow,

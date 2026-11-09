@@ -22,7 +22,7 @@ targets = ["dist/bundle/chunks/chunk-4DKZACXI.js", "dist/cli/list-models.js",
 # 目标清单：优先按内容扫描真实安装目录，扫描不到再回退到上面这份已知清单
 try:
     import importlib.util
-    spec = importlib.util.spec_from_file_location("dapp", REPO / "desktop_app.py")
+    spec = importlib.util.spec_from_file_location("dapp", REPO / "src" / "desktop_app.py")
     _dapp = importlib.util.module_from_spec(spec)
     _saved = os.environ.get("PI_PACKAGE_DIR")
     os.environ["PI_PACKAGE_DIR"] = str(REAL)
